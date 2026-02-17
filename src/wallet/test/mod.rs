@@ -451,3 +451,6 @@ mod sign_psbt;
 #[cfg(feature = "electrum")]
 mod sync;
 mod witness_receive;
+
+#[cfg(feature = "vss")]
+mod vss;

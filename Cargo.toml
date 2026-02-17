@@ -76,6 +76,14 @@ zip = { version = "8.6.0", default-features = false, features = [
     "zstd",
 ] }
 
+# VSS backup (optional)
+vss-client = { package = "vss-client-ng", git = "https://github.com/lightningdevkit/vss-client", rev = "ad63805047561dcf3117cd992ad6d8bc3881adef", default-features = false, optional = true, features = [
+    "sigs-auth",
+] }
+hkdf = { version = "0.12", default-features = false, optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
+
 # RGB-related deps
 amplify = { version = "=4.8.1", default-features = false }
 rgb-invoicing = { version = "=0.11.1-rc.11", default-features = false }
@@ -104,6 +112,8 @@ once_cell = { version = "1.21", default-features = false }
 regex = { version = "1.13", default-features = false }
 serial_test = { version = "3.5", default-features = false }
 
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
 # OS-specific reqwest features
 [target.'cfg(target_os = "android")'.dependencies.reqwest]
 version = "0.13"
@@ -115,7 +125,7 @@ features = ["rustls"]
 
 [features]
 default = ["electrum", "bdk_file_store_migration"]
-all = ["electrum", "esplora", "bdk_file_store_migration"]
+all = ["electrum", "esplora", "bdk_file_store_migration", "vss"]
 # import the BDK data of wallets created before the changeset moved into the rgb-lib DB; only
 # needed to upgrade such wallets, so it can be turned off to drop the bdk_file_store dependency
 bdk_file_store_migration = ["bdk_wallet/file_store"]
@@ -129,7 +139,16 @@ esplora = [
     "reqwest",
     "rgb-ops/esplora_blocking",
 ]
+vss = ["vss-client", "hkdf", "sha2", "tokio"]
 camel_case = ["default"]
+
+[[example]]
+name = "vss_example"
+required-features = ["vss"]
+
+[[example]]
+name = "vss_unencrypted_example"
+required-features = ["vss"]
 
 [profile.release]
 # make overflow bugs fail loudly instead of producing wrong amounts

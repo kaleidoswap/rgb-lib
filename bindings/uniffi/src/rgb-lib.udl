@@ -6,6 +6,9 @@ namespace rgb_lib {
 
   [Throws=RgbLibError]
   void restore_backup(string backup_path, string password, string data_dir);
+
+  [Throws=RgbLibError]
+  string restore_from_vss(VssBackupConfig config, string target_dir);
 };
 
 [Error, Remote]
@@ -810,6 +813,38 @@ dictionary HubInfo {
 dictionary WalletDescriptors {
   string colored;
   string vanilla;
+};
+
+[Remote]
+enum VssBackupMode {
+  "Async",
+  "Blocking",
+};
+
+dictionary VssBackupConfig {
+  string server_url;
+  string store_id;
+  sequence<u8> signing_key;
+  boolean encryption_enabled;
+  boolean auto_backup;
+  VssBackupMode backup_mode;
+};
+
+[Remote]
+dictionary VssBackupInfo {
+  boolean backup_exists;
+  i64? server_version;
+  boolean backup_required;
+};
+
+interface VssBackupClient {
+  [Throws=RgbLibError]
+  constructor(VssBackupConfig config);
+
+  boolean encryption_enabled();
+
+  [Throws=RgbLibError]
+  void delete_backup();
 };
 
 interface Wallet {

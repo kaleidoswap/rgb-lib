@@ -519,6 +519,7 @@ impl Wallet {
         )?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
+        self.trigger_auto_backup();
 
         info!(self.logger(), "Save new asset completed");
         Ok(())
@@ -649,6 +650,7 @@ impl Wallet {
 
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
 
         info!(self.logger(), "Send (end) db update only completed");
         Ok(OperationResult {

@@ -1044,6 +1044,10 @@ impl MultisigWallet {
                 bdk_pending: Arc::new(Mutex::new(ChangeSet::default())),
                 #[cfg(any(feature = "electrum", feature = "esplora"))]
                 online_data: None,
+                #[cfg(feature = "vss")]
+                vss_client: None,
+                #[cfg(feature = "vss")]
+                auto_backup_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             keys,
         })

@@ -215,6 +215,10 @@ pub struct WalletInternals {
     pub(crate) bdk_pending: Arc<Mutex<ChangeSet>>,
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) online_data: Option<OnlineData>,
+    #[cfg(feature = "vss")]
+    pub(crate) vss_client: Option<Arc<super::vss::VssBackupClient>>,
+    #[cfg(feature = "vss")]
+    pub(crate) auto_backup_in_progress: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) fn setup_rgb<P: AsRef<Path>>(
@@ -485,6 +489,23 @@ pub trait WalletCore {
 
     fn database(&self) -> &RgbLibDatabase {
         &self.internals().database
+    }
+
+    fn database_arc(&self) -> &Arc<RgbLibDatabase> {
+        &self.internals().database
+    }
+
+    #[cfg(feature = "vss")]
+    fn vss_client(&self) -> &Option<Arc<super::vss::VssBackupClient>> {
+        &self.internals().vss_client
+    }
+    #[cfg(feature = "vss")]
+    fn set_vss_client(&mut self, client: Option<Arc<super::vss::VssBackupClient>>) {
+        self.internals_mut().vss_client = client;
+    }
+    #[cfg(feature = "vss")]
+    fn auto_backup_in_progress(&self) -> &Arc<std::sync::atomic::AtomicBool> {
+        &self.internals().auto_backup_in_progress
     }
 
     fn logger(&self) -> &Logger {
