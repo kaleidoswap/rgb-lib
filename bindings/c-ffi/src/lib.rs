@@ -16,7 +16,7 @@ use rgb_lib::{
     keys::WitnessVersion,
     utils::BitcoinNetwork,
     wallet::{
-        AssetFilter, Online, OnlineOptions, Recipient, RefreshFilter, RgbWalletOpsOffline,
+        AssetFilter, Invoice, Online, OnlineOptions, Recipient, RefreshFilter, RgbWalletOpsOffline,
         RgbWalletOpsOnline, SinglesigKeys, SyncOptions, Wallet, WalletData,
     },
 };
@@ -619,4 +619,21 @@ pub extern "C" fn rgblib_witness_receive(
         min_confirmations,
     )
     .into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn free_invoice(obj: COpaqueStruct) {
+    unsafe {
+        let _ = Box::from_raw(obj.ptr as *mut Invoice);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rgblib_invoice_new(invoice_string: *const c_char) -> CResult {
+    invoice_new(invoice_string).into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rgblib_invoice_string(invoice: &COpaqueStruct) -> CResultString {
+    invoice_string(invoice).into()
 }

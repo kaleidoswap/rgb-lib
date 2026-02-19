@@ -51,6 +51,7 @@ trait CReturnType: Sized + 'static {
     }
 }
 impl CReturnType for Wallet {}
+impl CReturnType for Invoice {}
 
 impl<T: 'static, E> From<Result<T, E>> for CResult
 where
@@ -867,4 +868,14 @@ pub(crate) fn witness_receive(
         min_confirmations,
     )?;
     Ok(serde_json::to_string(&res)?)
+}
+
+pub(crate) fn invoice_new(invoice_string: *const c_char) -> Result<Invoice, Error> {
+    let invoice_string = ptr_to_string(invoice_string);
+    Ok(Invoice::new(invoice_string)?)
+}
+
+pub(crate) fn invoice_string(invoice: &COpaqueStruct) -> Result<String, Error> {
+    let invoice = Invoice::from_opaque(invoice)?;
+    Ok(invoice.invoice_string())
 }
