@@ -104,10 +104,12 @@ pub mod wallet;
 pub use bdk_wallet;
 pub use bdk_wallet::bitcoin;
 pub use rgbstd::{
-    ContractId, Txid as RgbTxid,
+    ChainNet, ContractId, Txid as RgbTxid,
     containers::{
         ConsignmentExt, Fascia, FileContent, PubWitness, Transfer as RgbTransfer, WitnessBundle,
     },
+    indexers::AnyResolver,
+    validation::{ValidationConfig, ValidationError},
     persistence::UpdateRes,
     schema::SchemaId,
     txout::CloseMethod,
@@ -213,7 +215,7 @@ use rgbinvoice::{
 #[cfg(feature = "electrum")]
 use rgbstd::indexers::electrum_blocking::electrum_client::ConfigBuilder;
 use rgbstd::{
-    Allocation, Amount, Assign, ChainNet, Genesis, GraphSeal, Identity, KnownTransition, Layer1,
+    Allocation, Amount, Assign, Genesis, GraphSeal, Identity, KnownTransition, Layer1,
     Operation as _, Opout, OutputSeal, OwnedFraction, Precision, Schema, SecretSeal, TokenIndex,
     Transition, TypeSystem,
     containers::{BuilderSeal, Kit, ValidContract, ValidKit, ValidTransfer},
@@ -241,9 +243,8 @@ use rgbstd::{
     containers::Consignment,
     contract::FilterIncludeAll,
     daggy::Walker,
-    indexers::AnyResolver,
     info::ContractInfo,
-    validation::{OpoutsDagData, ValidationConfig, ValidationError, Validity, Warning},
+    validation::{OpoutsDagData, Validity, Warning},
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use schemata::{CfaWrapper, NiaWrapper, UdaWrapper};
