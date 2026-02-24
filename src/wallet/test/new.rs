@@ -107,6 +107,7 @@ fn signet_success() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
+#[ignore = "no testnet electrum server available"]
 fn testnet_success() {
     let data_dir = PrivateDataDir::new();
 
@@ -122,6 +123,7 @@ fn testnet_success() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
+#[ignore = "no testnet4 electrum server available"]
 fn testnet4_success() {
     let data_dir = PrivateDataDir::new();
 
