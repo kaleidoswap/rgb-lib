@@ -112,6 +112,7 @@ fn signet_esplora_success() {
     let bitcoin_network = BitcoinNetwork::Signet;
     let mut party = offline_party!(data_dir.wallet_with_net(true, None, bitcoin_network));
     check_wallet(&party, bitcoin_network, None);
+    // UTEXO Signet Esplora (electrs REST API on Hetzner)
     party.go_online(false, Some("https://esplora-api.utexo.com"));
     assert!(!party.wallet.watch_only());
     assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
