@@ -104,6 +104,19 @@ fn signet_success() {
     assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
 }
 
+#[cfg(feature = "esplora")]
+#[test]
+#[parallel]
+fn signet_esplora_success() {
+    let data_dir = PrivateDataDir::new();
+    let bitcoin_network = BitcoinNetwork::Signet;
+    let mut party = offline_party!(data_dir.wallet_with_net(true, None, bitcoin_network));
+    check_wallet(&party, bitcoin_network, None);
+    party.go_online(false, Some("https://esplora-api.utexo.com"));
+    assert!(!party.wallet.watch_only());
+    assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
+}
+
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
