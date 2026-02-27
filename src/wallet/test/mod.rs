@@ -454,3 +454,5 @@ mod witness_receive;
 
 #[cfg(feature = "vss")]
 mod vss;
+#[cfg(feature = "vss")]
+mod vss_e2e;
