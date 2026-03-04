@@ -2033,7 +2033,10 @@ mod tests {
         // Shared runtime must be reusable and safe to call from multiple threads (FFI-style).
         let rt_ptr_1 = std::ptr::from_ref(vss_runtime());
         let rt_ptr_2 = std::ptr::from_ref(vss_runtime());
-        assert_eq!(rt_ptr_1, rt_ptr_2, "expected vss_runtime() to be a singleton");
+        assert_eq!(
+            rt_ptr_1, rt_ptr_2,
+            "expected vss_runtime() to be a singleton"
+        );
 
         let threads = (0..8)
             .map(|_| {
@@ -2064,7 +2067,10 @@ mod tests {
         };
         match err {
             RgbLibError::Internal { details } => {
-                assert!(details.contains("Invalid signing key"), "unexpected error: {details}");
+                assert!(
+                    details.contains("Invalid signing key"),
+                    "unexpected error: {details}"
+                );
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
@@ -2082,6 +2088,9 @@ mod tests {
             backup_mode: VssBackupMode::Async,
         };
         let client = VssBackupClient::new(good).expect("VssBackupClient::new");
-        assert!(client.encryption_enabled(), "expected encryption_enabled=true");
+        assert!(
+            client.encryption_enabled(),
+            "expected encryption_enabled=true"
+        );
     }
 }
