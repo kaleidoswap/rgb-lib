@@ -192,26 +192,11 @@ pub trait WalletBackup: WalletCore {
     /// Returns the server-side version number of the uploaded backup.
     #[cfg(feature = "vss")]
     async fn vss_backup(&self, client: &super::vss::VssBackupClient) -> Result<i64, Error> {
+        let version = self._vss_backup(client).await?;
         let txn = self.database().begin_transaction()?;
-        let prev_backup_info = self.update_backup_info(&txn, true)?;
+        self.update_backup_info(&txn, true)?;
         txn.commit()?;
-
-        match self._vss_backup(client).await {
-            Ok(version) => Ok(version),
-            Err(e) => {
-                error!(self.logger(), "Error during VSS backup: {e:?}");
-                // Restore previous backup info on failure
-                let txn = self.database().begin_transaction()?;
-                if let Some(prev_backup_info) = prev_backup_info {
-                    let mut prev_backup_info: DbBackupInfoActMod = prev_backup_info.into();
-                    txn.update_backup_info(&mut prev_backup_info)?;
-                } else {
-                    txn.del_backup_info()?;
-                }
-                txn.commit()?;
-                Err(e)
-            }
-        }
+        Ok(version)
     }
 
     #[cfg(feature = "vss")]
