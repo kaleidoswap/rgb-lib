@@ -1013,6 +1013,7 @@ pub trait WalletOnline: WalletOffline {
                 }
                 Err(e) if e.to_string().contains("Cannot change ACK") => {
                     warn!(self.logger(), "Found an NACK when trying ACK");
+                    return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?));
                 }
                 Err(e) => {
                     error!(self.logger(), "Failed to post ACK: {e}");
@@ -1103,6 +1104,10 @@ pub trait WalletOnline: WalletOffline {
                     Ok(r) => r,
                 };
 
+                if result.validated == Some(false) {
+                    warn!(self.logger(), "Proxy already NACKed consignment for {recipient_id}");
+                    return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?));
+                }
                 proxy_res = Some((
                     result.consignment,
                     transport_endpoint.endpoint,
