@@ -444,3 +444,23 @@ pub(crate) fn default_rcv_expiration() -> u64 {
 pub(crate) fn default_send_expiration() -> u64 {
     (now().unix_timestamp() + DURATION_SEND_TRANSFER as i64) as u64
 }
+
+#[cfg(feature = "electrum")]
+pub(crate) fn assert_colorable_unspent_count(
+    wallet: &mut Wallet,
+    online: Option<&Online>,
+    settled_only: bool,
+    expected_len: usize,
+) {
+    let colorable_len = get_colorable_unspents(wallet, online, settled_only).len();
+    assert_eq!(colorable_len, expected_len);
+}
+
+#[cfg(feature = "electrum")]
+pub(crate) fn restart_test_wallet(wallet_data: WalletData) -> (Wallet, Online) {
+    let mut wallet = Wallet::new(wallet_data).expect("wallet recreate failed");
+    let online = wallet
+        .go_online(true, ELECTRUM_URL.to_string())
+        .expect("go_online after recreate failed");
+    (wallet, online)
+}

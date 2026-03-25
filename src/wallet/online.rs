@@ -1009,6 +1009,13 @@ pub trait WalletOnline: WalletOffline {
             let proxy_client = ProxyClient::new(proxy_url)?;
             match proxy_client.post_ack(&recipient_id, true) {
                 Ok(r) => {
+                    if let Some(err) = r.error {
+                        if err.message.contains("Cannot change ACK") {
+                            warn!(self.logger(), "Pre-existing NACK found when trying ACK");
+                            return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?));
+                        }
+                        return Err(Error::Proxy { details: err.message });
+                    }
                     debug!(self.logger(), "Consignment ACK response: {:?}", r);
                 }
                 Err(e) if e.to_string().contains("Cannot change ACK") => {
