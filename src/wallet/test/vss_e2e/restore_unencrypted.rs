@@ -23,14 +23,7 @@ fn scenario_2_1_unencrypted_backup_sanitized_restore_plus_bdk_db_rehydrate() {
 
     // Ensure some RGB state.
     let _ = wallet_a
-        .create_utxos(
-            online_a.clone(),
-            true,
-            Some(5),
-            Some(20_000),
-            FEE_RATE,
-            false,
-        )
+        .create_utxos(online_a, true, Some(5), Some(20_000), FEE_RATE, false)
         .expect("create_utxos");
     let issued_supply = 100u64;
     let asset = wallet_a
@@ -62,7 +55,7 @@ fn scenario_2_1_unencrypted_backup_sanitized_restore_plus_bdk_db_rehydrate() {
     )]);
     let _ = wallet_a
         .send(
-            online_a.clone(),
+            online_a,
             recipient_map,
             true,
             FEE_RATE,
@@ -74,8 +67,8 @@ fn scenario_2_1_unencrypted_backup_sanitized_restore_plus_bdk_db_rehydrate() {
     let expected_settled = issued_supply - send_amount;
     let ok = wait_for_function(
         || {
-            let _ = wallet_b.refresh(online_b.clone(), None, vec![], false);
-            let _ = wallet_a.refresh(online_a.clone(), Some(asset_id.clone()), vec![], false);
+            let _ = wallet_b.refresh(online_b, None, vec![], false);
+            let _ = wallet_a.refresh(online_a, Some(asset_id.clone()), vec![], false);
             let bal = wallet_a.get_asset_balance(asset_id.clone()).unwrap();
             bal.settled == expected_settled
         },
@@ -194,7 +187,7 @@ fn scenario_2_1_unencrypted_backup_sanitized_restore_plus_bdk_db_rehydrate() {
     let online_r = wallet_r
         .go_online(true, ELECTRUM_URL.to_string())
         .expect("go_online restored");
-    let _ = wallet_r.refresh(online_r.clone(), Some(asset_id.clone()), vec![], false);
+    let _ = wallet_r.refresh(online_r, Some(asset_id.clone()), vec![], false);
 
     let snapshot_post =
         snapshot_wallet_state(&mut wallet_r, &online_r, &asset_id).expect("snapshot post");
@@ -235,14 +228,7 @@ fn scenario_2_1_unencrypted_backup_sanitized_restore_plus_bdk_db_rehydrate() {
         .iter()
         .filter(|u| u.utxo.colorable)
         .count();
-    match wallet_r.create_utxos(
-        online_r.clone(),
-        true,
-        Some(1),
-        Some(20_000),
-        FEE_RATE,
-        false,
-    ) {
+    match wallet_r.create_utxos(online_r, true, Some(1), Some(20_000), FEE_RATE, false) {
         Ok(n) => {
             if n > 0 {
                 let ok = wait_for_function(
@@ -260,7 +246,7 @@ fn scenario_2_1_unencrypted_backup_sanitized_restore_plus_bdk_db_rehydrate() {
                 );
                 if !ok {
                     let colorable_after = wallet_r
-                        .list_unspents(Some(online_r.clone()), false, false)
+                        .list_unspents(Some(online_r), false, false)
                         .expect("list_unspents post-create_utxos")
                         .iter()
                         .filter(|u| u.utxo.colorable)
@@ -315,14 +301,7 @@ fn scenario_2_2_unencrypted_restore_without_bdk_db_restores_rgb_state_only() {
     let (mut wallet_b, online_b) = get_empty_wallet!();
 
     let _ = wallet_a
-        .create_utxos(
-            online_a.clone(),
-            true,
-            Some(5),
-            Some(20_000),
-            FEE_RATE,
-            false,
-        )
+        .create_utxos(online_a, true, Some(5), Some(20_000), FEE_RATE, false)
         .expect("create_utxos");
     let issued_supply = 100u64;
     let asset = wallet_a
@@ -354,7 +333,7 @@ fn scenario_2_2_unencrypted_restore_without_bdk_db_restores_rgb_state_only() {
     )]);
     let _ = wallet_a
         .send(
-            online_a.clone(),
+            online_a,
             recipient_map,
             true,
             FEE_RATE,
@@ -367,8 +346,8 @@ fn scenario_2_2_unencrypted_restore_without_bdk_db_restores_rgb_state_only() {
     let expected_settled = issued_supply - send_amount;
     let ok = wait_for_function(
         || {
-            let _ = wallet_b.refresh(online_b.clone(), None, vec![], false);
-            let _ = wallet_a.refresh(online_a.clone(), Some(asset_id.clone()), vec![], false);
+            let _ = wallet_b.refresh(online_b, None, vec![], false);
+            let _ = wallet_a.refresh(online_a, Some(asset_id.clone()), vec![], false);
             let bal = wallet_a.get_asset_balance(asset_id.clone()).unwrap();
             bal.settled == expected_settled
         },
