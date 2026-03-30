@@ -445,7 +445,7 @@ pub(crate) fn default_send_expiration() -> u64 {
     (now().unix_timestamp() + DURATION_SEND_TRANSFER as i64) as u64
 }
 
-#[cfg(feature = "electrum")]
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn assert_colorable_unspent_count(
     wallet: &mut Wallet,
     online: Option<&Online>,
