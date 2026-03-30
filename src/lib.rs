@@ -123,6 +123,8 @@ pub use crate::{
     error::Error,
     utils::{BitcoinNetwork, block_on},
 };
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub use rgbstd::validation::{ValidationConfig, ValidationError};
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use std::{
