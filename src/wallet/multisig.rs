@@ -337,6 +337,7 @@ impl RgbWalletOpsOnline for MultisigWallet {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Fail transfers completed");
         if outcome.cannot_fail {
             return Err(Error::CannotFailBatchTransfer);
@@ -1191,6 +1192,7 @@ impl MultisigWallet {
         let txn = self.database().begin_transaction()?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Get address completed");
         Ok(address.to_string())
     }
@@ -1503,6 +1505,7 @@ impl MultisigWallet {
         self.mark_operation_as_processed(&txn, response.operation_idx)?;
 
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
 
         Ok(ReceiveData {
             invoice: receive_data_internal.invoice_string,
@@ -1838,6 +1841,7 @@ impl MultisigWallet {
 
         let op_idx = self.get_local_last_processed_operation_idx_impl(&txn)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         let next_op_idx = op_idx
             .checked_add(1)
             .expect("operation index cannot exceed i32::MAX");
@@ -1861,6 +1865,7 @@ impl MultisigWallet {
             let txn = self.database().begin_transaction()?;
             let _ = self.refresh_impl(&txn, None, vec![], true)?;
             self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
             if !matches!(
                 op.operation_type,
                 OperationType::Inflation | OperationType::Burn
@@ -1868,6 +1873,7 @@ impl MultisigWallet {
                 let txn = self.database().begin_transaction()?;
                 let _ = self.refresh_impl(&txn, None, vec![], true);
                 self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
             }
         }
 
@@ -1884,6 +1890,7 @@ impl MultisigWallet {
         let txn = self.database().begin_transaction()?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Sync with hub completed");
         Ok(Some(OperationInfo {
             operation_idx: op.operation_idx,
@@ -1975,6 +1982,7 @@ impl MultisigWallet {
                 self.update_backup_info(&txn, false)?;
                 self.mark_operation_as_processed(&txn, op.operation_idx)?;
                 self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
                 let status = Self::build_voting_status(op, op.my_response)?;
                 Ok(H::completed(txid, details, status))
             }
@@ -1982,6 +1990,7 @@ impl MultisigWallet {
                 let txn = self.database().begin_transaction()?;
                 self.mark_operation_as_processed(&txn, op.operation_idx)?;
                 self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
                 let status = Self::build_voting_status(op, my_response)?;
                 Ok(H::discarded(details, status))
             }
@@ -2004,6 +2013,7 @@ impl MultisigWallet {
                     let asset_id = self.accept_issuance_consignment(&files, &txn)?;
                     self.mark_operation_as_processed(&txn, op.operation_idx)?;
                     self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
                     Operation::IssuanceCompleted { asset_id }
                 }
                 _ => {
@@ -2018,6 +2028,7 @@ impl MultisigWallet {
                     let details = self.import_receive_data(&txn, &files, &op.operation_type)?;
                     self.mark_operation_as_processed(&txn, op.operation_idx)?;
                     self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
                     match op.operation_type {
                         OperationType::BlindReceive => Operation::BlindReceiveCompleted { details },
                         _ => Operation::WitnessReceiveCompleted { details },
@@ -2102,6 +2113,7 @@ impl MultisigWallet {
         let txn = self.database().begin_transaction()?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Responding to operation...");
         Ok(OperationInfo {
             operation_idx: operation_response.operation_idx,
@@ -2177,6 +2189,7 @@ impl MultisigWallet {
             self.create_utxos_begin_impl(&txn, up_to, num, size, fee_rate, skip_sync, true)?;
         let res = self.post_operation(OperationType::CreateUtxos, PostData::Psbt(psbt))?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Initiate creating UTXOs completed");
         Ok(res)
     }
@@ -2201,6 +2214,7 @@ impl MultisigWallet {
         let psbt = self.send_btc_begin_impl(&txn, address, amount, fee_rate, skip_sync, true)?;
         let res = self.post_operation(OperationType::SendBtc, PostData::Psbt(psbt))?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Initiate sending BTC completed");
         Ok(res)
     }
@@ -2259,6 +2273,7 @@ impl MultisigWallet {
             PostData::BeginOperationData(Box::new(data)),
         )?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Initiate sending completed");
         Ok(res)
     }
@@ -2300,6 +2315,7 @@ impl MultisigWallet {
             PostData::BeginOperationData(Box::new(data)),
         )?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Initiate inflating completed");
         Ok(res)
     }
@@ -2331,8 +2347,38 @@ impl MultisigWallet {
             PostData::BeginOperationData(Box::new(data)),
         )?;
         self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Initiate burning completed");
         Ok(res)
+    }
+}
+
+#[cfg(feature = "vss")]
+impl MultisigWallet {
+    /// Configure VSS backup for this wallet.
+    pub fn configure_vss_backup(
+        &mut self,
+        config: super::vss::VssBackupConfig,
+    ) -> Result<(), Error> {
+        WalletBackup::configure_vss_backup(self, config)
+    }
+
+    /// Disable VSS auto-backup.
+    pub fn disable_vss_auto_backup(&mut self) {
+        WalletBackup::disable_vss_auto_backup(self)
+    }
+
+    /// Perform a VSS backup.
+    pub async fn vss_backup(&self, client: &super::vss::VssBackupClient) -> Result<i64, Error> {
+        WalletBackup::vss_backup(self, client).await
+    }
+
+    /// Get VSS backup info.
+    pub async fn vss_backup_info(
+        &self,
+        client: &super::vss::VssBackupClient,
+    ) -> Result<super::vss::VssBackupInfo, Error> {
+        WalletBackup::vss_backup_info(self, client).await
     }
 }
 

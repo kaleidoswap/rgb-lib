@@ -938,6 +938,7 @@ impl Wallet {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        if !dry_run { self.trigger_auto_backup(); }
         info!(self.logger(), "Send (begin) completed");
         Ok(SendBeginResult {
             psbt: begin_op_data.psbt.to_string(),
@@ -1224,6 +1225,7 @@ impl Wallet {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        if !dry_run { self.trigger_auto_backup(); }
         info!(self.logger(), "Inflate (begin) completed");
         Ok(InflateBeginResult {
             psbt: begin_operation_data.psbt.to_string(),

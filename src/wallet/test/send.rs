@@ -9644,8 +9644,9 @@ fn offline_receiver_blind_restart_donation_true() {
         TransferStatus::WaitingCounterparty
     ));
 
-    let rcv_wallet_data = rcv_wallet.wallet_data.clone();
-    drop(rcv_online);
+    let rcv_wallet_data = rcv_wallet.wallet_data().clone();
+    let rcv_keys = rcv_wallet.get_keys();
+    let _ = rcv_online;
     drop(rcv_wallet);
     let (mut rcv_wallet, rcv_online) = restart_test_wallet(rcv_wallet_data);
 
@@ -10074,8 +10075,9 @@ fn offline_receiver_sequential_receives_slot_integrity_after_restart() {
 
         assert_colorable_unspent_count(&mut rcv_wallet, Some(&rcv_online), false, 1);
 
-        let rcv_wallet_data = rcv_wallet.wallet_data.clone();
-        drop(rcv_online);
+        let rcv_wallet_data = rcv_wallet.wallet_data().clone();
+        let rcv_keys = rcv_wallet.get_keys();
+        let _ = rcv_online;
         drop(rcv_wallet);
         let (mut reopened_wallet, reopened_online) = restart_test_wallet(rcv_wallet_data);
 
