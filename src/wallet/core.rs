@@ -213,6 +213,8 @@ pub struct WalletInternals {
     pub(crate) wallet_dir: PathBuf,
     pub(crate) bdk_wallet: BdkWallet,
     pub(crate) bdk_pending: Arc<Mutex<ChangeSet>>,
+    /// Pinned derivation index per keychain for address reuse.
+    pub(crate) reuse_address_index: HashMap<KeychainKind, u32>,
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) online_data: Option<OnlineData>,
     #[cfg(feature = "vss")]

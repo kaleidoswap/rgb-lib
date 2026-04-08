@@ -15,6 +15,8 @@ pub mod bdk_wallet;
 pub mod bdk_wallet_locked_outpoint;
 pub mod coloring;
 pub mod media;
+#[cfg(feature = "mpc")]
+pub mod mpc_address;
 pub mod pending_witness_script;
 pub mod reserved_txo;
 pub mod token;

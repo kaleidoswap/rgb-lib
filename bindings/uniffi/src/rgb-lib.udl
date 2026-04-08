@@ -13,6 +13,7 @@ namespace rgb_lib {
 
 [Error, Remote]
 interface RgbLibError {
+  AddressReuseDisabled();
   AllocationsAlreadyAvailable();
   AssetNotFound(string asset_id);
   BatchTransferNotFound(i32 idx);
@@ -81,6 +82,7 @@ interface RgbLibError {
   InvalidWitnessVersion(string witness_version);
   MaxFeeExceeded(string txid);
   MinFeeNotMet(string txid);
+  MpcProvider(string details);
   MultisigCannotMarkOperationProcessed(string details);
   MultisigCannotRespondToOperation(string details);
   MultisigHubService(string details);
@@ -595,6 +597,7 @@ dictionary WalletData {
   DatabaseType database_type;
   u32 max_allocations_per_utxo;
   sequence<AssetSchema> supported_schemas;
+  boolean reuse_addresses;
 };
 
 [Remote]
@@ -928,6 +931,12 @@ interface Wallet {
 
   [Throws=RgbLibError]
   string get_address();
+
+  [Throws=RgbLibError]
+  string rotate_vanilla_address();
+
+  [Throws=RgbLibError]
+  string rotate_colored_address();
 
   [Throws=RgbLibError]
   Balance get_asset_balance(string asset_id);
