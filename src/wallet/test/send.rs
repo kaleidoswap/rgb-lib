@@ -9435,7 +9435,15 @@ fn offline_receiver_witness_restart_waiting_counterparty() {
         TransferStatus::WaitingConfirmations
     ));
 
-    rcv_wallet.sync(rcv_online).unwrap();
+    rcv_wallet
+        .sync(
+            rcv_online,
+            SyncOptions {
+                keychain: SyncKeychain::Colored,
+                strategy: SyncStrategy::FastSync,
+            },
+        )
+        .unwrap();
 
     let rcv_txos = rcv_wallet.database.iter_txos().unwrap();
     let rcv_witness_txos: Vec<database::entities::txo::Model> =
@@ -9513,7 +9521,7 @@ fn offline_receiver_witness_restart_donation_true() {
             true,
             FEE_RATE,
             MIN_CONFIRMATIONS,
-            false,
+            None,
         )
         .unwrap();
     assert!(!txid.is_empty());
@@ -9537,7 +9545,15 @@ fn offline_receiver_witness_restart_donation_true() {
         TransferStatus::WaitingCounterparty
     ));
 
-    rcv_wallet.sync(rcv_online).unwrap();
+    rcv_wallet
+        .sync(
+            rcv_online,
+            SyncOptions {
+                keychain: SyncKeychain::Colored,
+                strategy: SyncStrategy::FastSync,
+            },
+        )
+        .unwrap();
 
     let rcv_txos = rcv_wallet.database.iter_txos().unwrap();
     let rcv_witness_txos: Vec<database::entities::txo::Model> =
@@ -9628,7 +9644,7 @@ fn offline_receiver_blind_restart_donation_true() {
             true,
             FEE_RATE,
             MIN_CONFIRMATIONS,
-            false,
+            None,
         )
         .unwrap();
     assert!(!txid.is_empty());
@@ -9942,7 +9958,7 @@ fn offline_receiver_nack_donation_true_receiver_fails_after_broadcast() {
             true,
             FEE_RATE,
             MIN_CONFIRMATIONS,
-            false,
+            None,
         )
         .unwrap();
     assert!(!txid.is_empty());

@@ -899,6 +899,51 @@ fn restore_backup(
     rgb_lib::wallet::restore_backup(&backup_path, &password, &data_dir)
 }
 
+pub struct ValidateConsignmentResult {
+    pub valid: bool,
+    pub warnings: Option<Vec<String>>,
+    pub error: Option<String>,
+    pub details: Option<String>,
+}
+
+fn validate_consignment(
+    file_path: String,
+    indexer_url: String,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<ValidateConsignmentResult, RgbLibError> {
+    let r = rgb_lib::wallet::rust_only::validate_consignment(
+        &file_path,
+        &indexer_url,
+        bitcoin_network,
+    )?;
+    Ok(ValidateConsignmentResult {
+        valid: r.valid,
+        warnings: r.warnings,
+        error: r.error,
+        details: r.details,
+    })
+}
+
+fn validate_consignment_offchain(
+    file_path: String,
+    txid: String,
+    indexer_url: String,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<ValidateConsignmentResult, RgbLibError> {
+    let r = rgb_lib::wallet::rust_only::validate_consignment_offchain(
+        &file_path,
+        &txid,
+        &indexer_url,
+        bitcoin_network,
+    )?;
+    Ok(ValidateConsignmentResult {
+        valid: r.valid,
+        warnings: r.warnings,
+        error: r.error,
+        details: r.details,
+    })
+}
+
 struct RecipientInfo {
     recipient_info: RwLock<RgbLibRecipientInfo>,
 }
@@ -1643,6 +1688,7 @@ fn restore_from_vss(config: VssBackupConfig, target_dir: String) -> Result<Strin
 }
 
 uniffi::deps::static_assertions::assert_impl_all!(Wallet: Sync, Send);
+uniffi::deps::static_assertions::assert_impl_all!(VssBackupClient: Sync, Send);
 
 struct MultisigWallet {
     wallet_mutex: Mutex<RgbLibMultisigWallet>,

@@ -459,8 +459,8 @@ pub(crate) fn assert_colorable_unspent_count(
 }
 
 #[cfg(feature = "electrum")]
-pub(crate) fn restart_test_wallet(wallet_data: WalletData) -> (Wallet, Online) {
-    let mut wallet = Wallet::new(wallet_data).expect("wallet recreate failed");
+pub(crate) fn restart_test_wallet(wallet_data: WalletData, keys: SinglesigKeys) -> (Wallet, Online) {
+    let mut wallet = Wallet::new(wallet_data, keys).expect("wallet recreate failed");
     let online = wallet
         .go_online(true, ELECTRUM_URL.to_string())
         .expect("go_online after recreate failed");

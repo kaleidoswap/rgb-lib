@@ -139,7 +139,7 @@ fn scenario_3_1_enable_auto_backup_bumps_version_after_each_operation() {
             true,
             FEE_RATE,
             MIN_CONFIRMATIONS,
-            false,
+            None,
         )
         .expect("send");
     let v4 = rt
@@ -261,7 +261,7 @@ fn scenario_3_2_disable_auto_backup_prevents_version_bumps() {
             true,
             FEE_RATE,
             MIN_CONFIRMATIONS,
-            false,
+            None,
         )
         .expect("send");
     assert_version_unchanged_for(
@@ -398,7 +398,7 @@ fn manual_smoke_autobackup_async_restore() {
         .issue_asset_nia("QA".into(), "QA asset".into(), 0, vec![issued_supply])
         .expect("issue_asset_nia");
     let asset_id = asset.asset_id.clone();
-    mine_blocks(false, 2, false);
+    mine_blocks(false, 2);
     let _ = wallet_a.refresh(online_a, Some(asset_id.clone()), vec![], false);
 
     let bal_pre = wallet_a
@@ -456,7 +456,7 @@ fn manual_smoke_autobackup_async_restore() {
     restored_data.data_dir = restore_root.to_string();
     let mut wallet_r = Wallet::new(restored_data).expect("Wallet::new restored");
     let online_r = wallet_r
-        .go_online(true, ELECTRUM_URL.to_string())
+        .go_online(test_go_online_options(None))
         .expect("go_online restored");
     let _ = wallet_r.refresh(online_r, Some(asset_id.clone()), vec![], false);
 
@@ -499,7 +499,7 @@ fn manual_smoke_autobackup_blocking_restore() {
         .issue_asset_nia("QA".into(), "QA asset".into(), 0, vec![issued_supply])
         .expect("issue_asset_nia");
     let asset_id = asset.asset_id.clone();
-    mine_blocks(false, 2, false);
+    mine_blocks(false, 2);
     let _ = wallet_a.refresh(online_a, Some(asset_id.clone()), vec![], false);
 
     let bal_pre = wallet_a
@@ -538,7 +538,7 @@ fn manual_smoke_autobackup_blocking_restore() {
     restored_data.data_dir = restore_root.to_string();
     let mut wallet_r = Wallet::new(restored_data).expect("Wallet::new restored");
     let online_r = wallet_r
-        .go_online(true, ELECTRUM_URL.to_string())
+        .go_online(test_go_online_options(None))
         .expect("go_online restored");
     let _ = wallet_r.refresh(online_r, Some(asset_id.clone()), vec![], false);
     let bal_post = wallet_r.get_asset_balance(asset_id).expect("balance");
