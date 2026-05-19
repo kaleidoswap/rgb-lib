@@ -438,6 +438,7 @@ mod load;
 mod multisig;
 mod new;
 #[cfg(feature = "electrum")]
+mod onchain_swap;
 mod refresh;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 mod rust_only;

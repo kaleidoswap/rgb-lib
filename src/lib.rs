@@ -188,7 +188,10 @@ use bdk_wallet::{
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use bdk_wallet::{
     Update,
-    bitcoin::{blockdata::fee_rate::FeeRate, hashes::HashEngine},
+    bitcoin::{
+        Sequence, TxIn, Witness, absolute::LockTime, blockdata::fee_rate::FeeRate,
+        hashes::HashEngine, transaction::Version as TxVersion,
+    },
     chain::{
         DescriptorExt,
         spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse},
@@ -306,7 +309,7 @@ use crate::{
     error::IndexerError,
     utils::{
         INDEXER_STOP_GAP, OffchainResolver, check_proxy, get_indexer_and_resolver, hash_file,
-        script_buf_from_recipient_id,
+        recipient_id_from_script_buf, script_buf_from_recipient_id,
     },
     wallet::{AssignmentsCollection, Indexer, multisig::RespondToOperation},
 };
