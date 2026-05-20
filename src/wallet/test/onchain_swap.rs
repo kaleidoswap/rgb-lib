@@ -232,6 +232,9 @@ fn execute_swap(
 ) {
     let maker_receives_rgb = matches!(maker_receives.kind, OnchainSwapLegKind::Rgb);
     let taker_receives_rgb = matches!(maker_gives.kind, OnchainSwapLegKind::Rgb);
+    let rgb_for_rgb = maker_receives_rgb && taker_receives_rgb;
+    let maker_gives_asset_id = maker_gives.asset_id.clone();
+    let maker_receives_asset_id = maker_receives.asset_id.clone();
 
     let offer = maker
         .create_swap_offer(
@@ -249,9 +252,29 @@ fn execute_swap(
         .accept_swap_request(maker_online, request, 0, false)
         .unwrap();
     assert_consignment_transport(&proposal.consignments, proxy_url);
+    if taker_receives_rgb {
+        assert!(
+            proposal.maker_history.is_some(),
+            "maker RGB history should be exposed as a high-level history ref"
+        );
+    }
     let completion = taker
         .complete_swap_proposal(taker_online, proposal, 0, false)
         .unwrap();
+    if rgb_for_rgb {
+        assert!(
+            completion.taker_history.is_some(),
+            "taker RGB history should be exposed as a high-level history ref"
+        );
+        let mut tampered_completion = completion.clone();
+        tampered_completion.txid =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        assert!(
+            maker
+                .process_swap_completion(maker_online, tampered_completion)
+                .is_err()
+        );
+    }
     // Maker resumes the swap on their side: for RGB-for-RGB this consumes the fascia and emits
     // the maker's consignment; for the single-RGB cases this is a no-op.
     let completion = maker
@@ -270,6 +293,20 @@ fn execute_swap(
     mine(false);
 
     if taker_receives_rgb {
+        let mut missing_consignment = completion.clone();
+        missing_consignment
+            .consignments
+            .retain(|c| Some(c.asset_id.as_str()) != maker_gives_asset_id.as_deref());
+        assert!(
+            taker
+                .accept_swap_transfers(
+                    taker_online,
+                    missing_consignment,
+                    OnchainSwapRole::Taker,
+                    false,
+                )
+                .is_err()
+        );
         let receive_result = taker
             .accept_swap_transfers(
                 taker_online,
@@ -281,6 +318,20 @@ fn execute_swap(
         assert!(!receive_result.assignments.is_empty());
     }
     if maker_receives_rgb {
+        let mut missing_consignment = completion.clone();
+        missing_consignment
+            .consignments
+            .retain(|c| Some(c.asset_id.as_str()) != maker_receives_asset_id.as_deref());
+        assert!(
+            maker
+                .accept_swap_transfers(
+                    maker_online,
+                    missing_consignment,
+                    OnchainSwapRole::Maker,
+                    false,
+                )
+                .is_err()
+        );
         let receive_result = maker
             .accept_swap_transfers(maker_online, completion, OnchainSwapRole::Maker, false)
             .unwrap();

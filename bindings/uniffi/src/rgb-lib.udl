@@ -796,12 +796,19 @@ dictionary OnchainSwapInput {
 [Remote]
 dictionary OnchainSwapConsignment {
   string asset_id;
-  string schema_id;
   string path;
   string? endpoint;
   string txid;
   u32 vout;
   u64 blinding;
+  string recipient_id;
+};
+
+[Remote]
+dictionary OnchainSwapAssetHistory {
+  string asset_id;
+  string path;
+  string? endpoint;
   string recipient_id;
 };
 
@@ -819,7 +826,6 @@ dictionary OnchainSwapOffer {
   string? maker_rgb_script_pubkey_hex;
   u64? maker_rgb_blinding;
   string? proxy_url;
-  string? maker_send_contract_path;
 };
 
 [Remote]
@@ -831,7 +837,6 @@ dictionary OnchainSwapRequest {
   string? taker_rgb_script_pubkey_hex;
   u64? taker_rgb_blinding;
   string taker_change_script_pubkey_hex;
-  string? taker_send_contract_path;
 };
 
 [Remote]
@@ -842,6 +847,7 @@ dictionary OnchainSwapProposal {
   string psbt;
   string txid;
   sequence<OnchainSwapConsignment> consignments;
+  OnchainSwapAssetHistory? maker_history;
 };
 
 [Remote]
@@ -851,7 +857,7 @@ dictionary OnchainSwapCompletion {
   string? finalized_psbt;
   string txid;
   sequence<OnchainSwapConsignment> consignments;
-  string? fascia_json;
+  OnchainSwapAssetHistory? taker_history;
 };
 
 dictionary OnchainSwapReceiveResult {
@@ -1088,6 +1094,10 @@ interface Wallet {
   OnchainSwapCompletion complete_swap_proposal(
     Online online, OnchainSwapProposal proposal, u8 min_confirmations,
     boolean skip_sync);
+
+  [Throws=RgbLibError]
+  OnchainSwapCompletion process_swap_completion(
+    Online online, OnchainSwapCompletion completion);
 
   [Throws=RgbLibError]
   OnchainSwapReceiveResult accept_swap_transfers(

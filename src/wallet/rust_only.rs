@@ -3,6 +3,15 @@
 //! This module defines additional utility methods that are not exposed via FFI.
 
 use super::*;
+use amplify::num::u5;
+use rgbstd::{
+    containers::SealWitness,
+    opret::OpretProof,
+    rgbcore::commit_verify::{
+        TryCommitVerify,
+        mpc::{self, MPC_MINIMAL_DEPTH},
+    },
+};
 
 /// RGB asset-specific information to color a transaction
 #[derive(Debug, Clone)]
@@ -278,6 +287,46 @@ impl Wallet {
 
         info!(self.logger(), "Finalize RGB commitment completed");
         Ok(fascia)
+    }
+
+    /// Reconstruct an RGB fascia from a PSBT whose RGB commitment has already been finalized.
+    ///
+    /// This is used by high-level interactive flows where one party receives a PSBT after the
+    /// counterparty has finalized the MPC commitment. It keeps the raw fascia internal to Rust while
+    /// still allowing the wallet to consume the RGB transition data.
+    pub(crate) fn fascia_from_finalized_psbt(&self, psbt: &Psbt) -> Result<Fascia, Error> {
+        let bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
+        let output = psbt
+            .outputs
+            .iter()
+            .find(|output| output.mpc_message_map().is_ok())
+            .ok_or_else(|| Error::InvalidColoringInfo {
+                details: s!("PSBT has no RGB MPC message host"),
+            })?;
+        let messages = output.mpc_message_map().map_err(InternalError::from)?;
+        let min_depth = output
+            .mpc_min_tree_depth()
+            .map(u5::with)
+            .unwrap_or(MPC_MINIMAL_DEPTH);
+        let source = mpc::MultiSource {
+            min_depth,
+            messages,
+            static_entropy: output.mpc_entropy(),
+        };
+        let merkle_tree =
+            mpc::MerkleTree::try_commit(&source).map_err(|e| Error::InvalidColoringInfo {
+                details: format!("failed to reconstruct RGB MPC proof: {e}"),
+            })?;
+        let merkle_block = mpc::MerkleBlock::from(merkle_tree);
+        let bundles = Confined::try_from(bundles).map_err(|_| Error::InvalidColoringInfo {
+            details: s!("PSBT has no RGB bundles"),
+        })?;
+        let seal_witness = SealWitness::new(
+            PubWitness::with(psbt.unsigned_tx.clone()),
+            merkle_block,
+            OpretProof::default().into(),
+        );
+        Ok(Fascia::new(seal_witness, bundles))
     }
 
     /// Color a PSBT, consume the RGB fascia and return the related consignment.

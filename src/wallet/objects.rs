@@ -1728,8 +1728,6 @@ pub struct OnchainSwapLeg {
 pub struct OnchainSwapConsignment {
     /// RGB asset ID
     pub asset_id: String,
-    /// RGB schema ID
-    pub schema_id: String,
     /// Local consignment file path
     pub path: String,
     /// Proxy transport endpoint used to retrieve the consignment
@@ -1744,6 +1742,21 @@ pub struct OnchainSwapConsignment {
     /// Proxy lookup key (the receiver's RGB recipient ID). Distinct per consignment so that
     /// RGB-for-RGB swaps with two consignments under the same witness transaction do not collide
     /// in the proxy server's keyspace.
+    pub recipient_id: String,
+}
+
+/// Asset history needed by a counterparty to validate/import an RGB asset before a swap step.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct OnchainSwapAssetHistory {
+    /// RGB asset ID
+    pub asset_id: String,
+    /// Local history file path
+    pub path: String,
+    /// Proxy transport endpoint used to retrieve the history file
+    pub endpoint: Option<String>,
+    /// Proxy lookup key
     pub recipient_id: String,
 }
 
@@ -1792,11 +1805,6 @@ pub struct OnchainSwapOffer {
     pub maker_rgb_blinding: Option<u64>,
     /// Preferred proxy URL
     pub proxy_url: Option<String>,
-    /// Path to the issuance consignment for the contract the maker is sending. Used by the
-    /// counterparty to import the contract definition into their runtime before they have to
-    /// consume the RGB fascia (required for RGB-for-RGB swaps so the taker knows the maker's
-    /// contract when consuming the multi-contract fascia).
-    pub maker_send_contract_path: Option<String>,
 }
 
 /// A taker response to an on-chain swap offer.
@@ -1818,10 +1826,6 @@ pub struct OnchainSwapRequest {
     pub taker_rgb_blinding: Option<u64>,
     /// Taker BTC/RGB change script pubkey
     pub taker_change_script_pubkey_hex: String,
-    /// Path to the issuance consignment for the contract the taker is sending. Used by the maker
-    /// to import the contract definition into their runtime before consuming the multi-contract
-    /// fascia (only required for RGB-for-RGB swaps).
-    pub taker_send_contract_path: Option<String>,
 }
 
 /// A maker-created proposal containing the coordinated PSBT.
@@ -1841,6 +1845,9 @@ pub struct OnchainSwapProposal {
     pub txid: String,
     /// Consignments produced by the maker
     pub consignments: Vec<OnchainSwapConsignment>,
+    /// Maker asset history, required when the maker sends RGB and the counterparty needs the
+    /// contract history before completing the swap.
+    pub maker_history: Option<OnchainSwapAssetHistory>,
 }
 
 /// A taker-completed swap ready for maker verification/broadcast.
@@ -1858,11 +1865,9 @@ pub struct OnchainSwapCompletion {
     pub txid: String,
     /// Consignments produced by both parties
     pub consignments: Vec<OnchainSwapConsignment>,
-    /// Serialized RGB [`Fascia`] (JSON), produced when the swap involves any RGB leg. The maker
-    /// uses this to consume the fascia and generate the consignment for the leg they are sending
-    /// (only required for RGB-for-RGB swaps; for RGB-for-BTC the maker already consumed locally,
-    /// and for BTC-for-RGB the maker has no leg to consume).
-    pub fascia_json: Option<String>,
+    /// Taker asset history, required when the taker sends RGB and the maker needs the contract
+    /// history before processing the completion.
+    pub taker_history: Option<OnchainSwapAssetHistory>,
 }
 
 /// Result of accepting swap RGB transfers.

@@ -19,8 +19,8 @@ use rgb_lib::{
         InvoiceData as RgbLibInvoiceData, Media, Metadata, MultisigKeys, MultisigOnlineOptions,
         MultisigVotingStatus as RgbLibMultisigVotingStatus, MultisigWallet as RgbLibMultisigWallet,
         Online, OnlineOptions, Operation as RgbLibOperation, OperationInfo as RgbLibOperationInfo,
-        OnchainSwapCompletion, OnchainSwapConsignment, OnchainSwapInput, OnchainSwapLeg,
-        OnchainSwapLegKind, OnchainSwapOffer, OnchainSwapProposal,
+        OnchainSwapAssetHistory, OnchainSwapCompletion, OnchainSwapConsignment, OnchainSwapInput,
+        OnchainSwapLeg, OnchainSwapLegKind, OnchainSwapOffer, OnchainSwapProposal,
         OnchainSwapReceiveResult as RgbLibOnchainSwapReceiveResult, OnchainSwapRequest,
         OnchainSwapRole, OperationResult, Outpoint, PendingVanillaTx, ProofOfReserves,
         PsbtInputInfo, PsbtInspection, PsbtOutputInfo, ReceiveData, Recipient as RgbLibRecipient,
@@ -1453,6 +1453,14 @@ impl Wallet {
             .complete_swap_proposal(online, proposal, min_confirmations, skip_sync)
     }
 
+    fn process_swap_completion(
+        &self,
+        online: Online,
+        completion: OnchainSwapCompletion,
+    ) -> Result<OnchainSwapCompletion, RgbLibError> {
+        self._get_wallet().process_swap_completion(online, completion)
+    }
+
     fn accept_swap_transfers(
         &self,
         online: Online,
@@ -1900,6 +1908,7 @@ mod tests {
             "accept_swap_offer",
             "accept_swap_request",
             "complete_swap_proposal",
+            "process_swap_completion",
             "accept_swap_transfers",
         ] {
             assert!(UDL.contains(method), "missing {method} from UDL");
