@@ -2232,6 +2232,7 @@ fn batch_donation_success() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap()
         .txid;
@@ -2776,6 +2777,7 @@ fn fail() {
         MIN_CONFIRMATIONS,
         default_send_expiration(),
         false,
+        None,
     );
     assert!(matches!(result, Err(Error::InvalidFeeRate { details: m }) if m == FEE_MSG_LOW));
 
@@ -2788,6 +2790,7 @@ fn fail() {
         MIN_CONFIRMATIONS,
         default_send_expiration(),
         false,
+        None,
     );
     assert!(matches!(result, Err(Error::InvalidFeeRate { details: m }) if m == FEE_MSG_OVER));
 
@@ -4824,6 +4827,7 @@ fn min_confirmations_common(
             FEE_RATE,
             min_confirmations,
             default_send_expiration(),
+            None,
         )
         .unwrap()
         .txid;
@@ -4913,6 +4917,7 @@ fn min_confirmations_common(
             FEE_RATE,
             min_confirmations,
             default_send_expiration(),
+            None,
         )
         .unwrap()
         .txid;
@@ -5048,6 +5053,7 @@ fn spend_double_receive() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap()
         .txid;
@@ -5089,6 +5095,7 @@ fn spend_double_receive() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap()
         .txid;
@@ -5552,6 +5559,7 @@ fn min_fee_rate() {
             MIN_CONFIRMATIONS,
             default_send_expiration(),
             false,
+            None,
         )
         .unwrap();
     let psbt = Psbt::from_str(&res.psbt).unwrap();
@@ -5569,6 +5577,7 @@ fn min_fee_rate() {
             fee_rate,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap()
         .txid;
@@ -5620,6 +5629,7 @@ fn max_fee_exceeded_common(
             fee_rate,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap();
     assert!(!send_result.txid.is_empty());
@@ -5716,6 +5726,7 @@ fn min_relay_fee_common(
             MIN_CONFIRMATIONS,
             default_send_expiration(),
             false,
+            None,
         )
         .unwrap();
     let psbt = Psbt::from_str(&res.psbt).unwrap();
@@ -5735,6 +5746,7 @@ fn min_relay_fee_common(
             fee_rate,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap();
     assert!(!send_result.txid.is_empty());
@@ -5860,6 +5872,7 @@ fn skip_sync() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap()
         .txid;
@@ -5911,6 +5924,7 @@ fn skip_sync() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap()
         .txid;
@@ -5970,6 +5984,7 @@ fn skip_sync() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap()
         .txid;
@@ -6736,6 +6751,7 @@ fn pending_witness_ma1_blind_receive_fail() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap();
     assert!(!txid.is_empty());
@@ -6925,6 +6941,7 @@ fn pending_witness_txo() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap();
     assert!(!txid.is_empty());
@@ -7340,6 +7357,7 @@ fn donation_recipient_nack() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap()
         .txid;
@@ -9522,6 +9540,7 @@ fn offline_receiver_witness_restart_donation_true() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
     assert!(!txid.is_empty());
@@ -9644,6 +9663,7 @@ fn offline_receiver_blind_restart_donation_true() {
             true,
             FEE_RATE,
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .unwrap();
@@ -9958,6 +9978,7 @@ fn offline_receiver_nack_donation_true_receiver_fails_after_broadcast() {
             true,
             FEE_RATE,
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .unwrap();

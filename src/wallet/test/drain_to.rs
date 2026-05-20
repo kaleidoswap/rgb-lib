@@ -261,6 +261,7 @@ fn reservation_interaction() {
         FEE_RATE,
         true,
         false,
+        None,
     );
     assert_matches!(
         res,
@@ -284,6 +285,7 @@ fn reservation_interaction() {
             FEE_RATE,
             true,
             false,
+            None,
         )
         .unwrap();
     let send_psbt = Psbt::from_str(&send_psbt_str).unwrap();

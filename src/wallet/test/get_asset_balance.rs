@@ -416,6 +416,7 @@ fn transfer_balances() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
         .unwrap();
 
