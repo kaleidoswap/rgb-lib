@@ -455,6 +455,7 @@ mod sign_psbt;
 mod sync;
 mod witness_receive;
 
+mod tx_known_to_wallet;
 #[cfg(feature = "vss")]
 mod vss;
 #[cfg(feature = "vss")]
