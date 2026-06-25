@@ -1051,6 +1051,7 @@ impl MultisigWallet {
         // setup RGB
         setup_rgb(&wallet_dir, wdata.supported_schemas, wdata.bitcoin_network)?;
 
+        let reuse_address_index = database.begin_transaction()?.get_reuse_address_index()?;
         info!(logger, "New multisig wallet completed");
         Ok(Self {
             internals: WalletInternals {
@@ -1061,7 +1062,7 @@ impl MultisigWallet {
                 wallet_dir,
                 bdk_wallet,
                 bdk_pending: Arc::new(Mutex::new(ChangeSet::default())),
-                reuse_address_index: HashMap::new(),
+                reuse_address_index,
                 #[cfg(any(feature = "electrum", feature = "esplora"))]
                 online_data: None,
                 #[cfg(feature = "vss")]
@@ -1234,6 +1235,9 @@ impl MultisigWallet {
         self.internals_mut()
             .reuse_address_index
             .insert(keychain, new_index);
+        let txn = self.database().begin_transaction()?;
+        txn.set_reuse_address_index(keychain, new_index)?;
+        txn.commit()?;
         let address = self.bdk_wallet().peek_address(keychain, new_index).address;
         Ok(address.to_string())
     }

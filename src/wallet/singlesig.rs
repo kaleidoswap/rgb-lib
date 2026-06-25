@@ -201,6 +201,7 @@ impl Wallet {
 
         // persist the settings needed to load the wallet back
         WalletManifest::new(&wallet_data, &keys).write(&wallet_dir)?;
+        let reuse_address_index = database.begin_transaction()?.get_reuse_address_index()?;
 
         info!(logger, "New wallet completed");
         Ok(Self {
@@ -212,7 +213,7 @@ impl Wallet {
                 wallet_dir,
                 bdk_wallet,
                 bdk_pending: Arc::new(Mutex::new(ChangeSet::default())),
-                reuse_address_index: HashMap::new(),
+                reuse_address_index,
                 #[cfg(any(feature = "electrum", feature = "esplora"))]
                 online_data: None,
                 #[cfg(feature = "vss")]
@@ -375,6 +376,11 @@ impl Wallet {
         self.internals_mut()
             .reuse_address_index
             .insert(keychain, new_index);
+        let txn = self.database().begin_transaction()?;
+        txn.set_reuse_address_index(keychain, new_index)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         let address = self.bdk_wallet().peek_address(keychain, new_index).address;
         Ok(address.to_string())
     }

@@ -8,6 +8,7 @@ mod m20260401_000001_create_mpc_address_table;
 mod m20260414_134758_add_reserved_txo;
 mod m20260625_121819_incoming_rework;
 mod m20260727_115821_add_bdk_tables;
+mod m20260415_000001_create_reuse_address_index_table;
 
 pub struct Migrator;
 
@@ -23,6 +24,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260414_134758_add_reserved_txo::Migration),
             Box::new(m20260625_121819_incoming_rework::Migration),
             Box::new(m20260727_115821_add_bdk_tables::Migration),
+            Box::new(m20260415_000001_create_reuse_address_index_table::Migration),
         ]
     }
 }
