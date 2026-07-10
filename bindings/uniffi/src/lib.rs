@@ -236,6 +236,7 @@ fn parse_rgb_transport(endpoint: &str) -> Result<RgbTransport, RgbLibError> {
 
 pub struct InvoiceData {
     pub recipient_id: String,
+    pub proxy_recipient_id: String,
     pub asset_schema: Option<AssetSchema>,
     pub asset_id: Option<String>,
     pub assignment: Assignment,
@@ -249,6 +250,7 @@ impl From<RgbLibInvoiceData> for InvoiceData {
     fn from(orig: RgbLibInvoiceData) -> Self {
         Self {
             recipient_id: orig.recipient_id,
+            proxy_recipient_id: orig.proxy_recipient_id,
             asset_schema: orig.asset_schema,
             asset_id: orig.asset_id,
             assignment: orig.assignment.into(),
@@ -264,6 +266,7 @@ impl From<InvoiceData> for RgbLibInvoiceData {
     fn from(orig: InvoiceData) -> Self {
         RgbLibInvoiceData {
             recipient_id: orig.recipient_id,
+            proxy_recipient_id: orig.proxy_recipient_id,
             asset_schema: orig.asset_schema,
             asset_id: orig.asset_id,
             assignment: orig.assignment.into(),
@@ -335,6 +338,7 @@ pub struct Transfer {
     pub kind: TransferKind,
     pub txid: Option<String>,
     pub recipient_id: Option<String>,
+    pub proxy_recipient_id: Option<String>,
     pub receive_utxo: Option<Outpoint>,
     pub change_utxo: Option<Outpoint>,
     pub expiration_timestamp: Option<u64>,
@@ -356,6 +360,7 @@ impl From<RgbLibTransfer> for Transfer {
             kind: orig.kind,
             txid: orig.txid,
             recipient_id: orig.recipient_id,
+            proxy_recipient_id: orig.proxy_recipient_id,
             receive_utxo: orig.receive_utxo,
             change_utxo: orig.change_utxo,
             expiration_timestamp: orig.expiration_timestamp,
@@ -379,6 +384,7 @@ impl From<Transfer> for RgbLibTransfer {
             kind: orig.kind,
             txid: orig.txid,
             recipient_id: orig.recipient_id,
+            proxy_recipient_id: orig.proxy_recipient_id,
             receive_utxo: orig.receive_utxo,
             change_utxo: orig.change_utxo,
             expiration_timestamp: orig.expiration_timestamp,
