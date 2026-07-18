@@ -766,6 +766,7 @@ impl MpcWallet {
             expiration_timestamp.map(|t| t as i64),
             transport_endpoints,
             RecipientType::Blind,
+            None,
         )?;
 
         let batch_transfer_idx =

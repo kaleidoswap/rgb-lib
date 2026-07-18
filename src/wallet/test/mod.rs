@@ -450,6 +450,7 @@ mod send;
 #[cfg(feature = "electrum")]
 mod send_btc;
 mod sign_psbt;
+mod swaply_htlc_lock;
 #[cfg(feature = "electrum")]
 mod sync;
 mod witness_receive;
