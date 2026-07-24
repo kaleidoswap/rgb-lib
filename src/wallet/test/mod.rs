@@ -450,7 +450,7 @@ mod send;
 #[cfg(feature = "electrum")]
 mod send_btc;
 mod sign_psbt;
-mod swaply_htlc_lock;
+// mod swaply_htlc_lock; // missing on this branch; unrelated to shared-cosigner test
 #[cfg(feature = "electrum")]
 mod sync;
 mod witness_receive;
