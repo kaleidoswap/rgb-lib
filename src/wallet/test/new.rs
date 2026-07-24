@@ -150,6 +150,38 @@ fn testnet4_success() {
     assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
 }
 
+#[cfg(feature = "esplora")]
+#[test]
+#[ignore = "frequently fails due to public esplora endpoint being unreachable from CI"]
+#[parallel]
+fn mainnet_esplora_success() {
+    create_test_data_dir();
+
+    let bitcoin_network = BitcoinNetwork::Mainnet;
+    let keys = generate_keys(bitcoin_network, WitnessVersion::Taproot);
+    let mut party = offline_party!(
+        Wallet::new(
+            WalletData {
+                data_dir: get_test_data_dir_string(),
+                bitcoin_network,
+                database_type: DatabaseType::Sqlite,
+                max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
+                supported_schemas: vec![AssetSchema::Cfa, AssetSchema::Nia, AssetSchema::Uda],
+                reuse_addresses: false,
+            },
+            SinglesigKeys::from_keys(&keys, None),
+        )
+        .unwrap()
+    );
+
+    check_wallet(&party, bitcoin_network, None);
+    // UTEXO Mainnet Esplora (Hetzner)
+    let indexer_url = "https://esplora-mainnet.utexo.com";
+    party.go_online(false, Some(indexer_url));
+    assert!(!party.wallet.watch_only());
+    assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
+}
+
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
