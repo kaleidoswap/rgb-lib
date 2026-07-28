@@ -1474,6 +1474,9 @@ impl MultisigWallet {
     ///
     /// The `inflation_amounts` can be empty. If provided the sum of its elements plus the sum of
     /// `amounts` cannot exceed the maximum `u64` value.
+    ///
+    /// `issuance_type` controls whether a link-right UTXO is created and whether the genesis
+    /// contract declares a parent contract.
     pub fn issue_asset_ifa(
         &self,
         online: Online,
@@ -1483,10 +1486,13 @@ impl MultisigWallet {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
+        issuance_type: Option<IfaIssuanceType>,
     ) -> Result<AssetIFA, Error> {
         info!(self.logger(), "Issuing IFA...");
         self.check_online(online)?;
         self.check_is_cosigner()?;
+        let (create_link_right, linked_from_contract_id) =
+            issuance_type.unwrap_or_default().into_ifa_link_data()?;
         let txn = self.database().begin_transaction()?;
         let issue_data = self.create_ifa_contract(
             &txn,
@@ -1496,6 +1502,8 @@ impl MultisigWallet {
             amounts,
             inflation_amounts,
             reject_list_url,
+            linked_from_contract_id,
+            create_link_right,
         )?;
         let res = self.upload_and_process_issuance(&txn, &issue_data, vec![])?;
         txn.commit()?;
@@ -1766,6 +1774,7 @@ impl MultisigWallet {
             valid_contract,
             contract_path,
             issue_utxos,
+            link_right_outpoint: None,
         };
 
         self.import_and_save_contract(txn, &issue_data, &mut runtime)?;

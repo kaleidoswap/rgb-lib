@@ -244,6 +244,13 @@ pub enum Error {
     #[error("Invalid consignment")]
     InvalidConsignment,
 
+    /// The provided contracts cannot be linked
+    #[error("Invalid contract link: {details}")]
+    InvalidContractLink {
+        /// Error details
+        details: String,
+    },
+
     /// The provided cosigner is invalid
     #[error("Invalid cosigner: {details}")]
     InvalidCosigner {
@@ -383,6 +390,13 @@ pub enum Error {
     /// The provided reject list URL is invalid
     #[error("Invalid reject list URL: {details}")]
     InvalidRejectListUrl {
+        /// Error details
+        details: String,
+    },
+
+    /// The provided outpoint does not hold a spendable right
+    #[error("Invalid right outpoint: {details}")]
+    InvalidRightOutpoint {
         /// Error details
         details: String,
     },

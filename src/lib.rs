@@ -125,6 +125,10 @@ pub use crate::{
     },
     error::Error,
     utils::{BitcoinNetwork, block_on},
+    wallet::{
+        IfaIssuanceType, RecipientType, TransactionType, TransferKind, Wallet,
+        backup::restore_backup,
+    },
 };
 #[cfg(feature = "mpc")]
 pub use mpc::MpcWalletProvider;
@@ -228,7 +232,10 @@ use rgbstd::{
     Operation as _, Opout, OutputSeal, OwnedFraction, Precision, Schema, SecretSeal, TokenIndex,
     Transition, TypeSystem,
     containers::{BuilderSeal, Kit, ValidContract, ValidKit, ValidTransfer},
-    contract::{AllocatedState, ContractBuilder, IssuerWrapper, SchemaWrapper, TransitionBuilder},
+    contract::{
+        AllocatedState, ContractBuilder, IssuerWrapper, LinkableSchemaWrapper, SchemaWrapper,
+        TransitionBuilder,
+    },
     info::SchemaInfo,
     invoice::{InvoiceState, Pay2Vout},
     persistence::{MemContract, MemContractState, StashReadProvider, Stock, fs::FsBinStore},
@@ -259,7 +266,7 @@ use rgbstd::{
 use schemata::{CfaWrapper, NiaWrapper, UdaWrapper};
 use schemata::{
     CollectibleFungibleAsset, IfaWrapper, InflatableFungibleAsset, NonInflatableAsset, OS_ASSET,
-    OS_INFLATION, TS_BURN, TS_INFLATION, TS_TRANSFER, UniqueDigitalAsset,
+    OS_INFLATION, OS_LINK, TS_BURN, TS_INFLATION, TS_LINK, TS_TRANSFER, UniqueDigitalAsset,
 };
 use scrypt::{Params, phc::Salt, scrypt};
 use sea_orm::{

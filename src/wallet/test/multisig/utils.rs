@@ -564,6 +564,7 @@ pub(super) trait MultisigOps: OfflineSigParty {
             amounts,
             inflation_amounts,
             reject_list_url,
+            None,
         )
     }
 

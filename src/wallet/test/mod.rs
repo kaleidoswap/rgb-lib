@@ -429,6 +429,8 @@ mod issue_asset_nia;
 #[cfg(feature = "electrum")]
 mod issue_asset_uda;
 #[cfg(feature = "electrum")]
+mod link_ifa;
+#[cfg(feature = "electrum")]
 mod list_assets;
 #[cfg(feature = "electrum")]
 mod list_pending_vanilla_txs;

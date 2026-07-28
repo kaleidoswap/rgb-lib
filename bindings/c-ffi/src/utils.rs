@@ -664,6 +664,7 @@ pub(crate) fn issue_asset_ifa(
         amounts,
         inflation_amounts,
         reject_list_url,
+        None,
     )?;
     Ok(serde_json::to_string(&res)?)
 }
