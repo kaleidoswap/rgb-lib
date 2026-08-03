@@ -165,11 +165,6 @@ required-features = ["electrum"]
 # make overflow bugs fail loudly instead of producing wrong amounts
 overflow-checks = true
 
-[[example]]
-name = "mainnet_issue_nia"
-required-features = ["electrum"]
-
-
 [profile.reldebug]
 inherits = "release"
 debug = 1
