@@ -115,8 +115,6 @@ regex = { version = "1.13", default-features = false }
 serial_test = { version = "3.5", default-features = false }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-secp256k1 = { version = "0.31.1", features = ["rand", "global-context"] }
-bitcoin = { version = "0.32.7", features = ["rand-std"] }
 
 # OS-specific reqwest features
 [target.'cfg(target_os = "android")'.dependencies.reqwest]
@@ -171,9 +169,6 @@ overflow-checks = true
 name = "mainnet_issue_nia"
 required-features = ["electrum"]
 
-[[example]]
-name = "multisig_balance"
-required-features = ["electrum"]
 
 [profile.reldebug]
 inherits = "release"
