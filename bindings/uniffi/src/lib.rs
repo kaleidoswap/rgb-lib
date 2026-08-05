@@ -1200,30 +1200,6 @@ impl Wallet {
         )
     }
 
-    fn script_witness_receive(
-        &self,
-        script_pubkey_hex: String,
-        asset_id: Option<String>,
-        assignment: Assignment,
-        expiration_timestamp: Option<u64>,
-        transport_endpoints: Vec<String>,
-        min_confirmations: u8,
-    ) -> Result<ReceiveData, RgbLibError> {
-        let script_pubkey = ScriptBuf::from_hex(&script_pubkey_hex).map_err(|e| {
-            RgbLibError::InvalidRecipientData {
-                details: format!("invalid script_pubkey_hex: {e}"),
-            }
-        })?;
-        self._get_wallet().script_witness_receive(
-            script_pubkey,
-            asset_id,
-            assignment.into(),
-            expiration_timestamp,
-            transport_endpoints,
-            min_confirmations,
-        )
-    }
-
     fn color_psbt_and_consume(
         &self,
         psbt: String,

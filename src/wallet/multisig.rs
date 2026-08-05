@@ -1523,7 +1523,6 @@ impl MultisigWallet {
             expiration_timestamp as i64,
             transport_endpoints,
             recipient_type,
-            None,
         )?;
 
         // post operation and metadata to hub
