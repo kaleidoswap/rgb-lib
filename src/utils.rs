@@ -906,7 +906,6 @@ impl RgbRuntime {
             .map_err(InternalError::from)
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) fn contracts_assigning(
         &self,
         outputs: impl IntoIterator<Item = impl Into<OutPoint>>,

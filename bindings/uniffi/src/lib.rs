@@ -1010,11 +1010,9 @@ fn validate_consignment_offchain(
     })
 }
 
-fn script_hex_from_recipient_id(recipient_id: String) -> Result<String, RgbLibError> {
-    match rgb_lib::utils::script_buf_from_recipient_id(recipient_id)? {
-        Some(script) => Ok(script.to_hex_string()),
-        None => Err(RgbLibError::InvalidRecipientID),
-    }
+fn script_hex_from_recipient_id(recipient_id: String) -> Result<Option<String>, RgbLibError> {
+    Ok(rgb_lib::utils::script_buf_from_recipient_id(recipient_id)?
+        .map(|script| script.to_hex_string()))
 }
 
 fn restore_backup(
