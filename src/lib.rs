@@ -109,7 +109,7 @@ pub use bdk_wallet::bitcoin;
 pub use rgbstd::{
     ChainNet, ContractId, Txid as RgbTxid,
     containers::{
-        ConsignmentExt, Fascia, FileContent, PubWitness, Transfer as RgbTransfer, WitnessBundle,
+        ConsignmentExt, Contract as RgbContract, Fascia, FileContent, PubWitness, Transfer as RgbTransfer, WitnessBundle,
     },
     indexers::AnyResolver,
     validation::{ValidationConfig, ValidationError},
@@ -135,7 +135,6 @@ pub use mpc::MpcWalletProvider;
 #[cfg(feature = "dfns")]
 pub use mpc::dfns::{DfnsConfig, DfnsProvider};
 #[cfg(any(feature = "electrum", feature = "esplora"))]
-pub use rgbstd::validation::{ValidationConfig, ValidationError};
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use std::{
