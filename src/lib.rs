@@ -137,6 +137,8 @@ pub use mpc::dfns::{DfnsConfig, DfnsProvider};
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
+use std::collections::BTreeSet;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 use std::{
     cmp::{Ordering, max, min},
     collections::hash_map::DefaultHasher,
@@ -144,7 +146,7 @@ use std::{
     num::NonZeroU32,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
     hash::Hash,
     io::{self, ErrorKind, Read, Write},
@@ -184,7 +186,7 @@ use bdk_wallet::{
         bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource, Xpriv, Xpub},
         consensus::{Decodable, Encodable},
         hashes::{Hash as Sha256Hash, sha256},
-        psbt::{ExtractTxError, Psbt},
+        psbt::Psbt,
         secp256k1::Secp256k1,
     },
     chain::{
