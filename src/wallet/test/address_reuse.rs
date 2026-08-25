@@ -193,7 +193,7 @@ fn witness_receive_twice_reuses_pending_witness_script_row() {
         .witness_receive(
             None,
             Assignment::Any,
-            Some((now().unix_timestamp() + DURATION_RCV_TRANSFER as i64) as u64),
+            default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
         )
@@ -202,7 +202,7 @@ fn witness_receive_twice_reuses_pending_witness_script_row() {
         .witness_receive(
             None,
             Assignment::Any,
-            Some((now().unix_timestamp() + DURATION_RCV_TRANSFER as i64) as u64),
+            default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
         )
@@ -242,7 +242,7 @@ fn witness_receive_keeps_recipient_id_but_rotates_invoice_nonce() {
         .witness_receive(
             None,
             Assignment::Any,
-            Some((now().unix_timestamp() + DURATION_RCV_TRANSFER as i64) as u64),
+            default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
         )
@@ -251,7 +251,7 @@ fn witness_receive_keeps_recipient_id_but_rotates_invoice_nonce() {
         .witness_receive(
             None,
             Assignment::Any,
-            Some((now().unix_timestamp() + DURATION_RCV_TRANSFER as i64) as u64),
+            default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
         )
@@ -312,7 +312,7 @@ fn proxy_recipient_id_unique_per_invoice_under_reuse() {
         .witness_receive(
             None,
             Assignment::Any,
-            Some((now().unix_timestamp() + DURATION_RCV_TRANSFER as i64) as u64),
+            default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
         )
@@ -321,7 +321,7 @@ fn proxy_recipient_id_unique_per_invoice_under_reuse() {
         .witness_receive(
             None,
             Assignment::Any,
-            Some((now().unix_timestamp() + DURATION_RCV_TRANSFER as i64) as u64),
+            default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
         )
@@ -373,7 +373,7 @@ fn proxy_recipient_id_matches_recipient_id_without_nonce() {
             .witness_receive(
                 None,
                 Assignment::Any,
-                None,
+                default_rcv_expiration(),
                 TRANSPORT_ENDPOINTS.clone(),
                 MIN_CONFIRMATIONS,
             )
@@ -383,7 +383,7 @@ fn proxy_recipient_id_matches_recipient_id_without_nonce() {
             .blind_receive(
                 None,
                 Assignment::Any,
-                None,
+                default_rcv_expiration(),
                 TRANSPORT_ENDPOINTS.clone(),
                 MIN_CONFIRMATIONS,
             )
