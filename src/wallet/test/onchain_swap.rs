@@ -57,6 +57,8 @@ fn swap_offer_requires_proxy_url() {
         SWAP_FEE,
         None,
         None,
+        0,
+        None,
     );
 
     assert!(matches!(
@@ -113,6 +115,71 @@ fn maker_taker_rgb_for_btc_balances() {
             maker: 0,
             taker: SWAP_RGB_AMOUNT,
         }],
+    );
+}
+
+#[test]
+#[parallel]
+fn taker_pays_platform_fee() {
+    initialize();
+
+    const PLATFORM_FEE: u64 = 500;
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut fee_wallet, fee_online) = get_funded_noutxo_wallet(true, None);
+
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SFEE",
+        "Swap Platform Fee",
+        SWAP_RGB_AMOUNT,
+    );
+    let maker_btc_before = total_btc(&mut maker, maker_online);
+    let taker_btc_before = total_btc(&mut taker, taker_online);
+    let fee_btc_before = total_btc(&mut fee_wallet, fee_online);
+    let fee_recipient = fee_wallet.get_address().unwrap();
+
+    execute_swap_with_fee(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+        PLATFORM_FEE,
+        Some(fee_recipient),
+    );
+
+    assert_btc_delta_with_platform_fee(
+        &mut maker,
+        maker_online,
+        maker_btc_before,
+        &mut taker,
+        taker_online,
+        taker_btc_before,
+        ExpectedBtcDelta {
+            maker: SWAP_BTC_PRICE as i64,
+            taker: -((SWAP_BTC_PRICE + SWAP_FEE + PLATFORM_FEE) as i64),
+        },
+        PLATFORM_FEE,
+    );
+    assert_asset_balances(
+        &maker,
+        &taker,
+        &[ExpectedAssetBalance {
+            asset_id: &asset_id,
+            maker: 0,
+            taker: SWAP_RGB_AMOUNT,
+        }],
+    );
+    let fee_btc_after = total_btc(&mut fee_wallet, fee_online);
+    assert_eq!(
+        fee_btc_after as i64 - fee_btc_before as i64,
+        PLATFORM_FEE as i64,
+        "fee recipient should have received exactly the platform fee"
     );
 }
 
@@ -254,6 +321,8 @@ fn maker_rejects_request_with_mutated_offer() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
+            0,
+            None,
         )
         .unwrap();
     let mut request = taker
@@ -290,6 +359,8 @@ fn taker_rejects_proposal_with_mutated_request() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
+            0,
+            None,
         )
         .unwrap();
     let request = taker
@@ -329,6 +400,8 @@ fn maker_rejects_tampered_rgb_consignment_before_signing_btc() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
+            0,
+            None,
         )
         .unwrap();
     let request = taker
@@ -383,6 +456,31 @@ fn execute_swap(
     maker_receives: OnchainSwapLeg,
     proxy_url: &str,
 ) {
+    execute_swap_with_fee(
+        maker,
+        maker_online,
+        taker,
+        taker_online,
+        maker_gives,
+        maker_receives,
+        proxy_url,
+        0,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_swap_with_fee(
+    maker: &mut Wallet,
+    maker_online: Online,
+    taker: &mut Wallet,
+    taker_online: Online,
+    maker_gives: OnchainSwapLeg,
+    maker_receives: OnchainSwapLeg,
+    proxy_url: &str,
+    platform_fee_sat: u64,
+    fee_recipient: Option<String>,
+) {
     let maker_receives_rgb = matches!(maker_receives.kind, OnchainSwapLegKind::Rgb);
     let taker_receives_rgb = matches!(maker_gives.kind, OnchainSwapLegKind::Rgb);
     let maker_gives_btc = matches!(maker_gives.kind, OnchainSwapLegKind::Btc);
@@ -397,6 +495,8 @@ fn execute_swap(
             SWAP_FEE,
             None,
             Some(proxy_url.to_string()),
+            platform_fee_sat,
+            fee_recipient,
         )
         .unwrap();
     let request = taker
@@ -664,6 +764,29 @@ fn assert_btc_delta(
     taker_before: u64,
     expected: ExpectedBtcDelta,
 ) {
+    assert_btc_delta_with_platform_fee(
+        maker,
+        maker_online,
+        maker_before,
+        taker,
+        taker_online,
+        taker_before,
+        expected,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_btc_delta_with_platform_fee(
+    maker: &mut Wallet,
+    maker_online: Online,
+    maker_before: u64,
+    taker: &mut Wallet,
+    taker_online: Online,
+    taker_before: u64,
+    expected: ExpectedBtcDelta,
+    platform_fee_sat: u64,
+) {
     let maker_after = total_btc(maker, maker_online);
     let taker_after = total_btc(taker, taker_online);
     assert_eq!(
@@ -677,9 +800,9 @@ fn assert_btc_delta(
         "taker BTC delta mismatch"
     );
     assert_eq!(
-        maker_after + taker_after + SWAP_FEE,
+        maker_after + taker_after + SWAP_FEE + platform_fee_sat,
         maker_before + taker_before,
-        "total BTC should only decrease by the swap fee"
+        "total BTC should only decrease by the swap fee and the platform fee"
     );
 }
 

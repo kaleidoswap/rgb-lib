@@ -2665,9 +2665,23 @@ pub trait WalletOffline: WalletBackup {
         network_fee_sat: u64,
         expiration_timestamp: Option<u64>,
         proxy_url: Option<String>,
+        platform_fee_sat: u64,
+        fee_recipient: Option<String>,
     ) -> Result<OnchainSwapOffer, Error> {
         swap_validate_legs(&maker_gives, &maker_receives)?;
         swap_validate_proxy_url(&proxy_url)?;
+        let fee_recipient_script_pubkey_hex = if platform_fee_sat > 0 {
+            let address = fee_recipient.ok_or_else(|| {
+                swap_invalid("fee_recipient is required when platform_fee_sat > 0")
+            })?;
+            Some(
+                parse_address_str(&address, self.bitcoin_network())?
+                    .script_pubkey()
+                    .to_hex_string(),
+            )
+        } else {
+            None
+        };
         let (
             maker_btc_address,
             maker_rgb_recipient_id,
@@ -2704,6 +2718,8 @@ pub trait WalletOffline: WalletBackup {
             maker_rgb_script_pubkey_hex,
             maker_rgb_blinding,
             proxy_url,
+            platform_fee_sat,
+            fee_recipient_script_pubkey_hex,
         })
     }
 }
@@ -3143,6 +3159,25 @@ pub(crate) fn swap_build_psbt(
         });
     }
 
+    if offer.platform_fee_sat > 0 {
+        outputs.push(TxOut {
+            value: BdkAmount::from_sat(offer.platform_fee_sat),
+            script_pubkey: swap_parse_script(
+                offer
+                    .fee_recipient_script_pubkey_hex
+                    .as_ref()
+                    .ok_or_else(|| swap_invalid("missing fee recipient script"))?,
+            )?,
+        });
+    }
+
+    // The taker funds the network fee and the platform fee, same convention as
+    // rgb-onchain-swaps-atomic's earlier PSBT-level design: the platform fee is charged
+    // alongside the miner fee, both funded by whoever is buying/taking the offer.
+    let taker_fee_sat = offer
+        .network_fee_sat
+        .checked_add(offer.platform_fee_sat)
+        .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
     swap_append_side_change(
         &mut outputs,
         maker_inputs,
@@ -3158,7 +3193,7 @@ pub(crate) fn swap_build_psbt(
         taker_gives,
         taker_receives,
         offer.rgb_output_sat,
-        offer.network_fee_sat,
+        taker_fee_sat,
         &proposal.request.taker_change_script_pubkey_hex,
     )?;
 
@@ -3517,6 +3552,8 @@ mod swap_unit_tests {
             maker_rgb_script_pubkey_hex: Some("51".to_string()),
             maker_rgb_blinding: Some(1),
             proxy_url: Some("rpc://127.0.0.1:3000".to_string()),
+            platform_fee_sat: 0,
+            fee_recipient_script_pubkey_hex: None,
         };
         OnchainSwapProposal {
             request: OnchainSwapRequest {

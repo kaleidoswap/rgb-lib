@@ -1837,6 +1837,12 @@ pub struct OnchainSwapOffer {
     pub maker_rgb_blinding: Option<u64>,
     /// Required proxy URL for consignment and asset-history delivery
     pub proxy_url: Option<String>,
+    /// Platform fee reserved for a third-party facilitator, in sats. Funded by the taker
+    /// alongside `network_fee_sat`. Zero when there is no facilitator.
+    #[serde(default, deserialize_with = "from_str_or_number_mandatory")]
+    pub platform_fee_sat: u64,
+    /// Facilitator's fee-receive script pubkey, required when `platform_fee_sat > 0`
+    pub fee_recipient_script_pubkey_hex: Option<String>,
 }
 
 /// A taker response to an on-chain swap offer.

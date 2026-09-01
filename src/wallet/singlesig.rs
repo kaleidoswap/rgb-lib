@@ -1371,8 +1371,13 @@ impl Wallet {
     /// posted there so the counterparty can fetch them, and it is also used to publish the current
     /// asset history so the taker can validate the asset before accepting.
     ///
+    /// `platform_fee_sat`/`fee_recipient` reserve an additional output for a third-party
+    /// facilitator, funded by the taker alongside `network_fee_sat`. Pass `0`/`None` when there
+    /// is no facilitator.
+    ///
     /// This method is **offline** — no network connection is required.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn create_swap_offer(
         &mut self,
         maker_gives: OnchainSwapLeg,
@@ -1380,6 +1385,8 @@ impl Wallet {
         network_fee_sat: u64,
         expiration_timestamp: Option<u64>,
         proxy_url: Option<String>,
+        platform_fee_sat: u64,
+        fee_recipient: Option<String>,
     ) -> Result<OnchainSwapOffer, Error> {
         info!(self.logger(), "Creating on-chain swap offer...");
         let txn = self.database().begin_transaction()?;
@@ -1390,6 +1397,8 @@ impl Wallet {
             network_fee_sat,
             expiration_timestamp,
             proxy_url,
+            platform_fee_sat,
+            fee_recipient,
         )?;
         swap_save_state(self.wallet_dir(), &offer.swap_id, SWAP_OFFER_FILE, &offer)?;
         self.update_backup_info(&txn, false)?;
@@ -1428,6 +1437,7 @@ impl Wallet {
             &taker_gives,
             swap_side_rgb_output_cost(&taker_receives, offer.rgb_output_sat)
                 .checked_add(offer.network_fee_sat)
+                .and_then(|v| v.checked_add(offer.platform_fee_sat))
                 .ok_or_else(|| swap_invalid("swap amounts overflow"))?,
             min_confirmations,
             skip_sync,
