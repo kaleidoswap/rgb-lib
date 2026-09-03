@@ -4212,6 +4212,15 @@ pub(crate) fn swap_record_outgoing(
         expiration: ActiveValue::Set(None),
         created_at: ActiveValue::Set(now().unix_timestamp()),
         min_confirmations: ActiveValue::Set(1),
+        // `incoming` here only decides which branch of the generic pending-transfer
+        // reconciliation (`refresh_transfer`/`wait_confirmations`) applies; RGB-wise this leg is
+        // already fully colored and consumed by the time this is called, so all that's left to
+        // wait for is confirmation depth. Leaving `incoming` unset previously fell back to the
+        // schema's `DEFAULT true`, which routed refresh() into the incoming-only branch that
+        // reloads a consignment from `get_receive_consignment_path` and expects a `DbTransfer`
+        // row — neither of which this swap-specific recording path creates — panicking on the
+        // very first `refresh()` after a swap send.
+        incoming: ActiveValue::Set(false),
         ..Default::default()
     };
     let batch_transfer_idx = txn.set_batch_transfer(batch_transfer)?;
@@ -4269,6 +4278,13 @@ pub(crate) fn swap_record_incoming(
         expiration: ActiveValue::Set(None),
         created_at: ActiveValue::Set(now().unix_timestamp()),
         min_confirmations: ActiveValue::Set(1),
+        // See the matching comment in `swap_record_outgoing`: this leg's consignment was already
+        // validated and accepted synchronously in `swap_accept_transfer_from_file`, so `incoming`
+        // is set to `false` here too, purely to keep refresh()'s generic reconciliation on the
+        // plain confirmation-count path instead of the incoming-only branch, which expects a
+        // `DbTransfer` row and a consignment file at the ordinary (non-swap) receive path that
+        // this recording function never creates.
+        incoming: ActiveValue::Set(false),
         ..Default::default()
     };
     let batch_transfer_idx = txn.set_batch_transfer(batch_transfer)?;

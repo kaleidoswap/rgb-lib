@@ -120,6 +120,57 @@ fn maker_taker_rgb_for_btc_balances() {
 
 #[test]
 #[parallel]
+fn refresh_after_swap_settles_transfers_without_panicking() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SREF",
+        "Swap Refresh",
+        SWAP_RGB_AMOUNT,
+    );
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+
+    // Before the fix, the batch transfer `swap_record_outgoing`/`swap_record_incoming` create for
+    // a swap leg left `incoming` unset, which fell back to the schema's `DEFAULT true`. For the
+    // maker's outgoing leg that wrongly routed refresh() into the branch built for the ordinary
+    // (non-swap) receive flow, which expects a `DbTransfer` row and a consignment file this
+    // recording path never creates -- panicking on the very first refresh() after a swap send.
+    maker
+        .refresh(maker_online, None, vec![], false)
+        .expect("refresh should not panic after a swap send");
+    taker
+        .refresh(taker_online, None, vec![], false)
+        .expect("refresh should not panic after a swap receive");
+
+    // The maker's asset balance should settle to zero -- not stay stuck showing the pre-swap
+    // amount because its batch transfer can never reconcile from `WaitingConfirmations`.
+    let maker_balance = maker.get_asset_balance(asset_id.clone()).unwrap();
+    assert_eq!(maker_balance.settled, 0);
+    assert_eq!(maker_balance.future, 0);
+    assert_eq!(maker_balance.spendable, 0);
+
+    let taker_balance = taker.get_asset_balance(asset_id).unwrap();
+    assert_eq!(taker_balance.settled, SWAP_RGB_AMOUNT);
+    assert_eq!(taker_balance.future, SWAP_RGB_AMOUNT);
+    assert_eq!(taker_balance.spendable, SWAP_RGB_AMOUNT);
+}
+
+#[test]
+#[parallel]
 fn taker_pays_platform_fee() {
     initialize();
 
