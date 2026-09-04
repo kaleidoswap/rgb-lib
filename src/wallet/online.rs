@@ -480,6 +480,22 @@ pub trait WalletOnline: WalletOffline {
         batch_transfer: &DbBatchTransfer,
         db_data: &DbData,
     ) -> Result<TryFailBatchTransferOutcome, Error> {
+        // an Initiated batch transfer carrying a TXID is broadcast by the caller itself (the
+        // color-consume flow), so failing it would misreport state that already landed: once the
+        // indexer knows the TX its inputs are spent for good, and once the fascia is in the stash
+        // (marker left behind by a consume that crashed before its commit) the SQL side is the only
+        // thing still rollable back, which would diverge the two
+        if batch_transfer.status == TransferStatus::Initiated
+            && let Some(txid) = batch_transfer.txid.as_deref()
+            && (self
+                .get_transfer_dir(txid)
+                .join(super::rust_only::STASH_CONSUMED_FILE)
+                .exists()
+                || self.psbt_op_live_broadcast_blocks_fail(batch_transfer)?
+                || self.indexer().get_tx_confirmations(txid)?.is_some())
+        {
+            return Ok(TryFailBatchTransferOutcome::CannotFail);
+        }
         let updated_batch_transfer =
             match self.refresh_transfer(txn, batch_transfer, db_data, &[], true) {
                 Err(Error::MinFeeNotMet { txid: _ }) | Err(Error::MaxFeeExceeded { txid: _ }) => {
@@ -495,6 +511,58 @@ pub trait WalletOnline: WalletOffline {
         } else {
             Ok(TryFailBatchTransferOutcome::Refreshed)
         }
+    }
+
+    /// Persist SQL Failed rows without triggering VSS backup. Caller heals HTLC
+    /// metadata (if any) and backs up only after SQL and files are coherent.
+    fn fail_transfers_commit(
+        &mut self,
+        online: Online,
+        batch_transfer_idx: Option<i32>,
+        no_asset_only: bool,
+        skip_sync: bool,
+    ) -> Result<FailTransfersOutcome, Error> {
+        self.check_online(online)?;
+        let txn = self.database().begin_transaction()?;
+        let outcome =
+            self.fail_transfers_impl(&txn, batch_transfer_idx, no_asset_only, skip_sync)?;
+        if outcome.transfers_changed {
+            self.update_backup_info(&txn, false)?;
+        }
+        self.persist_and_commit(txn)?;
+        Ok(outcome)
+    }
+
+    /// Align file-backed HTLC operations with SQL Failed batches. Default: no HTLC ops.
+    fn heal_psbt_ops_after_failed_transfers(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    /// Refuse failing a batch whose linked HTLC operation has a live broadcast state.
+    fn psbt_op_live_broadcast_blocks_fail(
+        &self,
+        _batch_transfer: &DbBatchTransfer,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    fn fail_transfers_finish(&self, outcome: FailTransfersOutcome) -> Result<bool, Error> {
+        let healed = match self.heal_psbt_ops_after_failed_transfers() {
+            Ok(healed) => healed,
+            Err(e) => {
+                if outcome.transfers_changed {
+                    self.trigger_auto_backup();
+                }
+                return Err(e);
+            }
+        };
+        if outcome.transfers_changed || healed {
+            self.trigger_auto_backup();
+        }
+        if outcome.cannot_fail {
+            return Err(Error::CannotFailBatchTransfer);
+        }
+        Ok(outcome.transfers_changed)
     }
 
     fn fail_transfers_impl(
@@ -4652,6 +4720,12 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
     /// Transfers are eligible if they remain in a fallible status after a `refresh` has been
     /// performed. A transfer in status [`TransferStatus::WaitingBroadcast`] is an exception: it can
     /// only be failed once it has expired, since the TX may still be broadcast before then.
+    /// A transfer in status [`TransferStatus::Initiated`] whose TX is already known to the indexer
+    /// is a second exception: its inputs are spent on-chain, so it can no longer be failed.
+    /// So is a [`TransferStatus::Initiated`] batch whose fascia is already in the RGB stash
+    /// (`stash_consumed` under the transfer dir): failing it would diverge SQL from the stash.
+    /// An Initiated HTLC batch whose operation broadcast was attempted is a third exception
+    /// until it expires; past that the indexer decides, as for `WaitingBroadcast`.
     fn fail_transfers(
         &mut self,
         online: Online,
@@ -4663,19 +4737,11 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
             self.logger(),
             "Failing batch transfer with idx {:?}...", batch_transfer_idx
         );
-        self.check_online(online)?;
-        let txn = self.database().begin_transaction()?;
         let outcome =
-            self.fail_transfers_impl(&txn, batch_transfer_idx, no_asset_only, skip_sync)?;
-        if outcome.transfers_changed {
-            self.update_backup_info(&txn, false)?;
-        }
-        self.persist_and_commit(txn)?;
+            self.fail_transfers_commit(online, batch_transfer_idx, no_asset_only, skip_sync)?;
+        let changed = self.fail_transfers_finish(outcome)?;
         info!(self.logger(), "Fail transfers completed");
-        if outcome.cannot_fail {
-            return Err(Error::CannotFailBatchTransfer);
-        }
-        Ok(outcome.transfers_changed)
+        Ok(changed)
     }
 
     /// Sync the wallet and save new colored UTXOs to the DB.
