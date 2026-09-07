@@ -128,7 +128,7 @@ pub enum Error {
 
     /// HTLC operation directory / meta was not found
     #[error("HTLC operation not found: {operation_id}")]
-    HtlcOperationNotFound {
+    PsbtOperationNotFound {
         /// Opaque operation ID
         operation_id: String,
     },
@@ -310,7 +310,7 @@ pub enum Error {
 
     /// HTLC operation is not in the expected status for this call
     #[error("Invalid HTLC operation status: {details}")]
-    InvalidHtlcOperationStatus {
+    InvalidPsbtOperationStatus {
         /// Error details
         details: String,
     },
