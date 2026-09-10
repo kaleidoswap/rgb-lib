@@ -13,6 +13,7 @@
 use super::*;
 use crate::utils::recipient_id_from_script_buf;
 use bdk_wallet::bitcoin::Transaction;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
 use rgbstd::Operation as _;
 use serde::{Deserialize, Serialize};
