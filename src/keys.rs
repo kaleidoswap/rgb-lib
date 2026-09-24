@@ -73,8 +73,13 @@ pub struct Keys {
 
 /// Generate a set of [`Keys`] for the given Bitcoin network and witness version.
 pub fn generate_keys(bitcoin_network: BitcoinNetwork, witness_version: WitnessVersion) -> Keys {
-    let mnemonic = Mnemonic::generate((WordCount::Words12, Language::English))
-        .expect("to be able to generate a new mnemonic");
+    // fully qualified: bip39's `rand` feature (enabled by other crates in a dependant's graph)
+    // adds an inherent `Mnemonic::generate(usize)` that would shadow the trait method
+    let mnemonic = <Mnemonic as GeneratableKey<bdk_wallet::miniscript::Legacy>>::generate((
+        WordCount::Words12,
+        Language::English,
+    ))
+    .expect("to be able to generate a new mnemonic");
     let xkey: ExtendedKey = mnemonic
         .clone()
         .into_extended_key()
