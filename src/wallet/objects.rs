@@ -1857,6 +1857,41 @@ pub enum OnchainSwapRole {
     Taker,
 }
 
+/// The last step this wallet reached in an on-chain swap.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub enum OnchainSwapStage {
+    /// The maker created the offer
+    Offered,
+    /// The taker accepted the offer
+    Requested,
+    /// The maker built the proposal
+    Proposed,
+    /// This wallet broadcast the swap transaction
+    Broadcast,
+    /// This wallet accepted the swap transfers
+    Accepted,
+    /// The swap was cancelled before broadcast
+    Cancelled,
+}
+
+/// A swap known to this wallet, as returned by [`crate::wallet::Wallet::list_swaps`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub struct OnchainSwapSummary {
+    /// Swap ID
+    pub swap_id: String,
+    /// This wallet's role
+    pub role: OnchainSwapRole,
+    /// Last step reached
+    pub stage: OnchainSwapStage,
+    /// Offer expiration
+    pub expiration_timestamp: Option<u64>,
+    /// Swap transaction ID, once the maker has built the proposal
+    pub txid: Option<String>,
+}
+
 /// The type of an on-chain swap leg.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg(any(feature = "electrum", feature = "esplora"))]

@@ -1862,7 +1862,7 @@ impl Wallet {
         skip_sync: bool,
     ) -> Result<OnchainSwapRequest, RgbLibError> {
         self._get_wallet()
-            .accept_swap_offer(online, offer, min_confirmations, skip_sync)
+            .accept_swap_offer(online, offer, min_confirmations, skip_sync, vec![])
     }
 
     fn accept_swap_request(
@@ -1873,7 +1873,7 @@ impl Wallet {
         skip_sync: bool,
     ) -> Result<OnchainSwapProposal, RgbLibError> {
         self._get_wallet()
-            .accept_swap_request(online, request, min_confirmations, skip_sync)
+            .accept_swap_request(online, request, min_confirmations, skip_sync, vec![])
     }
 
     fn complete_swap_proposal(

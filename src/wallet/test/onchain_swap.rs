@@ -377,13 +377,13 @@ fn maker_rejects_request_with_mutated_offer() {
         )
         .unwrap();
     let mut request = taker
-        .accept_swap_offer(taker_online, offer, 0, false)
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
         .unwrap();
     request.offer.network_fee_sat += 1;
 
     assert!(
         maker
-            .accept_swap_request(maker_online, request, 0, false)
+            .accept_swap_request(maker_online, request, 0, false, vec![])
             .is_err()
     );
 }
@@ -415,10 +415,10 @@ fn taker_rejects_proposal_with_mutated_request() {
         )
         .unwrap();
     let request = taker
-        .accept_swap_offer(taker_online, offer, 0, false)
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
         .unwrap();
     let mut proposal = maker
-        .accept_swap_request(maker_online, request, 0, false)
+        .accept_swap_request(maker_online, request, 0, false, vec![])
         .unwrap();
     proposal.request.taker_change_script_pubkey_hex = "00".to_string();
 
@@ -456,10 +456,10 @@ fn maker_rejects_tampered_rgb_consignment_before_signing_btc() {
         )
         .unwrap();
     let request = taker
-        .accept_swap_offer(taker_online, offer, 0, false)
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
         .unwrap();
     let proposal = maker
-        .accept_swap_request(maker_online, request, 0, false)
+        .accept_swap_request(maker_online, request, 0, false, vec![])
         .unwrap();
     assert_eq!(signature_count(&proposal.psbt), 0);
 
@@ -698,10 +698,10 @@ fn cancel_before_broadcast_leaves_state_unchanged() {
         .unwrap();
     let swap_id = offer.swap_id.clone();
     let request = taker
-        .accept_swap_offer(taker_online, offer, 0, false)
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
         .unwrap();
     let proposal = maker
-        .accept_swap_request(maker_online, request, 0, false)
+        .accept_swap_request(maker_online, request, 0, false, vec![])
         .unwrap();
     // coloring prepared the leg without touching the stash
     assert_eq!(
@@ -790,10 +790,10 @@ fn expired_unbroadcast_swap_is_cancelled() {
         .unwrap();
     let swap_id = offer.swap_id.clone();
     let request = taker
-        .accept_swap_offer(taker_online, offer, 0, false)
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
         .unwrap();
     let proposal = maker
-        .accept_swap_request(maker_online, request, 0, false)
+        .accept_swap_request(maker_online, request, 0, false, vec![])
         .unwrap();
     let completion = taker
         .complete_swap_proposal(taker_online, proposal, 0, false)
@@ -837,6 +837,141 @@ fn expired_unbroadcast_swap_is_cancelled() {
     refresh_settled(&mut taker, taker_online);
     assert_settled_balance(&maker, &asset_id, SWAP_RGB_AMOUNT);
     assert_settled_balance(&taker, &asset_id, 0);
+}
+
+#[test]
+#[parallel]
+fn exclude_outpoints_and_list_swaps() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SXCL",
+        "Swap Exclude",
+        SWAP_RGB_AMOUNT,
+    );
+    let outpoints = |wallet: &mut Wallet, online: Online, colorable: bool| {
+        wallet
+            .list_unspents(Some(online), false, false)
+            .unwrap()
+            .into_iter()
+            .filter(|u| u.utxo.colorable == colorable)
+            .map(|u| u.utxo.outpoint)
+            .collect::<Vec<_>>()
+    };
+    let offer = maker
+        .create_swap_offer(
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            btc(SWAP_BTC_PRICE),
+            SWAP_FEE,
+            Some(now().unix_timestamp() as u64 + 3600),
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let swap_id = offer.swap_id.clone();
+
+    // excluded inputs are never selected: excluding all of them leaves nothing to pay with
+    let taker_btc = outpoints(&mut taker, taker_online, false);
+    assert!(matches!(
+        taker.accept_swap_offer(taker_online, offer.clone(), 0, false, taker_btc),
+        Err(Error::InsufficientBitcoins { .. })
+    ));
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let maker_colored = outpoints(&mut maker, maker_online, true);
+    assert!(
+        maker
+            .accept_swap_request(maker_online, request.clone(), 0, false, maker_colored)
+            .is_err()
+    );
+    let proposal = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap();
+
+    let summary = |wallet: &Wallet| {
+        wallet
+            .list_swaps()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.swap_id == swap_id)
+            .unwrap()
+    };
+    let maker_summary = summary(&maker);
+    assert_eq!(maker_summary.role, OnchainSwapRole::Maker);
+    assert_eq!(maker_summary.stage, OnchainSwapStage::Proposed);
+    assert_eq!(maker_summary.txid.as_deref(), Some(proposal.txid.as_str()));
+    let taker_summary = summary(&taker);
+    assert_eq!(taker_summary.role, OnchainSwapRole::Taker);
+    assert_eq!(taker_summary.stage, OnchainSwapStage::Requested);
+
+    let completion = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap();
+    let completion = maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap();
+    let txid = completion.txid.clone();
+    let outgoing_expiration = |wallet: &Wallet| {
+        let txn = wallet.database().begin_transaction().unwrap();
+        let db_data = txn.get_db_data(false).unwrap();
+        db_data
+            .batch_transfers
+            .iter()
+            .find(|b| !b.incoming && b.txid.as_deref() == Some(txid.as_str()))
+            .unwrap()
+            .expiration
+    };
+    assert!(outgoing_expiration(&maker).is_some());
+    maker
+        .broadcast_swap_completion(maker_online, completion.clone())
+        .unwrap();
+    // a broadcast leg can't be failed by the expiry sweep any more
+    assert_eq!(outgoing_expiration(&maker), None);
+    assert_eq!(summary(&maker).stage, OnchainSwapStage::Broadcast);
+
+    mine(false);
+    maker
+        .accept_swap_transfers(
+            maker_online,
+            completion.clone(),
+            OnchainSwapRole::Maker,
+            false,
+        )
+        .unwrap();
+    taker
+        .accept_swap_transfers(taker_online, completion, OnchainSwapRole::Taker, false)
+        .unwrap();
+    assert_eq!(summary(&maker).stage, OnchainSwapStage::Accepted);
+    assert_eq!(summary(&taker).stage, OnchainSwapStage::Accepted);
+
+    let cancelled = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    maker
+        .cancel_swap(maker_online, cancelled.swap_id.clone())
+        .unwrap();
+    let cancelled_summary = maker
+        .list_swaps()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.swap_id == cancelled.swap_id)
+        .unwrap();
+    assert_eq!(cancelled_summary.stage, OnchainSwapStage::Cancelled);
+    assert_eq!(cancelled_summary.txid, None);
 }
 
 fn refresh_settled(wallet: &mut Wallet, online: Online) {
@@ -969,10 +1104,10 @@ fn execute_swap_with_fee(
         )
         .unwrap();
     let request = taker
-        .accept_swap_offer(taker_online, offer, 0, false)
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
         .unwrap();
     let proposal = maker
-        .accept_swap_request(maker_online, request, 0, false)
+        .accept_swap_request(maker_online, request, 0, false, vec![])
         .unwrap();
     // the maker signs last in every direction: its proposal carries no signature
     assert_eq!(signature_count(&proposal.psbt), 0);
