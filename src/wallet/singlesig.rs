@@ -4,19 +4,20 @@
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use super::offline::{
-    SWAP_OFFER_FILE, SWAP_PROPOSAL_FILE, SWAP_REQUEST_FILE, SwapDirection, swap_build_psbt,
-    swap_ensure_not_expired, swap_ensure_state_matches, swap_invalid, swap_load_state,
-    swap_mpc_entropy, swap_random_blinding, swap_require_rgb_destination,
-    swap_restore_input_metadata, swap_save_state, swap_side_rgb_output_cost, swap_validate_legs,
-    swap_validate_proposal_psbt, swap_validate_proxy_url,
+    SWAP_ACCEPTED_FILE, SWAP_BROADCAST_FILE, SWAP_CANCELLED_EXTENSION, SWAP_OFFER_FILE,
+    SWAP_OUTGOING_FILE, SWAP_PROPOSAL_FILE, SWAP_REQUEST_FILE, SwapDirection, SwapOutgoingState,
+    swap_build_psbt, swap_consignment_dir, swap_ensure_not_expired, swap_ensure_state_matches,
+    swap_invalid, swap_load_state, swap_mpc_entropy, swap_random_blinding,
+    swap_require_rgb_destination, swap_restore_input_metadata, swap_save_state,
+    swap_side_rgb_output_cost, swap_state_path, swap_validate_legs, swap_validate_proposal_psbt,
+    swap_validate_proxy_url,
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use super::online::{
-    swap_accept_transfer_from_file, swap_color_rgb_leg, swap_emit_asset_history,
-    swap_emit_consignments, swap_ensure_inputs_confirmed, swap_fetch_consignment_to_file,
-    swap_finalize_psbt, swap_import_asset_history, swap_record_outgoing, swap_select_inputs,
-    swap_sign_psbt, swap_stage_rgb_leg, swap_validate_fascia_received_leg,
-    swap_validate_received_swap_leg,
+    SwapRgbSend, swap_accept_transfer_from_file, swap_color_rgb_leg, swap_emit_asset_history,
+    swap_ensure_inputs_confirmed, swap_fetch_consignment_to_file, swap_finalize_psbt,
+    swap_import_asset_history, swap_prepare_rgb_leg, swap_select_inputs, swap_sign_psbt,
+    swap_stage_rgb_leg, swap_validate_fascia_received_leg, swap_validate_received_swap_leg,
 };
 use super::*;
 
@@ -1591,8 +1592,14 @@ impl Wallet {
                 Some(blinding),
             )
         };
+        // RGB change is carried to the change output, which must then be colored
+        let taker_change_keychain = if matches!(taker_gives.kind, OnchainSwapLegKind::Rgb) {
+            KeychainKind::External
+        } else {
+            KeychainKind::Internal
+        };
         let taker_change_script_pubkey_hex = self
-            .get_new_addresses(KeychainKind::Internal, 1)?
+            .get_new_addresses(taker_change_keychain, 1)?
             .script_pubkey()
             .to_hex_string();
         let request = OnchainSwapRequest {
@@ -1664,8 +1671,13 @@ impl Wallet {
             min_confirmations,
             skip_sync,
         )?;
+        let maker_change_keychain = if matches!(offer.maker_gives.kind, OnchainSwapLegKind::Rgb) {
+            KeychainKind::External
+        } else {
+            KeychainKind::Internal
+        };
         let maker_change_script_pubkey_hex = self
-            .get_new_addresses(KeychainKind::Internal, 1)?
+            .get_new_addresses(maker_change_keychain, 1)?
             .script_pubkey()
             .to_hex_string();
         let mut proposal = OnchainSwapProposal {
@@ -1687,32 +1699,36 @@ impl Wallet {
                 offer.proxy_url.as_deref(),
                 &offer.swap_id,
             )?;
-            let vout = taker_rgb_vout.ok_or_else(|| swap_invalid("missing taker RGB vout"))?;
-            let blinding = proposal
-                .request
-                .taker_rgb_blinding
-                .ok_or_else(|| swap_invalid("missing taker RGB blinding"))?;
+            let send = SwapRgbSend {
+                leg: &offer.maker_gives,
+                inputs: &proposal.maker_inputs,
+                change_script_hex: &proposal.maker_change_script_pubkey_hex,
+                recipient_id: proposal
+                    .request
+                    .taker_rgb_recipient_id
+                    .as_deref()
+                    .ok_or_else(|| swap_invalid("missing taker RGB recipient ID"))?,
+                recipient_vout: taker_rgb_vout
+                    .ok_or_else(|| swap_invalid("missing taker RGB vout"))?,
+                blinding: proposal
+                    .request
+                    .taker_rgb_blinding
+                    .ok_or_else(|| swap_invalid("missing taker RGB blinding"))?,
+            };
             match direction {
                 SwapDirection::RgbForBtc => {
-                    let recipient_id = proposal
-                        .request
-                        .taker_rgb_recipient_id
-                        .as_deref()
-                        .ok_or_else(|| swap_invalid("missing taker RGB recipient ID"))?;
                     consignments = swap_color_rgb_leg(
                         &txn,
                         self,
                         &mut psbt,
-                        &offer.maker_gives,
-                        recipient_id,
-                        vout,
-                        blinding,
+                        &send,
                         offer.proxy_url.as_deref(),
                         &offer.swap_id,
+                        offer.expiration_timestamp,
                     )?;
                 }
                 SwapDirection::RgbForRgb => {
-                    swap_stage_rgb_leg(self, &mut psbt, &offer.maker_gives, vout, blinding)?;
+                    swap_stage_rgb_leg(self, &mut psbt, &send)?;
                 }
                 SwapDirection::BtcForRgb => {
                     unreachable!("BTC-for-RGB cannot reach maker_gives==Rgb branch")
@@ -1787,26 +1803,31 @@ impl Wallet {
             .cloned()
             .collect::<Vec<_>>();
         swap_restore_input_metadata(&mut psbt, &all_inputs)?;
+        let taker_send = SwapRgbSend {
+            leg: &offer.maker_receives,
+            inputs: &proposal.request.taker_inputs,
+            change_script_hex: &proposal.request.taker_change_script_pubkey_hex,
+            recipient_id: offer.maker_rgb_recipient_id.as_deref().unwrap_or_default(),
+            recipient_vout: maker_rgb_vout.unwrap_or_default(),
+            blinding: offer.maker_rgb_blinding.unwrap_or_default(),
+        };
+        if matches!(offer.maker_receives.kind, OnchainSwapLegKind::Rgb)
+            && (offer.maker_rgb_recipient_id.is_none()
+                || maker_rgb_vout.is_none()
+                || offer.maker_rgb_blinding.is_none())
+        {
+            return Err(swap_invalid("missing maker RGB receive data"));
+        }
         match direction {
             SwapDirection::BtcForRgb => {
-                let vout = maker_rgb_vout.ok_or_else(|| swap_invalid("missing maker RGB vout"))?;
-                let blinding = offer
-                    .maker_rgb_blinding
-                    .ok_or_else(|| swap_invalid("missing maker RGB blinding"))?;
-                let recipient_id = offer
-                    .maker_rgb_recipient_id
-                    .as_deref()
-                    .ok_or_else(|| swap_invalid("missing maker RGB recipient ID"))?;
                 consignments.extend(swap_color_rgb_leg(
                     &txn,
                     self,
                     &mut psbt,
-                    &offer.maker_receives,
-                    recipient_id,
-                    vout,
-                    blinding,
+                    &taker_send,
                     offer.proxy_url.as_deref(),
                     &offer.swap_id,
+                    offer.expiration_timestamp,
                 )?);
                 swap_restore_input_metadata(&mut psbt, &all_inputs)?;
             }
@@ -1843,18 +1864,7 @@ impl Wallet {
                     offer.proxy_url.as_deref(),
                     &offer.swap_id,
                 )?;
-                let maker_recv_vout =
-                    maker_rgb_vout.ok_or_else(|| swap_invalid("missing maker RGB vout"))?;
-                let maker_recv_blinding = offer
-                    .maker_rgb_blinding
-                    .ok_or_else(|| swap_invalid("missing maker RGB blinding"))?;
-                let taker_beneficiaries = swap_stage_rgb_leg(
-                    self,
-                    &mut psbt,
-                    &offer.maker_receives,
-                    maker_recv_vout,
-                    maker_recv_blinding,
-                )?;
+                swap_stage_rgb_leg(self, &mut psbt, &taker_send)?;
                 let mpc_entropy = swap_mpc_entropy(&offer.swap_id);
                 let fascia = self.color_psbt_finalize(&mut psbt, Some(mpc_entropy))?;
                 let taker_recv_vout =
@@ -1869,41 +1879,19 @@ impl Wallet {
                     taker_recv_vout,
                     taker_recv_blinding,
                 )?;
-                self.consume_fascia(fascia.clone(), None)?;
-                let witness_txid = psbt.get_txid();
-                let recv_asset_id = offer
-                    .maker_receives
-                    .asset_id
-                    .clone()
-                    .expect("RGB leg has asset ID");
-                let recv_contract_id = ContractId::from_str(&recv_asset_id)
-                    .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
-                let beneficiaries = taker_beneficiaries
-                    .get(&recv_contract_id)
-                    .cloned()
-                    .ok_or_else(|| swap_invalid("missing taker beneficiaries"))?;
-                let transfer =
-                    self.generate_transfer(recv_contract_id, beneficiaries, witness_txid, &fascia)?;
-                let txid_str = witness_txid.to_string();
-                swap_record_outgoing(&txn, &recv_asset_id, &txid_str, &psbt)?;
-                let recv_recipient_id = offer
-                    .maker_rgb_recipient_id
-                    .as_deref()
-                    .ok_or_else(|| swap_invalid("missing maker RGB recipient ID"))?;
-                consignments.extend(swap_emit_consignments(
+                consignments.extend(swap_prepare_rgb_leg(
+                    &txn,
                     self,
-                    vec![transfer],
+                    &psbt,
+                    &fascia,
+                    &taker_send,
                     offer.proxy_url.as_deref(),
                     &offer.swap_id,
-                    &txid_str,
-                    recv_recipient_id,
-                    maker_recv_vout,
-                    maker_recv_blinding,
+                    offer.expiration_timestamp,
                 )?);
                 swap_restore_input_metadata(&mut psbt, &all_inputs)?;
             }
         }
-        let _ = taker_rgb_vout;
         self.sync_if_requested(&txn, Some(online), skip_sync, KeychainKind::Internal)?;
         self.sync_if_requested(&txn, Some(online), skip_sync, KeychainKind::External)?;
         swap_ensure_inputs_confirmed(self, &proposal.maker_inputs, min_confirmations)?;
@@ -2032,47 +2020,49 @@ impl Wallet {
                     .as_ref()
                     .ok_or_else(|| swap_invalid("missing taker asset history"))?;
                 swap_import_asset_history(self, &txn, taker_history)?;
+                // the taker finalizes the commitment: the maker's staged transitions must be
+                // committed unchanged
+                let staged_bundles = Psbt::from_str(&local_proposal.psbt)?
+                    .rgb_bundles()
+                    .map_err(InternalError::from)?;
+                let committed_bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
+                if staged_bundles
+                    .iter()
+                    .any(|(contract_id, bundle)| committed_bundles.get(contract_id) != Some(bundle))
+                {
+                    return Err(swap_invalid(
+                        "swap PSBT does not commit the maker's staged RGB transitions",
+                    ));
+                }
                 let fascia = self.fascia_from_finalized_psbt(&psbt)?;
-                self.consume_fascia(fascia.clone(), None)?;
-                let witness_txid = psbt.get_txid();
-                let send_vout =
-                    taker_rgb_vout.ok_or_else(|| swap_invalid("missing taker RGB vout"))?;
-                let send_blinding = completion
-                    .proposal
-                    .request
-                    .taker_rgb_blinding
-                    .ok_or_else(|| swap_invalid("missing taker RGB blinding"))?;
-                let send_asset_id = offer
-                    .maker_gives
-                    .asset_id
-                    .clone()
-                    .expect("RGB leg has asset ID");
-                let send_contract_id = ContractId::from_str(&send_asset_id)
-                    .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
-                let beneficiaries = vec![BuilderSeal::Revealed(GraphSeal::with_blinded_vout(
-                    send_vout,
-                    send_blinding,
-                ))];
-                let transfer =
-                    self.generate_transfer(send_contract_id, beneficiaries, witness_txid, &fascia)?;
-                let txid_str = witness_txid.to_string();
-                swap_record_outgoing(&txn, &send_asset_id, &txid_str, &psbt)?;
-                let send_recipient_id = completion
-                    .proposal
-                    .request
-                    .taker_rgb_recipient_id
-                    .as_deref()
-                    .ok_or_else(|| swap_invalid("missing taker RGB recipient ID"))?;
+                let maker_send = SwapRgbSend {
+                    leg: &offer.maker_gives,
+                    inputs: &completion.proposal.maker_inputs,
+                    change_script_hex: &completion.proposal.maker_change_script_pubkey_hex,
+                    recipient_id: completion
+                        .proposal
+                        .request
+                        .taker_rgb_recipient_id
+                        .as_deref()
+                        .ok_or_else(|| swap_invalid("missing taker RGB recipient ID"))?,
+                    recipient_vout: taker_rgb_vout
+                        .ok_or_else(|| swap_invalid("missing taker RGB vout"))?,
+                    blinding: completion
+                        .proposal
+                        .request
+                        .taker_rgb_blinding
+                        .ok_or_else(|| swap_invalid("missing taker RGB blinding"))?,
+                };
                 let mut consignments = completion.consignments.clone();
-                consignments.extend(swap_emit_consignments(
+                consignments.extend(swap_prepare_rgb_leg(
+                    &txn,
                     self,
-                    vec![transfer],
+                    &psbt,
+                    &fascia,
+                    &maker_send,
                     offer.proxy_url.as_deref(),
                     &offer.swap_id,
-                    &txid_str,
-                    send_recipient_id,
-                    send_vout,
-                    send_blinding,
+                    offer.expiration_timestamp,
                 )?);
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::Internal)?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
@@ -2120,13 +2110,204 @@ impl Wallet {
             return Err(swap_invalid("swap completion txid mismatch"));
         }
 
+        // from here on the swap can no longer be cancelled
+        swap_save_state(
+            self.wallet_dir(),
+            &offer.swap_id,
+            SWAP_BROADCAST_FILE,
+            &txid,
+        )?;
         let txn = self.database().begin_transaction()?;
-        let tx = self.broadcast_psbt(&txn, &psbt)?;
+        let tx = match self.broadcast_psbt(&txn, &psbt) {
+            Ok(tx) => tx,
+            Err(
+                e @ (Error::FailedBroadcast { .. }
+                | Error::MinFeeNotMet { .. }
+                | Error::MaxFeeExceeded { .. }),
+            ) => {
+                // rejected and unknown to the indexer: the swap can still be cancelled
+                let _ = fs::remove_file(swap_state_path(
+                    self.wallet_dir(),
+                    &offer.swap_id,
+                    SWAP_BROADCAST_FILE,
+                ));
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
         let txid = tx.compute_txid().to_string();
+        if self.indexer().get_tx_confirmations(&txid)?.is_some() {
+            self.swap_apply_outgoing(online, &offer.swap_id, &txid)?;
+        }
         info!(self.logger(), "Broadcast swap completion completed");
         Ok(txid)
+    }
+
+    /// Cancel an on-chain swap whose transaction has not been broadcast.
+    ///
+    /// Fails the batch transfer recording the RGB leg this wallet prepared, if any, which releases
+    /// its inputs, and archives the local swap state so no further step can be run on it.
+    ///
+    /// Returns [`Error::CannotFailBatchTransfer`] once the swap transaction has been broadcast by
+    /// this wallet, is known to the indexer or the swap has been settled. A counterparty holding a
+    /// fully signed transaction can still broadcast it: to rule that out, spend the inputs.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn cancel_swap(&mut self, online: Online, swap_id: String) -> Result<(), Error> {
+        info!(self.logger(), "Cancelling on-chain swap {swap_id}...");
+        self.check_online(online)?;
+        let swap_dir = swap_consignment_dir(self.wallet_dir(), &swap_id);
+        if swap_id.is_empty() || !swap_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(swap_invalid("invalid swap ID"));
+        }
+        if !swap_dir.is_dir() {
+            return Err(swap_invalid(format!("unknown swap {swap_id}")));
+        }
+        if [SWAP_BROADCAST_FILE, SWAP_ACCEPTED_FILE]
+            .iter()
+            .any(|marker| swap_dir.join(marker).exists())
+        {
+            return Err(Error::CannotFailBatchTransfer);
+        }
+        if let Some((outgoing, batch_transfer)) = self.swap_outgoing_batch(&swap_id)? {
+            if self
+                .indexer()
+                .get_tx_confirmations(&outgoing.txid)?
+                .is_some()
+            {
+                return Err(Error::CannotFailBatchTransfer);
+            }
+            match batch_transfer.status {
+                TransferStatus::Initiated => {
+                    self.fail_transfers(online, Some(batch_transfer.idx), false, false)?;
+                }
+                TransferStatus::Failed => {}
+                _ => return Err(Error::CannotFailBatchTransfer),
+            }
+        }
+        fs::rename(&swap_dir, swap_dir.with_extension(SWAP_CANCELLED_EXTENSION))?;
+        info!(self.logger(), "Cancel swap completed");
+        Ok(())
+    }
+
+    /// Cancel every on-chain swap whose offer has expired and whose transaction has not been
+    /// broadcast, as [`cancel_swap`](Wallet::cancel_swap) does. Returns the cancelled swap IDs.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn cancel_expired_swaps(&mut self, online: Online) -> Result<Vec<String>, Error> {
+        info!(self.logger(), "Cancelling expired on-chain swaps...");
+        self.check_online(online)?;
+        let transfers_dir = swap_consignment_dir(self.wallet_dir(), "")
+            .parent()
+            .expect("swap dir has a parent")
+            .to_path_buf();
+        if !transfers_dir.is_dir() {
+            return Ok(vec![]);
+        }
+        let mut swap_ids = vec![];
+        for entry in fs::read_dir(&transfers_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(swap_id) = name.strip_prefix("swap-") else {
+                continue;
+            };
+            if !entry.path().is_dir() || !swap_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+                continue;
+            }
+            let offer = if let Ok(offer) =
+                swap_load_state::<OnchainSwapOffer>(self.wallet_dir(), swap_id, SWAP_OFFER_FILE)
+            {
+                offer
+            } else if let Ok(request) =
+                swap_load_state::<OnchainSwapRequest>(self.wallet_dir(), swap_id, SWAP_REQUEST_FILE)
+            {
+                request.offer
+            } else {
+                continue;
+            };
+            if swap_ensure_not_expired(&offer).is_ok() {
+                continue;
+            }
+            match self.cancel_swap(online, swap_id.to_string()) {
+                Ok(()) => swap_ids.push(swap_id.to_string()),
+                Err(Error::CannotFailBatchTransfer) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        info!(self.logger(), "Cancel expired swaps completed");
+        Ok(swap_ids)
+    }
+
+    /// Make the broadcast swap TX known to BDK: parties that did not broadcast it would not
+    /// discover it with a colored sync, leaving their swap outputs unknown.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn swap_apply_witness_tx(&mut self, completion: &OnchainSwapCompletion) -> Result<(), Error> {
+        let finalized_psbt = completion
+            .finalized_psbt
+            .as_deref()
+            .ok_or_else(|| swap_invalid("swap completion is not finalized"))?;
+        let psbt = Psbt::from_str(finalized_psbt)?;
+        swap_validate_proposal_psbt(&completion.proposal, &psbt)?;
+        let tx = psbt.extract_tx().map_err(InternalError::from)?;
+        if tx.compute_txid().to_string() != completion.txid {
+            return Err(swap_invalid("swap completion txid mismatch"));
+        }
+        if self
+            .indexer()
+            .get_tx_confirmations(&completion.txid)?
+            .is_none()
+        {
+            return Err(swap_invalid("swap transaction is not known to the indexer"));
+        }
+        let seen_at = now().unix_timestamp() as u64;
+        let (bdk_wallet, bdk_db) = self.bdk_wallet_db_mut();
+        bdk_wallet.apply_unconfirmed_txs([(tx, seen_at)]);
+        bdk_wallet.persist(bdk_db)?;
+        Ok(())
+    }
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn swap_outgoing_batch(
+        &self,
+        swap_id: &str,
+    ) -> Result<Option<(SwapOutgoingState, DbBatchTransfer)>, Error> {
+        if !swap_state_path(self.wallet_dir(), swap_id, SWAP_OUTGOING_FILE).exists() {
+            return Ok(None);
+        }
+        let outgoing: SwapOutgoingState =
+            swap_load_state(self.wallet_dir(), swap_id, SWAP_OUTGOING_FILE)?;
+        let txn = self.database().begin_transaction()?;
+        let db_data = txn.get_db_data(false)?;
+        let batch_transfer =
+            txn.get_batch_transfer_or_fail(outgoing.batch_transfer_idx, &db_data.batch_transfers)?;
+        if batch_transfer.incoming || batch_transfer.txid.as_deref() != Some(&outgoing.txid) {
+            return Err(Error::Inconsistency {
+                details: format!("swap {swap_id} outgoing batch does not match its local state"),
+            });
+        }
+        Ok(Some((outgoing, batch_transfer)))
+    }
+
+    /// Consume this wallet's prepared RGB leg of a swap into the stash, once `txid` is known.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn swap_apply_outgoing(
+        &mut self,
+        online: Online,
+        swap_id: &str,
+        txid: &str,
+    ) -> Result<(), Error> {
+        let Some((outgoing, batch_transfer)) = self.swap_outgoing_batch(swap_id)? else {
+            return Ok(());
+        };
+        if outgoing.txid != txid {
+            return Err(swap_invalid(
+                "swap txid does not match the prepared RGB leg",
+            ));
+        }
+        if batch_transfer.status == TransferStatus::Initiated {
+            self.consume_transfer_fascia(online, batch_transfer.idx)?;
+        }
+        Ok(())
     }
 
     /// Accept the RGB transfers received from a completed on-chain swap.
@@ -2149,6 +2330,8 @@ impl Wallet {
         self.check_online(online)?;
         let offer = &completion.proposal.request.offer;
         swap_validate_proxy_url(&offer.proxy_url)?;
+        self.swap_apply_witness_tx(&completion)?;
+        self.swap_apply_outgoing(online, &offer.swap_id, &completion.txid)?;
         let txn = self.database().begin_transaction()?;
         self.sync_if_requested(&txn, Some(online), skip_sync, KeychainKind::External)?;
         let receives = match role {
@@ -2161,6 +2344,12 @@ impl Wallet {
             };
             self.update_backup_info(&txn, false)?;
             txn.commit()?;
+            swap_save_state(
+                self.wallet_dir(),
+                &offer.swap_id,
+                SWAP_ACCEPTED_FILE,
+                &completion.txid,
+            )?;
             return Ok(result);
         }
         let mut assignments = vec![];
@@ -2182,6 +2371,7 @@ impl Wallet {
                 consignment.vout,
                 consignment.blinding,
                 &consignment.recipient_id,
+                offer.rgb_output_sat,
             )?;
             assignments.append(&mut accepted);
         }
@@ -2193,6 +2383,12 @@ impl Wallet {
         let result = OnchainSwapReceiveResult { assignments };
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
+        swap_save_state(
+            self.wallet_dir(),
+            &offer.swap_id,
+            SWAP_ACCEPTED_FILE,
+            &completion.txid,
+        )?;
         info!(self.logger(), "Accept swap transfers completed");
         Ok(result)
     }

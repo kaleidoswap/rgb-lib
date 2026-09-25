@@ -1131,6 +1131,72 @@ impl Wallet {
         )
     }
 
+    /// Stage coloring spending only `prev_outputs`, requiring every allocation they carry to be
+    /// reassigned (no implicit burn).
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub(crate) fn color_psbt_stage_for_inputs(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        prev_outputs: HashSet<OutPoint>,
+    ) -> Result<AssetBeneficiariesMap, Error> {
+        let runtime = self.rgb_runtime()?;
+        self.reject_uncolored_input_contracts(&runtime, &prev_outputs, &coloring_info)?;
+        let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
+        self.color_psbt_stage_runtime(
+            &runtime,
+            psbt,
+            coloring_info,
+            prev_outputs,
+            true,
+            shift_output_map_for_opreturn_first,
+        )
+    }
+
+    /// Record a colored PSBT as an Initiated batch inside `txn` without touching the stash. The
+    /// fascia is applied later by [`Self::consume_transfer_fascia`], once the TX is known.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub(crate) fn prepare_consume_txn(
+        &self,
+        txn: &DbTxn,
+        psbt: &Psbt,
+        fascia: &Fascia,
+        coloring_info: &ColoringInfo,
+        prev_outputs: &HashSet<OutPoint>,
+        shift_output_map_for_opreturn_first: bool,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<i32, Error> {
+        let runtime = self.rgb_runtime()?;
+        let mut spent: SpentByContract = HashMap::new();
+        for contract_id in coloring_info.asset_info_map.keys() {
+            let by_outpoint = spent.entry(*contract_id).or_default();
+            for (explicit_seal, opout_state_map) in
+                runtime.contract_assignments_for(*contract_id, prev_outputs.iter().copied())?
+            {
+                for (opout, state) in opout_state_map {
+                    by_outpoint
+                        .entry(explicit_seal.to_outpoint())
+                        .or_default()
+                        .push(Assignment::from_opout_and_state(opout, &state));
+                }
+            }
+        }
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        self.write_color_prepare_files(psbt, &txid, fascia, true)?;
+        self.persist_color_prepare_batch_txn(
+            txn,
+            psbt,
+            &txid,
+            &spent,
+            coloring_info,
+            shift_output_map_for_opreturn_first,
+            min_confirmations,
+            expiration_timestamp,
+            &runtime,
+        )
+    }
+
     /// Color a PSBT, build consignments, and register a fallible batch transfer.
     ///
     /// `output_map` indexing follows [`Self::color_psbt`] (legacy P2TR / `OpretFirst` +1 shift).
@@ -2524,6 +2590,32 @@ impl Wallet {
         allow_consume_transfer_fascia: bool,
         runtime: &RgbRuntime,
     ) -> Result<i32, Error> {
+        self.write_color_prepare_files(psbt, txid, fascia, allow_consume_transfer_fascia)?;
+        let txn = self.database().begin_transaction()?;
+        let batch_transfer_idx = self.persist_color_prepare_batch_txn(
+            &txn,
+            psbt,
+            txid,
+            spent,
+            coloring_info,
+            shift_output_map_for_opreturn_first,
+            min_confirmations,
+            expiration_timestamp,
+            runtime,
+        )?;
+        self.update_backup_info(&txn, false)?;
+        txn.commit()?;
+        Ok(batch_transfer_idx)
+    }
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn write_color_prepare_files(
+        &self,
+        psbt: &Psbt,
+        txid: &str,
+        fascia: &Fascia,
+        allow_consume_transfer_fascia: bool,
+    ) -> Result<(), Error> {
         let transfer_dir = self.get_transfer_dir(txid);
         fs::create_dir_all(&transfer_dir)?;
         let fascia_path = transfer_dir.join(FASCIA_FILE);
@@ -2533,11 +2625,25 @@ impl Wallet {
         if allow_consume_transfer_fascia {
             fs::write(transfer_dir.join(COLOR_PREPARE_FILE), b"")?;
         }
+        Ok(())
+    }
 
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn persist_color_prepare_batch_txn(
+        &self,
+        txn: &DbTxn,
+        psbt: &Psbt,
+        txid: &str,
+        spent: &HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>>,
+        coloring_info: &ColoringInfo,
+        shift_output_map_for_opreturn_first: bool,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+        runtime: &RgbRuntime,
+    ) -> Result<i32, Error> {
         let created_at = now().unix_timestamp();
         let bitcoin_network = self.bitcoin_network();
-        let txn = self.database().begin_transaction()?;
-        let incoming_witness_scripts = Self::incoming_witness_receive_script_hexes(&txn)?;
+        let incoming_witness_scripts = Self::incoming_witness_receive_script_hexes(txn)?;
         if let Some(existing) =
             txn.get_batch_transfers_by_txid(txid)?
                 .into_iter()
@@ -2708,8 +2814,6 @@ impl Wallet {
             }
         }
 
-        self.update_backup_info(&txn, false)?;
-        txn.commit()?;
         Ok(batch_transfer_idx)
     }
 
@@ -2881,39 +2985,6 @@ impl Wallet {
             blinding,
             expected,
         )
-    }
-
-    /// Color a PSBT, consume the RGB fascia and return the related consignment.
-    ///
-    /// <div class="warning">This method is meant for special usage and is normally not needed, use
-    /// it only if you know what you're doing</div>
-    pub fn color_psbt_and_consume(
-        &self,
-        psbt: &mut Psbt,
-        coloring_info: ColoringInfo,
-    ) -> Result<Vec<RgbTransfer>, Error> {
-        info!(self.logger(), "Coloring PSBT and consuming...");
-        let (fascia, asset_beneficiaries) = self.color_psbt(psbt, coloring_info.clone())?;
-
-        let witness_txid = psbt.get_txid();
-
-        {
-            let mut runtime = self.rgb_runtime()?;
-            runtime.consume_fascia(fascia.clone(), None)?;
-        } // drop the runtime here so `generate_transfer` can reacquire the stash lock
-
-        let mut transfers = vec![];
-        for (contract_id, beneficiaries) in asset_beneficiaries {
-            transfers.push(self.generate_transfer(
-                contract_id,
-                beneficiaries,
-                witness_txid,
-                &fascia,
-            )?);
-        }
-
-        info!(self.logger(), "Color PSBT and consume completed");
-        Ok(transfers)
     }
 
     /// Produce an [`RgbTransfer`] consignment for a single contract given its beneficiaries

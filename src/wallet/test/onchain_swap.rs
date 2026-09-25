@@ -481,6 +481,425 @@ fn maker_rejects_tampered_rgb_consignment_before_signing_btc() {
     assert!(signature_count(&completion.psbt) > 0);
 }
 
+#[test]
+#[parallel]
+fn partial_rgb_for_btc_keeps_change_spendable() {
+    initialize();
+
+    const PARTIAL: u64 = 400;
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SPRT",
+        "Swap Partial",
+        SWAP_RGB_AMOUNT,
+    );
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, PARTIAL),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &asset_id, SWAP_RGB_AMOUNT - PARTIAL);
+    assert_settled_balance(&taker, &asset_id, PARTIAL);
+
+    // the change is spendable in a second swap
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT - PARTIAL),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &asset_id, 0);
+    assert_settled_balance(&taker, &asset_id, SWAP_RGB_AMOUNT);
+}
+
+#[test]
+#[parallel]
+fn partial_rgb_for_rgb_keeps_change_on_both_sides() {
+    initialize();
+
+    const MAKER_PARTIAL: u64 = 300;
+    const TAKER_PARTIAL: u64 = 700;
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let maker_asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SPMA",
+        "Swap Partial Maker",
+        SWAP_RGB_AMOUNT,
+    );
+    let taker_asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SPTA",
+        "Swap Partial Taker",
+        SWAP_RGB_AMOUNT,
+    );
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&maker_asset_id, MAKER_PARTIAL),
+        rgb(&taker_asset_id, TAKER_PARTIAL),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &maker_asset_id, SWAP_RGB_AMOUNT - MAKER_PARTIAL);
+    assert_settled_balance(&taker, &maker_asset_id, MAKER_PARTIAL);
+    assert_settled_balance(&taker, &taker_asset_id, SWAP_RGB_AMOUNT - TAKER_PARTIAL);
+    assert_settled_balance(&maker, &taker_asset_id, TAKER_PARTIAL);
+}
+
+#[test]
+#[parallel]
+fn second_asset_on_swap_input_survives() {
+    initialize();
+
+    const OTHER_AMOUNT: u64 = 500;
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SCOA",
+        "Swap Co-located A",
+        SWAP_RGB_AMOUNT,
+    );
+    let other_asset_id = maker
+        .issue_asset_nia(
+            "SCOB".to_string(),
+            "Swap Co-located B".to_string(),
+            0,
+            vec![OTHER_AMOUNT],
+        )
+        .unwrap()
+        .asset_id;
+    let unspents = maker
+        .list_unspents(Some(maker_online), false, false)
+        .unwrap();
+    assert!(
+        unspents.iter().any(|u| {
+            let ids = u
+                .rgb_allocations
+                .iter()
+                .filter_map(|a| a.asset_id.clone())
+                .collect::<Vec<_>>();
+            ids.contains(&asset_id) && ids.contains(&other_asset_id)
+        }),
+        "both assets should sit on the same UTXO"
+    );
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &asset_id, 0);
+    assert_settled_balance(&taker, &asset_id, SWAP_RGB_AMOUNT);
+    assert_settled_balance(&maker, &other_asset_id, OTHER_AMOUNT);
+
+    // the carried-over asset can still be sent
+    let mut maker = party!(maker, maker_online);
+    let mut rcv = get_funded_party!();
+    normal_send(&mut maker, &mut rcv, &other_asset_id, OTHER_AMOUNT);
+    assert_eq!(rcv.get_asset_balance(&other_asset_id).settled, OTHER_AMOUNT);
+    assert_eq!(maker.get_asset_balance(&other_asset_id).settled, 0);
+}
+
+#[test]
+#[parallel]
+fn swap_received_utxo_is_spendable() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SRSP",
+        "Swap Received Spend",
+        SWAP_RGB_AMOUNT,
+    );
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&taker, &asset_id, SWAP_RGB_AMOUNT);
+
+    let mut taker = party!(taker, taker_online);
+    let mut rcv = get_funded_party!();
+    normal_send(&mut taker, &mut rcv, &asset_id, SWAP_RGB_AMOUNT);
+    assert_eq!(rcv.get_asset_balance(&asset_id).settled, SWAP_RGB_AMOUNT);
+    assert_eq!(taker.get_asset_balance(&asset_id).settled, 0);
+}
+
+#[test]
+#[parallel]
+fn cancel_before_broadcast_leaves_state_unchanged() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SCNL",
+        "Swap Cancel",
+        SWAP_RGB_AMOUNT,
+    );
+    let db_before = settled_unspents(&mut maker, maker_online);
+    let stash_before = stash_assignments(&mut maker, maker_online, &asset_id);
+    let balance_before = maker.get_asset_balance(asset_id.clone()).unwrap();
+
+    let offer = maker
+        .create_swap_offer(
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            btc(SWAP_BTC_PRICE),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let swap_id = offer.swap_id.clone();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false)
+        .unwrap();
+    let proposal = maker
+        .accept_swap_request(maker_online, request, 0, false)
+        .unwrap();
+    // coloring prepared the leg without touching the stash
+    assert_eq!(
+        stash_assignments(&mut maker, maker_online, &asset_id),
+        stash_before
+    );
+    let _completion = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap();
+
+    maker.cancel_swap(maker_online, swap_id.clone()).unwrap();
+    taker.cancel_swap(taker_online, swap_id.clone()).unwrap();
+    for wallet in [&maker, &taker] {
+        let transfers_dir = wallet.get_wallet_dir().join("transfers");
+        assert!(!transfers_dir.join(format!("swap-{swap_id}")).exists());
+        assert!(
+            transfers_dir
+                .join(format!("swap-{swap_id}.cancelled"))
+                .exists()
+        );
+    }
+    assert!(maker.cancel_swap(maker_online, swap_id).is_err());
+
+    assert_eq!(settled_unspents(&mut maker, maker_online), db_before);
+    assert_eq!(
+        stash_assignments(&mut maker, maker_online, &asset_id),
+        stash_before
+    );
+    let balance_after = maker.get_asset_balance(asset_id.clone()).unwrap();
+    assert_eq!(balance_after.settled, balance_before.settled);
+    assert_eq!(balance_after.spendable, balance_before.spendable);
+    assert!(
+        maker
+            .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+            .unwrap()
+            .iter()
+            .any(|t| t.status == TransferStatus::Failed)
+    );
+
+    // the released UTXO can be swapped again
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &asset_id, 0);
+    assert_settled_balance(&taker, &asset_id, SWAP_RGB_AMOUNT);
+}
+
+#[test]
+#[parallel]
+fn expired_unbroadcast_swap_is_cancelled() {
+    initialize();
+
+    const EXPIRY_SECS: i64 = 30;
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SEXP",
+        "Swap Expired",
+        SWAP_RGB_AMOUNT,
+    );
+    let db_before = settled_unspents(&mut taker, taker_online);
+    let stash_before = stash_assignments(&mut taker, taker_online, &asset_id);
+
+    let expiration = now().unix_timestamp() + EXPIRY_SECS;
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            Some(expiration as u64),
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let swap_id = offer.swap_id.clone();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false)
+        .unwrap();
+    let proposal = maker
+        .accept_swap_request(maker_online, request, 0, false)
+        .unwrap();
+    let completion = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap();
+    let _completion = maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap();
+    // the taker's RGB leg is prepared but the transaction is never broadcast
+    assert!(maker.cancel_expired_swaps(maker_online).unwrap().is_empty());
+    assert!(taker.cancel_expired_swaps(taker_online).unwrap().is_empty());
+
+    while now().unix_timestamp() <= expiration {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(
+        taker.cancel_expired_swaps(taker_online).unwrap(),
+        vec![swap_id.clone()]
+    );
+    assert_eq!(
+        maker.cancel_expired_swaps(maker_online).unwrap(),
+        vec![swap_id]
+    );
+    assert!(taker.cancel_expired_swaps(taker_online).unwrap().is_empty());
+    assert_eq!(settled_unspents(&mut taker, taker_online), db_before);
+    assert_eq!(
+        stash_assignments(&mut taker, taker_online, &asset_id),
+        stash_before
+    );
+    assert_settled_balance(&taker, &asset_id, SWAP_RGB_AMOUNT);
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        btc(SWAP_BTC_PRICE),
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &asset_id, SWAP_RGB_AMOUNT);
+    assert_settled_balance(&taker, &asset_id, 0);
+}
+
+fn refresh_settled(wallet: &mut Wallet, online: Online) {
+    wallet.refresh(online, None, vec![], false).unwrap();
+}
+
+fn assert_settled_balance(wallet: &Wallet, asset_id: &str, expected: u64) {
+    let balance = wallet.get_asset_balance(asset_id.to_string()).unwrap();
+    assert_eq!(balance.settled, expected, "settled balance of {asset_id}");
+    assert_eq!(
+        balance.spendable, expected,
+        "spendable balance of {asset_id}"
+    );
+}
+
+fn settled_unspents(wallet: &mut Wallet, online: Online) -> Vec<String> {
+    let mut unspents = wallet
+        .list_unspents(Some(online), true, false)
+        .unwrap()
+        .into_iter()
+        .map(|u| format!("{} {:?}", u.utxo.outpoint, u.rgb_allocations))
+        .collect::<Vec<_>>();
+    unspents.sort();
+    unspents
+}
+
+fn stash_assignments(
+    wallet: &mut Wallet,
+    online: Online,
+    asset_id: &str,
+) -> Vec<(Outpoint, Vec<Assignment>)> {
+    let outpoints = wallet
+        .list_unspents(Some(online), false, false)
+        .unwrap()
+        .into_iter()
+        .map(|u| u.utxo.outpoint)
+        .collect::<Vec<_>>();
+    let mut assignments = wallet
+        .contract_assignments_for_outpoints(ContractId::from_str(asset_id).unwrap(), outpoints)
+        .unwrap();
+    assignments.sort_by_key(|(outpoint, _)| outpoint.to_string());
+    assignments
+}
+
+fn normal_send(sender: &mut SinglesigParty, rcv: &mut SinglesigParty, asset_id: &str, amount: u64) {
+    let receive_data = rcv.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset_id.to_string(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    sender.send(recipient_map, FEE_RATE, None);
+    rcv.wait_for_refresh(None);
+    sender.wait_for_refresh(Some(asset_id));
+    mine(false);
+    rcv.wait_for_refresh(None);
+    sender.wait_for_refresh(Some(asset_id));
+}
+
 fn issue_swap_asset(
     wallet: &mut Wallet,
     online: Online,
@@ -740,9 +1159,32 @@ fn execute_swap_with_fee(
                 .is_err()
         );
         let receive_result = maker
-            .accept_swap_transfers(maker_online, completion, OnchainSwapRole::Maker, false)
+            .accept_swap_transfers(
+                maker_online,
+                completion.clone(),
+                OnchainSwapRole::Maker,
+                false,
+            )
             .unwrap();
         assert!(!receive_result.assignments.is_empty());
+    }
+    // parties receiving only BTC still settle the RGB leg they sent
+    if !taker_receives_rgb {
+        let receive_result = taker
+            .accept_swap_transfers(
+                taker_online,
+                completion.clone(),
+                OnchainSwapRole::Taker,
+                false,
+            )
+            .unwrap();
+        assert!(receive_result.assignments.is_empty());
+    }
+    if !maker_receives_rgb {
+        let receive_result = maker
+            .accept_swap_transfers(maker_online, completion, OnchainSwapRole::Maker, false)
+            .unwrap();
+        assert!(receive_result.assignments.is_empty());
     }
 }
 
@@ -796,6 +1238,7 @@ fn signature_count(psbt: &str) -> usize {
 
 fn total_btc(wallet: &mut Wallet, online: Online) -> u64 {
     let balance = wallet.get_btc_balance(Some(online), false).unwrap();
+
     balance.vanilla.future + balance.colored.future
 }
 

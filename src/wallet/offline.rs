@@ -16,6 +16,14 @@ pub(crate) const SWAP_OFFER_FILE: &str = "offer.json";
 pub(crate) const SWAP_REQUEST_FILE: &str = "request.json";
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const SWAP_PROPOSAL_FILE: &str = "proposal.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_OUTGOING_FILE: &str = "outgoing.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_BROADCAST_FILE: &str = "broadcast.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_ACCEPTED_FILE: &str = "accepted.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_CANCELLED_EXTENSION: &str = "cancelled";
 
 const ASSET_ID_PREFIX: &str = "rgb:";
 
@@ -2909,6 +2917,14 @@ pub trait WalletOffline: WalletBackup {
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const SWAP_DEFAULT_RGB_OUTPUT_SAT: u64 = 1_000;
 
+/// The Initiated batch recording this wallet's RGB leg of a swap, applied after broadcast.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct SwapOutgoingState {
+    pub(crate) txid: String,
+    pub(crate) batch_transfer_idx: i32,
+}
+
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum SwapDirection {
@@ -3172,46 +3188,77 @@ pub(crate) fn swap_validate_proxy_url(proxy_url: &Option<String>) -> Result<(), 
     Ok(())
 }
 
+/// Build the coloring for a swap RGB leg: `leg.amount` goes to `recipient_vout` and everything
+/// else the inputs carry (`available`, per contract) goes back to `change_vout`. Vouts are final
+/// PSBT indices; the returned flag tells whether the map was shifted for an OP_RETURN-first PSBT.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn swap_rgb_leg_coloring_info(
     leg: &OnchainSwapLeg,
     psbt: &Psbt,
     recipient_vout: u32,
+    change_vout: Option<u32>,
     blinding: u64,
-) -> Result<(ContractId, rust_only::ColoringInfo), Error> {
+    available: &BTreeMap<ContractId, u64>,
+) -> Result<(ContractId, rust_only::ColoringInfo, bool), Error> {
     let asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
     let contract_id = ContractId::from_str(&asset_id)
         .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
-    let coloring_vout = if psbt
-        .unsigned_tx
-        .output
+    let outputs = &psbt.unsigned_tx.output;
+    let shift = outputs
         .first()
         .is_some_and(|o| o.script_pubkey.is_op_return())
-        && psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .any(|o| o.script_pubkey.is_p2tr())
-    {
-        recipient_vout
-            .checked_sub(1)
-            .ok_or_else(|| swap_invalid("invalid RGB recipient vout"))?
-    } else {
-        recipient_vout
+        && outputs.iter().any(|o| o.script_pubkey.is_p2tr());
+    let map_key = |vout: u32| -> Result<u32, Error> {
+        let output = outputs
+            .get(vout as usize)
+            .ok_or_else(|| swap_invalid(format!("swap vout {vout} does not exist in the PSBT")))?;
+        if output.script_pubkey.is_op_return() {
+            return Err(swap_invalid(format!(
+                "swap vout {vout} is the OP_RETURN output"
+            )));
+        }
+        vout.checked_sub(u32::from(shift))
+            .ok_or_else(|| swap_invalid("invalid RGB swap vout"))
     };
-    let output_map = HashMap::from_iter([(coloring_vout, leg.amount)]);
-    let coloring_info = rust_only::ColoringInfo {
-        asset_info_map: HashMap::from_iter([(
-            contract_id,
+    let swap_available = available.get(&contract_id).copied().unwrap_or(0);
+    if swap_available < leg.amount {
+        return Err(swap_invalid(format!(
+            "swap inputs carry {swap_available} of {asset_id}, {} required",
+            leg.amount
+        )));
+    }
+    let mut asset_info_map = HashMap::new();
+    for (cid, amount) in available {
+        let mut output_map = HashMap::new();
+        let change = if *cid == contract_id {
+            output_map.insert(map_key(recipient_vout)?, leg.amount);
+            amount - leg.amount
+        } else {
+            *amount
+        };
+        if change > 0 {
+            let change_vout = change_vout.ok_or_else(|| {
+                swap_invalid("swap inputs carry RGB change but the swap has no change output")
+            })?;
+            if change_vout == recipient_vout {
+                return Err(swap_invalid("swap change vout is the recipient vout"));
+            }
+            output_map.insert(map_key(change_vout)?, change);
+        }
+        asset_info_map.insert(
+            *cid,
             rust_only::AssetColoringInfo {
                 output_map,
-                static_blinding: Some(blinding),
+                static_blinding: (*cid == contract_id).then_some(blinding),
             },
-        )]),
+        );
+    }
+    let coloring_info = rust_only::ColoringInfo {
+        asset_info_map,
         static_blinding: Some(blinding),
         nonce: None,
     };
-    Ok((contract_id, coloring_info))
+    Ok((contract_id, coloring_info, shift))
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -3850,6 +3897,65 @@ mod swap_unit_tests {
         proposal.psbt = psbt.to_string();
         psbt.unsigned_tx.output[1].value = BdkAmount::from_sat(42);
         assert!(swap_validate_proposal_psbt(&proposal, &psbt).is_err());
+    }
+
+    #[test]
+    fn swap_coloring_carries_change_and_other_assets() {
+        let proposal = rgb_rgb_proposal();
+        let (psbt, _, taker_rgb_vout) = swap_build_psbt(&proposal).unwrap();
+        let recipient_vout = taker_rgb_vout.unwrap();
+        let change_vout = psbt.unsigned_tx.output.len() as u32 - 1;
+        let asset_1 = ContractId::from_str(ASSET_1).unwrap();
+        let asset_2 = ContractId::from_str(ASSET_2).unwrap();
+        let available = BTreeMap::from_iter([(asset_1, 15), (asset_2, 7)]);
+        let (contract_id, coloring_info, shift) = swap_rgb_leg_coloring_info(
+            &rgb(ASSET_1, 10),
+            &psbt,
+            recipient_vout,
+            Some(change_vout),
+            42,
+            &available,
+        )
+        .unwrap();
+        assert_eq!(contract_id, asset_1);
+        assert!(!shift);
+        let swap_info = &coloring_info.asset_info_map[&asset_1];
+        assert_eq!(
+            swap_info.output_map,
+            HashMap::from_iter([(recipient_vout, 10), (change_vout, 5)])
+        );
+        assert_eq!(swap_info.static_blinding, Some(42));
+        assert_eq!(
+            coloring_info.asset_info_map[&asset_2].output_map,
+            HashMap::from_iter([(change_vout, 7)])
+        );
+    }
+
+    #[test]
+    fn swap_coloring_fails_closed() {
+        let proposal = rgb_rgb_proposal();
+        let (psbt, _, taker_rgb_vout) = swap_build_psbt(&proposal).unwrap();
+        let recipient_vout = taker_rgb_vout.unwrap();
+        let outputs = psbt.unsigned_tx.output.len() as u32;
+        let asset_1 = ContractId::from_str(ASSET_1).unwrap();
+        let exact = BTreeMap::from_iter([(asset_1, 10)]);
+        let leftover = BTreeMap::from_iter([(asset_1, 11)]);
+        let leg = rgb(ASSET_1, 10);
+        // leftover without a change output would be burned
+        assert!(
+            swap_rgb_leg_coloring_info(&leg, &psbt, recipient_vout, None, 1, &leftover).is_err()
+        );
+        // not enough on the inputs
+        let short = BTreeMap::from_iter([(asset_1, 9)]);
+        assert!(swap_rgb_leg_coloring_info(&leg, &psbt, recipient_vout, None, 1, &short).is_err());
+        // out-of-range and OP_RETURN vouts
+        assert!(swap_rgb_leg_coloring_info(&leg, &psbt, outputs, None, 1, &exact).is_err());
+        assert!(swap_rgb_leg_coloring_info(&leg, &psbt, 0, None, 1, &exact).is_err());
+        assert!(
+            swap_rgb_leg_coloring_info(&leg, &psbt, recipient_vout, Some(outputs), 1, &leftover)
+                .is_err()
+        );
+        assert!(swap_rgb_leg_coloring_info(&leg, &psbt, recipient_vout, None, 1, &exact).is_ok());
     }
 
     #[test]
