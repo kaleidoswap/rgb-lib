@@ -974,6 +974,174 @@ fn exclude_outpoints_and_list_swaps() {
     assert_eq!(cancelled_summary.txid, None);
 }
 
+/// Run a swap up to the taker's completion, with the offer expiring at `expiration`.
+#[allow(clippy::too_many_arguments)]
+fn swap_to_completion(
+    maker: &mut Wallet,
+    maker_online: Online,
+    taker: &mut Wallet,
+    taker_online: Online,
+    maker_gives: OnchainSwapLeg,
+    maker_receives: OnchainSwapLeg,
+    expiration: Option<u64>,
+) -> OnchainSwapCompletion {
+    let offer = maker
+        .create_swap_offer(
+            maker_gives,
+            maker_receives,
+            SWAP_FEE,
+            expiration,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let proposal = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap();
+    taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap()
+}
+
+#[test]
+#[parallel]
+fn maker_refuses_to_sign_after_offer_expiry() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SEXP",
+        "Swap Expiry",
+        SWAP_RGB_AMOUNT,
+    );
+    let expiration = now().unix_timestamp() as u64 + 20;
+    let completion = swap_to_completion(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        Some(expiration),
+    );
+    while (now().unix_timestamp() as u64) <= expiration {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(
+        maker
+            .process_swap_completion(maker_online, completion)
+            .is_err()
+    );
+}
+
+#[test]
+#[parallel]
+fn maker_refuses_a_completion_missing_taker_signatures() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SSIG",
+        "Swap Signatures",
+        SWAP_RGB_AMOUNT,
+    );
+    let mut completion = swap_to_completion(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        btc(SWAP_BTC_PRICE),
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        None,
+    );
+    let taker_inputs = completion
+        .proposal
+        .request
+        .taker_inputs
+        .iter()
+        .map(|i| i.outpoint.clone())
+        .collect::<Vec<_>>();
+    let mut psbt = Psbt::from_str(&completion.psbt).unwrap();
+    for (txin, input) in psbt.unsigned_tx.input.iter().zip(psbt.inputs.iter_mut()) {
+        let outpoint = Outpoint {
+            txid: txin.previous_output.txid.to_string(),
+            vout: txin.previous_output.vout,
+        };
+        if taker_inputs.contains(&outpoint) {
+            input.tap_key_sig = None;
+            input.tap_script_sigs.clear();
+            input.partial_sigs.clear();
+            input.final_script_witness = None;
+        }
+    }
+    completion.psbt = psbt.to_string();
+    assert!(
+        maker
+            .process_swap_completion(maker_online, completion)
+            .is_err()
+    );
+}
+
+#[test]
+#[parallel]
+fn refused_rebroadcast_keeps_swap_uncancellable() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SRBC",
+        "Swap Rebroadcast",
+        SWAP_RGB_AMOUNT,
+    );
+    let completion = swap_to_completion(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        None,
+    );
+    let swap_id = completion.proposal.request.offer.swap_id.clone();
+    let completion = maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap();
+    maker
+        .broadcast_swap_completion(maker_online, completion.clone())
+        .unwrap();
+    // re-broadcasting a swap already out (in the mempool, then mined) must never reopen it. The
+    // electrum backend used here accepts a known tx; esplora refuses it, which is the path the
+    // marker guard in broadcast_swap_completion covers
+    let _ = maker.broadcast_swap_completion(maker_online, completion.clone());
+    mine(false);
+    let _ = maker.broadcast_swap_completion(maker_online, completion);
+    let stage = maker
+        .list_swaps()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.swap_id == swap_id)
+        .unwrap()
+        .stage;
+    assert_eq!(stage, OnchainSwapStage::Broadcast);
+    assert!(matches!(
+        maker.cancel_swap(maker_online, swap_id),
+        Err(Error::CannotFailBatchTransfer)
+    ));
+}
+
 fn refresh_settled(wallet: &mut Wallet, online: Online) {
     wallet.refresh(online, None, vec![], false).unwrap();
 }

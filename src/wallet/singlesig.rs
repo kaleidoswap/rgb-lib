@@ -16,8 +16,9 @@ use super::offline::{
 use super::online::{
     SwapRgbSend, swap_accept_transfer_from_file, swap_color_rgb_leg, swap_emit_asset_history,
     swap_ensure_inputs_confirmed, swap_fetch_consignment_to_file, swap_finalize_psbt,
-    swap_import_asset_history, swap_prepare_rgb_leg, swap_select_inputs, swap_sign_psbt,
-    swap_stage_rgb_leg, swap_validate_fascia_received_leg, swap_validate_received_swap_leg,
+    swap_finalize_psbt_required, swap_import_asset_history, swap_prepare_rgb_leg,
+    swap_select_inputs, swap_sign_psbt, swap_stage_rgb_leg, swap_validate_fascia_received_leg,
+    swap_validate_received_swap_leg,
 };
 use super::*;
 
@@ -1939,6 +1940,8 @@ impl Wallet {
         swap_ensure_state_matches(&local_proposal, &completion.proposal, "proposal")?;
         let direction = swap_validate_legs(&offer.maker_gives, &offer.maker_receives)?;
         swap_validate_proxy_url(&offer.proxy_url)?;
+        // the maker signs last: never sign a swap whose offer has expired
+        swap_ensure_not_expired(&offer)?;
         let mut psbt = Psbt::from_str(&completion.psbt)?;
         swap_validate_proposal_psbt(&completion.proposal, &psbt)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
@@ -1969,10 +1972,7 @@ impl Wallet {
                 swap_ensure_inputs_confirmed(self, &completion.proposal.maker_inputs, 0)?;
                 swap_ensure_inputs_confirmed(self, &completion.proposal.request.taker_inputs, 0)?;
                 swap_sign_psbt(self, &mut psbt)?;
-                let finalized_psbt = swap_finalize_psbt(self, &psbt)?;
-                if finalized_psbt.is_none() {
-                    return Err(swap_invalid("swap PSBT is not fully signed"));
-                }
+                let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
                     psbt: psbt.to_string(),
                     finalized_psbt,
@@ -2009,7 +2009,7 @@ impl Wallet {
                 swap_ensure_inputs_confirmed(self, &completion.proposal.maker_inputs, 0)?;
                 swap_ensure_inputs_confirmed(self, &completion.proposal.request.taker_inputs, 0)?;
                 swap_sign_psbt(self, &mut psbt)?;
-                let finalized_psbt = swap_finalize_psbt(self, &psbt)?;
+                let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
                     psbt: psbt.to_string(),
                     finalized_psbt,
@@ -2095,7 +2095,7 @@ impl Wallet {
                 swap_ensure_inputs_confirmed(self, &completion.proposal.maker_inputs, 0)?;
                 swap_ensure_inputs_confirmed(self, &completion.proposal.request.taker_inputs, 0)?;
                 swap_sign_psbt(self, &mut psbt)?;
-                let finalized_psbt = swap_finalize_psbt(self, &psbt)?;
+                let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
                     psbt: psbt.to_string(),
                     finalized_psbt,
@@ -2137,6 +2137,8 @@ impl Wallet {
         }
 
         // from here on the swap can no longer be cancelled
+        let rebroadcast =
+            swap_state_path(self.wallet_dir(), &offer.swap_id, SWAP_BROADCAST_FILE).exists();
         swap_save_state(
             self.wallet_dir(),
             &offer.swap_id,
@@ -2164,6 +2166,11 @@ impl Wallet {
                 | Error::MinFeeNotMet { .. }
                 | Error::MaxFeeExceeded { .. }),
             ) => {
+                // a refused re-broadcast (e.g. the tx is already in the mempool or mined) or a tx
+                // the indexer knows is out there: the swap must stay uncancellable
+                if rebroadcast || self.indexer().get_tx_confirmations(&txid)?.is_some() {
+                    return Err(e);
+                }
                 // rejected and unknown to the indexer: the swap can still be cancelled
                 let _ = fs::remove_file(swap_state_path(
                     self.wallet_dir(),
