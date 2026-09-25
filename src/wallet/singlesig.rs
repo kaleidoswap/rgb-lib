@@ -1742,9 +1742,6 @@ impl Wallet {
                 .collect::<Vec<_>>();
             swap_restore_input_metadata(&mut psbt, &inputs)?;
         }
-        if matches!(direction, SwapDirection::RgbForBtc) {
-            swap_sign_psbt(self, &mut psbt)?;
-        }
         proposal.txid = psbt.unsigned_tx.compute_txid().to_string();
         proposal.psbt = psbt.to_string();
         proposal.consignments = consignments;
@@ -1763,10 +1760,10 @@ impl Wallet {
 
     /// Complete a maker proposal as the taker.
     ///
-    /// The taker validates the PSBT, colors any RGB leg they are sending, signs the PSBT, and
-    /// attempts to finalize it. The returned [`OnchainSwapCompletion`] must be forwarded to the
-    /// maker (who calls [`process_swap_completion`](Wallet::process_swap_completion) before
-    /// broadcasting) or broadcast directly for single-RGB swaps.
+    /// The taker validates the PSBT, colors any RGB leg they are sending and signs the PSBT. The
+    /// maker always signs last, so the returned [`OnchainSwapCompletion`] is never broadcastable
+    /// by the taker: it must be forwarded to the maker, who calls
+    /// [`process_swap_completion`](Wallet::process_swap_completion) and broadcasts.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub fn complete_swap_proposal(
         &mut self,
@@ -1954,6 +1951,28 @@ impl Wallet {
 
         match direction {
             SwapDirection::RgbForBtc => {
+                // the maker's RGB leg was committed when building the proposal: the taker may only
+                // have added signatures
+                if txid != completion.proposal.txid {
+                    return Err(swap_invalid("swap completion txid mismatch"));
+                }
+                let txn = self.database().begin_transaction()?;
+                self.sync_if_requested(&txn, Some(online), false, KeychainKind::Internal)?;
+                self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
+                swap_ensure_inputs_confirmed(self, &completion.proposal.maker_inputs, 0)?;
+                swap_ensure_inputs_confirmed(self, &completion.proposal.request.taker_inputs, 0)?;
+                swap_sign_psbt(self, &mut psbt)?;
+                let finalized_psbt = swap_finalize_psbt(self, &psbt)?;
+                if finalized_psbt.is_none() {
+                    return Err(swap_invalid("swap PSBT is not fully signed"));
+                }
+                let completion = OnchainSwapCompletion {
+                    psbt: psbt.to_string(),
+                    finalized_psbt,
+                    ..completion
+                };
+                self.update_backup_info(&txn, false)?;
+                txn.commit()?;
                 info!(self.logger(), "Process swap completion completed");
                 Ok(completion)
             }

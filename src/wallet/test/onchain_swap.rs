@@ -953,7 +953,6 @@ fn execute_swap_with_fee(
 ) {
     let maker_receives_rgb = matches!(maker_receives.kind, OnchainSwapLegKind::Rgb);
     let taker_receives_rgb = matches!(maker_gives.kind, OnchainSwapLegKind::Rgb);
-    let maker_gives_btc = matches!(maker_gives.kind, OnchainSwapLegKind::Btc);
     let rgb_for_rgb = maker_receives_rgb && taker_receives_rgb;
     let maker_gives_asset_id = maker_gives.asset_id.clone();
     let maker_receives_asset_id = maker_receives.asset_id.clone();
@@ -975,11 +974,8 @@ fn execute_swap_with_fee(
     let proposal = maker
         .accept_swap_request(maker_online, request, 0, false)
         .unwrap();
-    if rgb_for_rgb || maker_gives_btc {
-        assert_eq!(signature_count(&proposal.psbt), 0);
-    } else {
-        assert!(signature_count(&proposal.psbt) > 0);
-    }
+    // the maker signs last in every direction: its proposal carries no signature
+    assert_eq!(signature_count(&proposal.psbt), 0);
     assert_consignment_transport(&proposal.consignments);
     if taker_receives_rgb {
         assert!(
@@ -991,6 +987,11 @@ fn execute_swap_with_fee(
     let completion = taker
         .complete_swap_proposal(taker_online, proposal, 0, false)
         .unwrap();
+    assert!(
+        completion.finalized_psbt.is_none(),
+        "the taker must never hold a broadcastable swap transaction"
+    );
+    assert!(signature_count(&completion.psbt) > 0);
     if rgb_for_rgb {
         assert!(
             completion.taker_history.is_some(),
@@ -1017,15 +1018,11 @@ fn execute_swap_with_fee(
                 .is_err()
         );
     }
-    // Maker resumes the swap on their side: for RGB-for-RGB this consumes the fascia and emits
-    // the maker's consignment; for the single-RGB cases this is a no-op.
+    // the maker validates the taker's leg, signs last and finalizes
     let completion = maker
         .process_swap_completion(maker_online, completion)
         .unwrap();
-    if rgb_for_rgb || maker_gives_btc {
-        assert!(completion.finalized_psbt.is_some());
-        assert!(signature_count(&completion.psbt) > 0);
-    }
+    assert!(completion.finalized_psbt.is_some());
     assert_consignment_transport(&completion.consignments);
 
     let broadcast_txid = maker
