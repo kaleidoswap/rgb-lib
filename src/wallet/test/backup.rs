@@ -336,3 +336,122 @@ fn backup_info() {
     let backup_required = wallet.backup_info().unwrap();
     assert!(!backup_required);
 }
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn snapshot_seal_mark_done() {
+    initialize();
+
+    let backup_file_path = get_test_data_dir_path().join("test_backup_snapshot.rgb-lib_backup");
+    let backup_file = backup_file_path.to_str().unwrap();
+    let _ = std::fs::remove_file(backup_file);
+
+    let mut party = get_funded_party!();
+    let mut wallet_data = party.get_wallet_data();
+    let keys = party.get_keys();
+    let wallet_dir = party.wallet.get_wallet_dir();
+    let asset = party.issue_asset_nia(None);
+    assert!(party.wallet.backup_info().unwrap());
+
+    // taking the snapshot records nothing
+    let snapshot = party.wallet.backup_snapshot(backup_file).unwrap();
+    assert!(party.wallet.backup_info().unwrap());
+
+    // sealing runs without the wallet, and records nothing either
+    let sealed = std::thread::spawn(move || seal_backup(snapshot, PASSWORD))
+        .join()
+        .unwrap()
+        .unwrap();
+    assert!(backup_file_path.exists());
+    assert!(party.wallet.backup_info().unwrap());
+
+    // the file restores the wallet as it was when the snapshot was taken
+    drop(party);
+    let target_dir_path = get_restore_dir_path(Some("snapshot"));
+    let target_dir = target_dir_path.to_str().unwrap();
+    restore_backup(backup_file, PASSWORD, target_dir).unwrap();
+    let restore_wallet_dir = target_dir_path.join(wallet_dir.file_name().unwrap());
+    compare_test_directories(&wallet_dir, &restore_wallet_dir, &["log"]);
+
+    // once recorded, no backup is due
+    let wallet = Wallet::new(wallet_data.clone(), keys.clone()).unwrap();
+    wallet.backup_mark_done(&sealed).unwrap();
+    assert!(!wallet.backup_info().unwrap());
+    drop(wallet);
+
+    // the restored wallet holds the asset and asks for a backup of its own
+    wallet_data.data_dir = target_dir.to_string();
+    let restored = Wallet::new(wallet_data, keys).unwrap();
+    assert!(restored.backup_info().unwrap());
+    let assets = restored.list_assets(vec![]).unwrap();
+    assert!(
+        assets
+            .nia
+            .unwrap()
+            .iter()
+            .any(|a| a.asset_id == asset.asset_id)
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn snapshot_counts_from_when_it_was_taken() {
+    initialize();
+
+    let backup_file_path =
+        get_test_data_dir_path().join("test_backup_snapshot_taken_at.rgb-lib_backup");
+    let backup_file = backup_file_path.to_str().unwrap();
+    let _ = std::fs::remove_file(backup_file);
+    let newer_file_path =
+        get_test_data_dir_path().join("test_backup_snapshot_taken_at_newer.rgb-lib_backup");
+    let newer_file = newer_file_path.to_str().unwrap();
+    let _ = std::fs::remove_file(newer_file);
+
+    let mut party = get_funded_party!();
+    let snapshot = party.wallet.backup_snapshot(backup_file).unwrap();
+    // a change made while the snapshot is being sealed
+    party.issue_asset_nia(None);
+    let sealed = seal_backup(snapshot, PASSWORD).unwrap();
+    party.wallet.backup_mark_done(&sealed).unwrap();
+    assert!(party.wallet.backup_info().unwrap());
+
+    // recording an older backup doesn't undo a newer one
+    party.wallet.backup(newer_file, PASSWORD).unwrap();
+    assert!(!party.wallet.backup_info().unwrap());
+    party.wallet.backup_mark_done(&sealed).unwrap();
+    assert!(!party.wallet.backup_info().unwrap());
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn snapshot_fail() {
+    // services are unnecessary here but this prevents removal of the test dir during exectution
+    initialize();
+
+    let backup_file_path =
+        get_test_data_dir_path().join("test_backup_snapshot_fail.rgb-lib_backup");
+    let backup_file = backup_file_path.to_str().unwrap();
+    let _ = std::fs::remove_file(backup_file);
+    let wallet = get_test_wallet(true, None);
+
+    // an existing file is never overwritten, at snapshot or at seal
+    std::fs::write(&backup_file_path, b"").unwrap();
+    let result = wallet.backup_snapshot(backup_file);
+    assert_matches!(result, Err(Error::FileAlreadyExists { .. }));
+    std::fs::remove_file(&backup_file_path).unwrap();
+    let snapshot = wallet.backup_snapshot(backup_file).unwrap();
+    std::fs::write(&backup_file_path, b"").unwrap();
+    let result = seal_backup(snapshot, PASSWORD);
+    assert_matches!(result, Err(Error::FileAlreadyExists { .. }));
+    std::fs::remove_file(&backup_file_path).unwrap();
+
+    // a backup of another wallet can't be recorded
+    let other = get_test_wallet(true, None);
+    let snapshot = other.backup_snapshot(backup_file).unwrap();
+    let sealed = seal_backup(snapshot, PASSWORD).unwrap();
+    let result = wallet.backup_mark_done(&sealed);
+    assert_matches!(result, Err(Error::Internal { .. }));
+}
