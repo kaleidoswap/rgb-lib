@@ -688,16 +688,6 @@ impl Wallet {
 }
 
 /// Online APIs of the wallet.
-/// Outpoints a caller asks coin selection to leave alone. A malformed TXID is an error, never
-/// silently dropped, since the caller relies on the outpoint not being spent.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-fn parse_exclude_outpoints(exclude_outpoints: &[Outpoint]) -> Result<Vec<BdkOutPoint>, Error> {
-    exclude_outpoints
-        .iter()
-        .map(|o| BdkOutPoint::from_str(&o.to_string()).map_err(|_| Error::InvalidTxid))
-        .collect()
-}
-
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 impl Wallet {
     pub(crate) fn watch_only(&self) -> bool {
@@ -779,25 +769,16 @@ impl Wallet {
         skip_sync: bool,
         dry_run: bool,
     ) -> Result<String, Error> {
-        info!(self.logger(), "Creating UTXOs (begin)...");
-        self.check_online(online)?;
-        let txn = self.database().begin_transaction()?;
-        let res = self.create_utxos_begin_impl(
-            &txn,
+        self.create_utxos_begin_excluding(
+            online,
             up_to,
             num,
             size,
             fee_rate,
             skip_sync,
             dry_run,
-            &[],
-        )?;
-        if !dry_run {
-            self.update_backup_info(&txn, false)?;
-        }
-        txn.commit()?;
-        info!(self.logger(), "Create UTXOs (begin) completed");
-        Ok(res.to_string())
+            vec![],
+        )
     }
 
     /// [`create_utxos_begin`](Wallet::create_utxos_begin) that never spends an outpoint in
@@ -819,9 +800,12 @@ impl Wallet {
         dry_run: bool,
         exclude_outpoints: Vec<Outpoint>,
     ) -> Result<String, Error> {
-        info!(self.logger(), "Creating UTXOs (begin, excluding)...");
+        info!(self.logger(), "Creating UTXOs (begin)...");
         self.check_online(online)?;
-        let exclude = parse_exclude_outpoints(&exclude_outpoints)?;
+        let exclude = exclude_outpoints
+            .iter()
+            .map(BdkOutPoint::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
         let txn = self.database().begin_transaction()?;
         let res = self.create_utxos_begin_impl(
             &txn, up_to, num, size, fee_rate, skip_sync, dry_run, &exclude,
@@ -830,7 +814,7 @@ impl Wallet {
             self.update_backup_info(&txn, false)?;
         }
         txn.commit()?;
-        info!(self.logger(), "Create UTXOs (begin, excluding) completed");
+        info!(self.logger(), "Create UTXOs (begin) completed");
         Ok(res.to_string())
     }
 
@@ -1231,24 +1215,15 @@ impl Wallet {
         dry_run: bool,
         lock_time: Option<u32>,
     ) -> Result<String, Error> {
-        info!(self.logger(), "Sending BTC (begin)...");
-        self.check_online(online)?;
-        let txn = self.database().begin_transaction()?;
-        let res = self.send_btc_begin_impl(
-            &txn,
-            &[(address, amount)],
+        self.send_btc_many_begin(
+            online,
+            vec![(address, amount)],
             fee_rate,
             skip_sync,
             dry_run,
             lock_time,
-            &[],
-        )?;
-        if !dry_run {
-            self.update_backup_info(&txn, false)?;
-        }
-        txn.commit()?;
-        info!(self.logger(), "Send BTC (begin) completed");
-        Ok(res.to_string())
+            vec![],
+        )
     }
 
     /// Prepare the PSBT to send bitcoins using the vanilla wallet to several `recipients` in one
@@ -1275,13 +1250,12 @@ impl Wallet {
         lock_time: Option<u32>,
         exclude_outpoints: Vec<Outpoint>,
     ) -> Result<String, Error> {
-        info!(
-            self.logger(),
-            "Sending BTC to {} recipients (begin)...",
-            recipients.len()
-        );
+        info!(self.logger(), "Sending BTC (begin)...");
         self.check_online(online)?;
-        let exclude = parse_exclude_outpoints(&exclude_outpoints)?;
+        let exclude = exclude_outpoints
+            .iter()
+            .map(BdkOutPoint::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
         let txn = self.database().begin_transaction()?;
         let res = self.send_btc_begin_impl(
             &txn,
@@ -1296,7 +1270,7 @@ impl Wallet {
             self.update_backup_info(&txn, false)?;
         }
         txn.commit()?;
-        info!(self.logger(), "Send BTC to many (begin) completed");
+        info!(self.logger(), "Send BTC (begin) completed");
         Ok(res.to_string())
     }
 
