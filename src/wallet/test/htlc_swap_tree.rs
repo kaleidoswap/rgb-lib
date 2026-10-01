@@ -1102,7 +1102,20 @@ fn pinned_accept_then_claim_settles_through_the_operation() {
     assert_htlc_holds_lock(&claimer, &locked);
 
     // the operation reports what its transition assigns, at prepare and on lookup
-    let prepared = prepare_htlc_spend(&mut claimer, &locked, HtlcPath::Claim, 893);
+    // an out-of-band receive, as a maker's claim uses: only those settle through the handover,
+    // proxy invoices settle through refresh
+    let receive_data = claimer
+        .wallet
+        .witness_receive(
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![],
+            MIN_CONFIRMATIONS,
+        )
+        .unwrap();
+    let prepared =
+        prepare_htlc_spend_to(&mut claimer, &locked, HtlcPath::Claim, 893, receive_data).unwrap();
     let expected = vec![PsbtOpAllocation {
         asset_id: locked.asset_id.clone(),
         vout: Some(prepared.dest_vout),
