@@ -582,3 +582,119 @@ fn begin_end() {
     let bak_info_after = party.db_backup_info();
     assert!(bak_info_after.last_operation_timestamp > bak_info_before.last_operation_timestamp);
 }
+
+#[cfg(feature = "electrum")]
+fn psbt_inputs(psbt: &str) -> HashSet<BdkOutPoint> {
+    Psbt::from_str(psbt)
+        .unwrap()
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| i.previous_output)
+        .collect()
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn begin_excluding() {
+    initialize();
+
+    // two vanilla UTXOs
+    let mut party = get_empty_party!();
+    fund_wallet(party.get_address());
+    fund_wallet(party.get_address());
+    let vanilla: Vec<BdkOutPoint> = party
+        .list_unspents_vanilla(None)
+        .into_iter()
+        .map(|u| u.outpoint)
+        .collect();
+    assert_eq!(vanilla.len(), 2);
+    let (kept, spendable) = (vanilla[0], vanilla[1]);
+
+    // without an exclusion the split spends every vanilla UTXO
+    let psbt = party
+        .wallet
+        .create_utxos_begin(party.online, false, Some(1), None, FEE_RATE, false, true)
+        .unwrap();
+    assert_eq!(psbt_inputs(&psbt), HashSet::from([kept, spendable]));
+
+    // an outpoint the wallet doesn't own changes nothing
+    let foreign = Outpoint {
+        txid: s!("0000000000000000000000000000000000000000000000000000000000000001"),
+        vout: 0,
+    };
+    let psbt = party
+        .wallet
+        .create_utxos_begin_excluding(
+            party.online,
+            false,
+            Some(1),
+            None,
+            FEE_RATE,
+            false,
+            true,
+            vec![foreign],
+        )
+        .unwrap();
+    assert_eq!(psbt_inputs(&psbt), HashSet::from([kept, spendable]));
+
+    // an excluded outpoint is left out
+    let psbt = party
+        .wallet
+        .create_utxos_begin_excluding(
+            party.online,
+            false,
+            Some(1),
+            None,
+            FEE_RATE,
+            false,
+            true,
+            vec![Outpoint::from(kept)],
+        )
+        .unwrap();
+    assert_eq!(psbt_inputs(&psbt), HashSet::from([spendable]));
+
+    // and stays unspent once the split is broadcast
+    let signed = party.wallet.sign_psbt(psbt, None).unwrap();
+    let created = party.wallet.create_utxos_end(party.online, signed).unwrap();
+    assert_eq!(created, 1);
+    mine(false);
+    let vanilla: HashSet<BdkOutPoint> = party
+        .list_unspents_vanilla(None)
+        .into_iter()
+        .map(|u| u.outpoint)
+        .collect();
+    assert!(vanilla.contains(&kept));
+    assert!(!vanilla.contains(&spendable));
+
+    // nothing left to fund a split once every vanilla UTXO is excluded
+    let all: Vec<Outpoint> = vanilla.into_iter().map(Outpoint::from).collect();
+    let result = party.wallet.create_utxos_begin_excluding(
+        party.online,
+        false,
+        Some(1),
+        None,
+        FEE_RATE,
+        false,
+        true,
+        all,
+    );
+    assert_matches!(result, Err(Error::InsufficientBitcoins { .. }));
+
+    // a malformed TXID is refused, not ignored
+    let result = party.wallet.create_utxos_begin_excluding(
+        party.online,
+        false,
+        Some(1),
+        None,
+        FEE_RATE,
+        false,
+        true,
+        vec![Outpoint {
+            txid: s!("not a txid"),
+            vout: 0,
+        }],
+    );
+    assert_matches!(result, Err(Error::InvalidTxid));
+}

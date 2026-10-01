@@ -2303,7 +2303,7 @@ impl MultisigWallet {
         self.check_is_cosigner()?;
         let txn = self.database().begin_transaction()?;
         let psbt =
-            self.create_utxos_begin_impl(&txn, up_to, num, size, fee_rate, skip_sync, true)?;
+            self.create_utxos_begin_impl(&txn, up_to, num, size, fee_rate, skip_sync, true, &[])?;
         let res = self.post_operation(OperationType::CreateUtxos, PostData::Psbt(psbt))?;
         txn.commit()?;
         self.trigger_auto_backup();
@@ -2328,8 +2328,15 @@ impl MultisigWallet {
         self.check_online(online)?;
         self.check_is_cosigner()?;
         let txn = self.database().begin_transaction()?;
-        let psbt =
-            self.send_btc_begin_impl(&txn, address, amount, fee_rate, skip_sync, true, None)?;
+        let psbt = self.send_btc_begin_impl(
+            &txn,
+            &[(address, amount)],
+            fee_rate,
+            skip_sync,
+            true,
+            None,
+            &[],
+        )?;
         let res = self.post_operation(OperationType::SendBtc, PostData::Psbt(psbt))?;
         txn.commit()?;
         self.trigger_auto_backup();

@@ -371,6 +371,7 @@ impl WalletOnline for MpcWallet {
         fee_rate: u64,
         skip_sync: bool,
         _dry_run: bool,
+        exclude_outpoints: &[OutPoint],
     ) -> Result<Psbt, Error> {
         let fee_rate_checked = self.check_fee_rate(fee_rate)?;
 
@@ -409,6 +410,7 @@ impl WalletOnline for MpcWallet {
         let vanilla_utxos = self.query_vanilla_utxos()?;
         let available: Vec<(OutPoint, TxOut)> = vanilla_utxos
             .iter()
+            .filter(|(op, _, _)| !exclude_outpoints.contains(op))
             .map(|(op, txout, _)| (*op, txout.clone()))
             .collect();
 
@@ -474,16 +476,21 @@ impl WalletOnline for MpcWallet {
     fn send_btc_begin_impl(
         &mut self,
         txn: &DbTxn,
-        address: String,
-        amount: u64,
+        recipients: &[(String, u64)],
         fee_rate: u64,
         skip_sync: bool,
         _dry_run: bool,
         // MPC PSBTs are built manually with a final (zero) locktime, so they are
         // always valid as LN funding txs; the caller-pinned locktime is not needed.
         _lock_time: Option<u32>,
+        exclude_outpoints: &[OutPoint],
     ) -> Result<Psbt, Error> {
         let fee_rate_checked = self.check_fee_rate(fee_rate)?;
+        if recipients.is_empty() {
+            return Err(Error::InvalidRecipientData {
+                details: s!("no recipients"),
+            });
+        }
 
         if !skip_sync {
             self.sync_bdk_and_db_txos(
@@ -496,11 +503,24 @@ impl WalletOnline for MpcWallet {
             )?;
         }
 
-        let script_pubkey = self.get_script_pubkey(&address)?;
+        let mut outputs = Vec::with_capacity(recipients.len() + 1);
+        let mut amount: u64 = 0;
+        for (address, value) in recipients {
+            outputs.push(TxOut {
+                value: BdkAmount::from_sat(*value),
+                script_pubkey: self.get_script_pubkey(address)?,
+            });
+            amount = amount
+                .checked_add(*value)
+                .ok_or_else(|| Error::InvalidRecipientData {
+                    details: s!("total recipient amount exceeds u64::MAX"),
+                })?;
+        }
 
         // Get vanilla UTXOs, excluding colored ones
         let unspendable = self.get_unspendable_bdk_outpoints(txn)?;
-        let unspendable_set: HashSet<OutPoint> = unspendable.into_iter().collect();
+        let mut unspendable_set: HashSet<OutPoint> = unspendable.into_iter().collect();
+        unspendable_set.extend(exclude_outpoints.iter().copied());
 
         let vanilla_utxos = self.query_vanilla_utxos()?;
         let available: Vec<(OutPoint, TxOut)> = vanilla_utxos
@@ -509,15 +529,12 @@ impl WalletOnline for MpcWallet {
             .map(|(op, txout, _)| (op, txout))
             .collect();
 
-        let (selected, total) = mpc_psbt::select_coins(&available, amount, fee_rate_checked, 2)?;
+        let num_outputs = outputs.len() + 1; // +1 for change
+        let (selected, total) =
+            mpc_psbt::select_coins(&available, amount, fee_rate_checked, num_outputs)?;
 
-        let fee = mpc_psbt::calculate_fee(selected.len(), 2, fee_rate_checked)?;
+        let fee = mpc_psbt::calculate_fee(selected.len(), num_outputs, fee_rate_checked)?;
         let change = total - amount - fee;
-
-        let mut outputs = vec![TxOut {
-            value: BdkAmount::from_sat(amount),
-            script_pubkey,
-        }];
 
         if change > mpc_psbt::TAPROOT_DUST {
             let change_addr = self.get_new_addresses(KeychainKind::Internal, 1)?;
@@ -899,7 +916,7 @@ impl MpcWallet {
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
         let psbt =
-            self.create_utxos_begin_impl(&txn, up_to, num, size, fee_rate, skip_sync, true)?;
+            self.create_utxos_begin_impl(&txn, up_to, num, size, fee_rate, skip_sync, true, &[])?;
         let signed = self.mpc_sign_psbt(psbt)?;
         let res = self.create_utxos_end_impl(&txn, &signed)?;
         self.update_backup_info(&txn, false)?;
@@ -923,8 +940,16 @@ impl MpcWallet {
         info!(self.logger(), "Creating UTXOs (begin)...");
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let res =
-            self.create_utxos_begin_impl(&txn, up_to, num, size, fee_rate, skip_sync, dry_run)?;
+        let res = self.create_utxos_begin_impl(
+            &txn,
+            up_to,
+            num,
+            size,
+            fee_rate,
+            skip_sync,
+            dry_run,
+            &[],
+        )?;
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }
@@ -1056,8 +1081,15 @@ impl MpcWallet {
         info!(self.logger(), "Sending BTC...");
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let psbt =
-            self.send_btc_begin_impl(&txn, address, amount, fee_rate, skip_sync, true, None)?;
+        let psbt = self.send_btc_begin_impl(
+            &txn,
+            &[(address, amount)],
+            fee_rate,
+            skip_sync,
+            true,
+            None,
+            &[],
+        )?;
         let signed = self.mpc_sign_psbt(psbt)?;
         let res = self.send_btc_end_impl(&txn, &signed)?;
         self.update_backup_info(&txn, false)?;
@@ -1079,8 +1111,15 @@ impl MpcWallet {
         info!(self.logger(), "Sending BTC (begin)...");
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let res =
-            self.send_btc_begin_impl(&txn, address, amount, fee_rate, skip_sync, dry_run, None)?;
+        let res = self.send_btc_begin_impl(
+            &txn,
+            &[(address, amount)],
+            fee_rate,
+            skip_sync,
+            dry_run,
+            None,
+            &[],
+        )?;
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }

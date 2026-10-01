@@ -256,6 +256,7 @@ pub trait WalletOnline: WalletOffline {
         fee_rate: u64,
         skip_sync: bool,
         dry_run: bool,
+        exclude_outpoints: &[BdkOutPoint],
     ) -> Result<Psbt, Error> {
         let fee_rate_checked = self.check_fee_rate(fee_rate)?;
 
@@ -291,10 +292,11 @@ pub trait WalletOnline: WalletOffline {
             "Will try to create {} UTXOs", utxos_to_create
         );
 
-        let reserved: HashSet<BdkOutPoint> = self
+        let mut reserved: HashSet<BdkOutPoint> = self
             .get_reserved_vanilla_outpoints(txn)?
             .into_iter()
             .collect();
+        reserved.extend(exclude_outpoints.iter().copied());
         let (inputs, usable_btc_amount) = self.internal_unspents().fold(
             (Vec::new(), 0u64),
             |(mut inputs, usable_btc_amount), u| {
@@ -4135,14 +4137,19 @@ pub trait WalletOnline: WalletOffline {
     fn send_btc_begin_impl(
         &mut self,
         txn: &DbTxn,
-        address: String,
-        amount: u64,
+        recipients: &[(String, u64)],
         fee_rate: u64,
         skip_sync: bool,
         dry_run: bool,
         lock_time: Option<u32>,
+        exclude_outpoints: &[BdkOutPoint],
     ) -> Result<Psbt, Error> {
         let fee_rate_checked = self.check_fee_rate(fee_rate)?;
+        if recipients.is_empty() {
+            return Err(Error::InvalidRecipientData {
+                details: s!("no recipients"),
+            });
+        }
 
         if !skip_sync {
             self.sync_wallet(
@@ -4157,9 +4164,13 @@ pub trait WalletOnline: WalletOffline {
             )?;
         }
 
-        let script_pubkey = self.get_script_pubkey(&address)?;
+        let outputs = recipients
+            .iter()
+            .map(|(address, amount)| Ok((self.get_script_pubkey(address)?, *amount)))
+            .collect::<Result<Vec<_>, Error>>()?;
 
-        let unspendable = self.get_unspendable_bdk_outpoints(txn)?;
+        let mut unspendable = self.get_unspendable_bdk_outpoints(txn)?;
+        unspendable.extend(exclude_outpoints.iter().copied());
 
         let change_script = if self.wallet_data().reuse_addresses {
             Some(
@@ -4172,8 +4183,10 @@ pub trait WalletOnline: WalletOffline {
         let mut tx_builder = self.bdk_wallet_mut().build_tx();
         tx_builder
             .unspendable(unspendable)
-            .add_recipient(script_pubkey, BdkAmount::from_sat(amount))
             .fee_rate(fee_rate_checked);
+        for (script_pubkey, amount) in outputs {
+            tx_builder.add_recipient(script_pubkey, BdkAmount::from_sat(amount));
+        }
         // When the caller pins a locktime (e.g. 0 for an LN funding tx that must
         // be final), honor it; otherwise keep BDK's anti-fee-sniping default.
         if let Some(height) = lock_time {
