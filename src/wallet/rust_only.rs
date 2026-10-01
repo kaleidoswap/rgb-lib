@@ -5,6 +5,8 @@
 use super::*;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use crate::utils::{recipient_id_from_script_buf, script_buf_from_recipient_id};
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use crate::wallet::online::proxy_get_consignment;
 use amplify::num::u5;
 use bdk_wallet::bitcoin::Transaction;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -269,24 +271,25 @@ pub struct AcceptedTransfer {
     pub outpoint: Outpoint,
 }
 
-/// Fetch an RGB consignment from the proxy at `consignment_endpoint` by its proxy key
-/// `recipient_id`, without a wallet.
+/// Fetch an RGB consignment by recipient_id (proxy lookup key), without a wallet: what
+/// [`Wallet::fetch_consignment_by_recipient_id_unchecked`] does, so it can run off the thread
+/// that owns the wallet.
 ///
-/// Nothing is validated, so this can run off the thread that owns the wallet; accept the result
-/// with [`Wallet::accept_transfer_pinned`].
+/// **Unchecked:** `txid` and `vout` come from the proxy and are **not** validated here. Accept
+/// the result with [`Wallet::accept_transfer_pinned`], which pins the witness output first.
 ///
 /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
 #[cfg(any(feature = "electrum", feature = "esplora"))]
-pub fn fetch_consignment_by_recipient_id(
-    consignment_endpoint: &str,
+pub fn fetch_consignment_by_recipient_id_unchecked(
     recipient_id: String,
+    consignment_endpoint: &str,
 ) -> Result<FetchedConsignment, Error> {
     let proxy_url = TransportEndpoint::new(consignment_endpoint.to_string())?.endpoint;
-    let consignment_res = ProxyClient::new(&proxy_url)?
-        .get_consignment(&recipient_id)
-        .ok()
-        .and_then(|res| res.result)
-        .ok_or(Error::NoConsignment)?;
+    let consignment_res = proxy_get_consignment(
+        &proxy_url,
+        &recipient_id,
+        &Logger::root(slog::Discard, o!()),
+    )?;
     let vout = consignment_res.vout.ok_or_else(|| Error::Internal {
         details: s!("missing vout in consignment response"),
     })?;
@@ -320,11 +323,8 @@ fn fascia_allocations(fascia: &Fascia) -> Result<Vec<PsbtOpAllocation>, Error> {
                 let mut found = vec![];
                 for assign in typed_assigns.as_fungible() {
                     let amount = assign.as_revealed_state().as_u64();
-                    let assignment = match *ass_type {
-                        OS_ASSET => Assignment::Fungible(amount),
-                        OS_INFLATION => Assignment::InflationRight(amount),
-                        _ => return Err(unknown(ass_type)),
-                    };
+                    let assignment =
+                        Assignment::fungible(*ass_type, amount).ok_or_else(|| unknown(ass_type))?;
                     found.push((witness_vout(assign.revealed_seal()), assignment));
                 }
                 for assign in typed_assigns.as_structured() {
@@ -2662,7 +2662,7 @@ impl Wallet {
     /// it only if you know what you're doing</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub fn psbt_ops_spending(&self, outpoint: Outpoint) -> Result<Vec<PsbtOperation>, Error> {
-        let spent = OutPoint::from_str(&outpoint.to_string()).map_err(|_| Error::InvalidTxid)?;
+        let spent = OutPoint::try_from(&outpoint)?;
         let mut metas = self.psbt_op_scan()?;
         metas.sort_by(|a, b| (a.created_at, &a.operation_id).cmp(&(b.created_at, &b.operation_id)));
         let mut ops = vec![];
@@ -3213,7 +3213,8 @@ impl Wallet {
         recipient_id: String,
         consignment_endpoint: &str,
     ) -> Result<(RgbTransfer, String, u32), Error> {
-        let fetched = fetch_consignment_by_recipient_id(consignment_endpoint, recipient_id)?;
+        let fetched =
+            self::fetch_consignment_by_recipient_id_unchecked(recipient_id, consignment_endpoint)?;
         Ok((fetched.consignment, fetched.txid, fetched.vout))
     }
 
@@ -3233,22 +3234,28 @@ impl Wallet {
         expected: ExpectedTransfer,
     ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
         self.check_online(online)?;
-        let fetched = fetch_consignment_by_recipient_id(consignment_endpoint, proxy_recipient_id)?;
-        self.accept_pinned(
+        let fetched = self::fetch_consignment_by_recipient_id_unchecked(
+            proxy_recipient_id,
+            consignment_endpoint,
+        )?;
+        let accepted = self.accept_transfer_pinned(
             online,
             fetched,
-            &witness_recipient_id,
+            witness_recipient_id,
             blinding,
             min_confirmations,
             expected,
-        )
+        )?;
+        Ok((accepted.consignment, accepted.assignments))
     }
 
-    /// Accept a consignment fetched with [`fetch_consignment_by_recipient_id`]: pin
+    /// Accept a consignment fetched with [`fetch_consignment_by_recipient_id_unchecked`]: pin
     /// `output[vout]` of the witness transaction to `witness_recipient_id` with at least
-    /// `min_confirmations`, check the transfer matches `expected`, accept it, and save the asset
-    /// if the wallet doesn't know it yet (a wallet that never held the asset can't color a spend
-    /// of the received allocation without it).
+    /// `min_confirmations`, check the transfer matches `expected`, and accept it.
+    ///
+    /// [`Self::fetch_and_accept_transfer_by_recipient_id`] is the fetch followed by this. Neither
+    /// saves the asset: a wallet that never held it calls [`Self::save_new_asset`] before coloring
+    /// a spend of the received allocation.
     ///
     /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -3263,54 +3270,33 @@ impl Wallet {
     ) -> Result<AcceptedTransfer, Error> {
         info!(self.logger(), "Accepting pinned transfer...");
         self.check_online(online)?;
-        let outpoint = Outpoint {
-            txid: fetched.txid.clone(),
-            vout: fetched.vout,
-        };
-        let (consignment, assignments) = self.accept_pinned(
-            online,
-            fetched,
-            &witness_recipient_id,
-            blinding,
-            min_confirmations,
-            expected,
-        )?;
-        self.save_new_asset(online, consignment.clone(), outpoint.txid.clone())?;
-        info!(self.logger(), "Accept pinned transfer completed");
-        Ok(AcceptedTransfer {
-            consignment,
-            assignments,
-            outpoint,
-        })
-    }
-
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
-    fn accept_pinned(
-        &mut self,
-        online: Online,
-        fetched: FetchedConsignment,
-        witness_recipient_id: &str,
-        blinding: u64,
-        min_confirmations: u8,
-        expected: ExpectedTransfer,
-    ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
         pin_witness_output_to_recipient_id(
             self.blockchain_resolver(),
             self.indexer(),
             self.chain_net(),
-            witness_recipient_id,
+            &witness_recipient_id,
             &fetched.txid,
             fetched.vout,
             min_confirmations,
         )?;
-        self.accept_transfer_from_consignment_unchecked(
+        let outpoint = Outpoint {
+            txid: fetched.txid.clone(),
+            vout: fetched.vout,
+        };
+        let (consignment, assignments) = self.accept_transfer_from_consignment_unchecked(
             online,
             fetched.consignment,
             fetched.txid,
             fetched.vout,
             blinding,
             expected,
-        )
+        )?;
+        info!(self.logger(), "Accept pinned transfer completed");
+        Ok(AcceptedTransfer {
+            consignment,
+            assignments,
+            outpoint,
+        })
     }
 
     /// Produce an [`RgbTransfer`] consignment for a single contract given its beneficiaries

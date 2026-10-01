@@ -142,6 +142,15 @@ impl From<Outpoint> for OutPoint {
     }
 }
 
+/// For outpoints a caller supplies: a malformed TXID is an error, not a panic.
+impl TryFrom<&Outpoint> for OutPoint {
+    type Error = Error;
+
+    fn try_from(x: &Outpoint) -> Result<OutPoint, Error> {
+        OutPoint::from_str(&x.to_string()).map_err(|_| Error::InvalidTxid)
+    }
+}
+
 /// A balance.
 ///
 /// This structure is used both for RGB assets and BTC balances (in sats). When used for a BTC

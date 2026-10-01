@@ -1037,15 +1037,15 @@ fn swap_tree_witnesses_verify() {
     }
 }
 
-/// Import the lock with the wallet-free fetch and the pinned accept, which also saves the asset.
+/// Import the lock with the wallet-free fetch and the pinned accept, then save the asset.
 fn accept_htlc_lock_pinned(party: &mut SinglesigParty, locked: &LockedHtlc) -> AcceptedTransfer {
-    let fetched = crate::wallet::rust_only::fetch_consignment_by_recipient_id(
-        &PROXY_ENDPOINT,
+    let fetched = crate::wallet::rust_only::fetch_consignment_by_recipient_id_unchecked(
         locked.recipient_id.clone(),
+        &PROXY_ENDPOINT,
     )
     .unwrap();
     let online = party.party_online();
-    party
+    let accepted = party
         .wallet
         .accept_transfer_pinned(
             online,
@@ -1055,7 +1055,16 @@ fn accept_htlc_lock_pinned(party: &mut SinglesigParty, locked: &LockedHtlc) -> A
             MIN_CONFIRMATIONS,
             expected_nia(&locked.asset_id, LOCK_AMOUNT),
         )
-        .unwrap()
+        .unwrap();
+    party
+        .wallet
+        .save_new_asset(
+            online,
+            accepted.consignment.clone(),
+            accepted.outpoint.txid.clone(),
+        )
+        .unwrap();
+    accepted
 }
 
 #[cfg(feature = "electrum")]
@@ -1069,16 +1078,16 @@ fn pinned_accept_then_claim_settles_through_the_operation() {
     let locked = lock_in_htlc(&mut sender, None);
 
     // nothing posted under an unknown key
-    let missing = crate::wallet::rust_only::fetch_consignment_by_recipient_id(
-        &PROXY_ENDPOINT,
+    let missing = crate::wallet::rust_only::fetch_consignment_by_recipient_id_unchecked(
         claimer.witness_receive().recipient_id,
+        &PROXY_ENDPOINT,
     );
     assert_matches!(missing, Err(Error::NoConsignment));
 
     // the consignment is pinned to the HTLC output, not to another script
-    let fetched = crate::wallet::rust_only::fetch_consignment_by_recipient_id(
-        &PROXY_ENDPOINT,
+    let fetched = crate::wallet::rust_only::fetch_consignment_by_recipient_id_unchecked(
         locked.recipient_id.clone(),
+        &PROXY_ENDPOINT,
     )
     .unwrap();
     let online = claimer.party_online();
