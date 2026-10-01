@@ -9,6 +9,8 @@ use amplify::num::u5;
 use bdk_wallet::bitcoin::Transaction;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use rgbstd::AssignmentType;
 use rgbstd::Operation as _;
 use rgbstd::{
     containers::SealWitness,
@@ -222,6 +224,135 @@ pub struct PsbtOpPrepareResult {
     pub colored_psbt: String,
     /// Wallet-relative directory containing file-backed payloads.
     pub operation_dir: String,
+    /// What the operation's RGB transitions assign, read back from the committed fascia.
+    pub allocations: Vec<PsbtOpAllocation>,
+}
+
+/// One assignment a PSBT operation's RGB transitions make, read back from its committed fascia
+/// (not from the [`ColoringInfo`] the operation was prepared with).
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PsbtOpAllocation {
+    /// Contract the assignment belongs to, in its canonical spelling.
+    pub asset_id: String,
+    /// Output of the witness transaction the assignment is sealed to; `None` when the seal is
+    /// concealed or points to another transaction.
+    pub vout: Option<u32>,
+    /// The assigned state.
+    pub assignment: Assignment,
+}
+
+/// A consignment fetched from a proxy, before any validation.
+///
+/// **Unchecked:** `txid` and `vout` are what the proxy reported. Pass it to
+/// [`Wallet::accept_transfer_pinned`], which pins the witness output before accepting.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone)]
+pub struct FetchedConsignment {
+    /// The consignment.
+    pub consignment: RgbTransfer,
+    /// Witness transaction ID reported by the proxy.
+    pub txid: String,
+    /// Witness output reported by the proxy.
+    pub vout: u32,
+}
+
+/// Result of [`Wallet::accept_transfer_pinned`].
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone)]
+pub struct AcceptedTransfer {
+    /// The accepted consignment.
+    pub consignment: RgbTransfer,
+    /// Assignments received on the pinned witness output.
+    pub assignments: Vec<Assignment>,
+    /// The pinned witness output.
+    pub outpoint: Outpoint,
+}
+
+/// Fetch an RGB consignment from the proxy at `consignment_endpoint` by its proxy key
+/// `recipient_id`, without a wallet.
+///
+/// Nothing is validated, so this can run off the thread that owns the wallet; accept the result
+/// with [`Wallet::accept_transfer_pinned`].
+///
+/// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub fn fetch_consignment_by_recipient_id(
+    consignment_endpoint: &str,
+    recipient_id: String,
+) -> Result<FetchedConsignment, Error> {
+    let proxy_url = TransportEndpoint::new(consignment_endpoint.to_string())?.endpoint;
+    let consignment_res = ProxyClient::new(&proxy_url)?
+        .get_consignment(&recipient_id)
+        .ok()
+        .and_then(|res| res.result)
+        .ok_or(Error::NoConsignment)?;
+    let vout = consignment_res.vout.ok_or_else(|| Error::Internal {
+        details: s!("missing vout in consignment response"),
+    })?;
+    let consignment_bytes = general_purpose::STANDARD
+        .decode(consignment_res.consignment)
+        .map_err(InternalError::from)?;
+    let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
+    Ok(FetchedConsignment {
+        consignment,
+        txid: consignment_res.txid,
+        vout,
+    })
+}
+
+/// What `fascia`'s transitions assign. Every owned-state type the wallet's schemas define is
+/// reported; any other is an error rather than left out.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn fascia_allocations(fascia: &Fascia) -> Result<Vec<PsbtOpAllocation>, Error> {
+    fn witness_vout(seal: Option<GraphSeal>) -> Option<u32> {
+        seal.filter(|seal| seal.txid == TxPtr::WitnessTx)
+            .map(|seal| seal.vout.into_u32())
+    }
+    let mut allocations = vec![];
+    for (contract_id, bundle) in fascia.bundles() {
+        let asset_id = contract_id.to_string();
+        let unknown = |ass_type: &AssignmentType| Error::Inconsistency {
+            details: format!("fascia for {asset_id} assigns unknown owned state {ass_type}"),
+        };
+        for KnownTransition { transition, .. } in bundle.known_transitions.iter() {
+            for (ass_type, typed_assigns) in transition.assignments.iter() {
+                let mut found = vec![];
+                for assign in typed_assigns.as_fungible() {
+                    let amount = assign.as_revealed_state().as_u64();
+                    let assignment = match *ass_type {
+                        OS_ASSET => Assignment::Fungible(amount),
+                        OS_INFLATION => Assignment::InflationRight(amount),
+                        _ => return Err(unknown(ass_type)),
+                    };
+                    found.push((witness_vout(assign.revealed_seal()), assignment));
+                }
+                for assign in typed_assigns.as_structured() {
+                    found.push((
+                        witness_vout(assign.revealed_seal()),
+                        Assignment::NonFungible,
+                    ));
+                }
+                for assign in typed_assigns.as_declarative() {
+                    if *ass_type != OS_LINK {
+                        return Err(unknown(ass_type));
+                    }
+                    found.push((witness_vout(assign.revealed_seal()), Assignment::LinkRight));
+                }
+                allocations.extend(
+                    found
+                        .into_iter()
+                        .map(|(vout, assignment)| PsbtOpAllocation {
+                            asset_id: asset_id.clone(),
+                            vout,
+                            assignment,
+                        }),
+                );
+            }
+        }
+    }
+    allocations.sort();
+    Ok(allocations)
 }
 
 /// Recovered HTLC operation (lookup after a lost `psbt_op_prepare` response).
@@ -240,6 +371,8 @@ pub struct PsbtOperation {
     pub broadcast: PsbtBroadcastState,
     /// Witness txid committed at prepare.
     pub txid: String,
+    /// What the operation's RGB transitions assign, read back from the committed fascia.
+    pub allocations: Vec<PsbtOpAllocation>,
 }
 
 /// Caller intent for HTLC / special accept paths.
@@ -1842,7 +1975,7 @@ impl Wallet {
 
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn psbt_op_from_meta(&self, meta: &PsbtOpMeta) -> Result<PsbtOperation, Error> {
-        let (psbt, _) = self.psbt_op_verify_committed_payloads(meta)?;
+        let (psbt, fascia) = self.psbt_op_verify_committed_payloads(meta)?;
         let operation_dir = PathBuf::from(PSBT_OPS_DIR)
             .join(&meta.operation_id)
             .to_string_lossy()
@@ -1854,6 +1987,7 @@ impl Wallet {
             status: meta.status,
             broadcast: meta.broadcast,
             txid: meta.txid.clone(),
+            allocations: fascia_allocations(&fascia)?,
         })
     }
 
@@ -1986,6 +2120,7 @@ impl Wallet {
         }
 
         let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let allocations = fascia_allocations(&fascia)?;
         let foreign_inputs = self.collect_foreign_input_entries(&spent)?;
 
         let operation_id = Self::new_psbt_op_id();
@@ -2074,6 +2209,7 @@ impl Wallet {
             operation_id,
             colored_psbt: psbt.to_string(),
             operation_dir,
+            allocations,
         })
     }
 
@@ -2517,6 +2653,103 @@ impl Wallet {
                 details: format!("multiple HTLC operations share txid {txid}"),
             }),
         }
+    }
+
+    /// List the HTLC operations whose colored PSBT spends `outpoint`, in any status, ordered by
+    /// creation time (to the second).
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn psbt_ops_spending(&self, outpoint: Outpoint) -> Result<Vec<PsbtOperation>, Error> {
+        let spent = OutPoint::from_str(&outpoint.to_string()).map_err(|_| Error::InvalidTxid)?;
+        let mut metas = self.psbt_op_scan()?;
+        metas.sort_by(|a, b| (a.created_at, &a.operation_id).cmp(&(b.created_at, &b.operation_id)));
+        let mut ops = vec![];
+        for meta in metas {
+            // Cheap filter on the PSBT alone; matches are fully verified below. An unreadable
+            // PSBT is an error: skipping it could hide an operation spending `outpoint`.
+            let path = self
+                .psbt_op_dir(&meta.operation_id)?
+                .join(PSBT_OP_COLORED_PSBT_FILE);
+            let psbt =
+                Psbt::from_str(&fs::read_to_string(&path)?).map_err(|e| Error::Inconsistency {
+                    details: format!(
+                        "HTLC operation {} has an unreadable colored PSBT: {e}",
+                        meta.operation_id
+                    ),
+                })?;
+            if psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .any(|i| i.previous_output == spent)
+            {
+                ops.push(self.psbt_op_from_meta(&meta)?);
+            }
+        }
+        Ok(ops)
+    }
+
+    /// Hand the consignment an applied HTLC operation produced for `asset_id` to the wallet's
+    /// pending receive it pays (e.g. the witness receive a claim spends to), as
+    /// [`provide_out_of_band_consignment`](Wallet::provide_out_of_band_consignment) would.
+    ///
+    /// `asset_id` may be in any spelling rgb-lib parses. The operation must be applied: the
+    /// consignment of an operation that may never confirm, or was aborted, is never handed over.
+    /// As with `provide_out_of_band_consignment`, it is an error when no pending receive matches,
+    /// including once the receive has already been handed the consignment.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn psbt_op_provide_receive_consignment(
+        &mut self,
+        online: Online,
+        operation_id: &str,
+        asset_id: &str,
+    ) -> Result<RefreshResult, Error> {
+        info!(
+            self.logger(),
+            "Providing HTLC operation {operation_id} consignment to its receive..."
+        );
+        self.check_online(online)?;
+        let asset_id = ContractId::from_str(asset_id)
+            .map_err(|_| Error::AssetNotFound {
+                asset_id: asset_id.to_string(),
+            })?
+            .to_string();
+        let meta = self.psbt_op_read_meta(operation_id)?;
+        if !matches!(
+            meta.status,
+            PsbtOperationStatus::Applied | PsbtOperationStatus::Settled
+        ) {
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "operation {operation_id} is {:?}, expected Applied or Settled",
+                    meta.status
+                ),
+            });
+        }
+        self.psbt_op_verify_committed_payloads(&meta)?;
+        if !meta.hashes.consignments.contains_key(&asset_id) {
+            return Err(Error::CannotProvideOutOfBandConsignment {
+                details: format!("operation {operation_id} has no consignment for {asset_id}"),
+            });
+        }
+        let path = psbt_op_consignment_path(&self.psbt_op_dir(operation_id)?, &asset_id);
+        let path = path
+            .to_str()
+            .ok_or_else(|| Error::Internal {
+                details: s!("consignment path is not valid UTF-8"),
+            })?
+            .to_owned();
+        let res = self.provide_out_of_band_consignment(online, path, vec![])?;
+        info!(
+            self.logger(),
+            "Provide HTLC operation consignment completed"
+        );
+        Ok(res)
     }
 
     /// Read HTLC operation status; marks Settled when a linked batch has settled.
@@ -2980,18 +3213,8 @@ impl Wallet {
         recipient_id: String,
         consignment_endpoint: &str,
     ) -> Result<(RgbTransfer, String, u32), Error> {
-        let proxy_url = TransportEndpoint::new(consignment_endpoint.to_string())?.endpoint;
-        let consignment_res = self.get_consignment(&proxy_url, recipient_id)?;
-        let vout = consignment_res.vout.ok_or_else(|| Error::Internal {
-            details: s!("missing vout in consignment response"),
-        })?;
-
-        let consignment_bytes = general_purpose::STANDARD
-            .decode(consignment_res.consignment)
-            .map_err(InternalError::from)?;
-        let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
-
-        Ok((consignment, consignment_res.txid, vout))
+        let fetched = fetch_consignment_by_recipient_id(consignment_endpoint, recipient_id)?;
+        Ok((fetched.consignment, fetched.txid, fetched.vout))
     }
 
     /// Fetch a consignment by proxy key, pin the witness output to `witness_recipient_id`, and
@@ -3010,24 +3233,81 @@ impl Wallet {
         expected: ExpectedTransfer,
     ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
         self.check_online(online)?;
-        let (consignment, txid, vout) = self.fetch_consignment_by_recipient_id_unchecked(
-            proxy_recipient_id,
-            consignment_endpoint,
+        let fetched = fetch_consignment_by_recipient_id(consignment_endpoint, proxy_recipient_id)?;
+        self.accept_pinned(
+            online,
+            fetched,
+            &witness_recipient_id,
+            blinding,
+            min_confirmations,
+            expected,
+        )
+    }
+
+    /// Accept a consignment fetched with [`fetch_consignment_by_recipient_id`]: pin
+    /// `output[vout]` of the witness transaction to `witness_recipient_id` with at least
+    /// `min_confirmations`, check the transfer matches `expected`, accept it, and save the asset
+    /// if the wallet doesn't know it yet (a wallet that never held the asset can't color a spend
+    /// of the received allocation without it).
+    ///
+    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn accept_transfer_pinned(
+        &mut self,
+        online: Online,
+        fetched: FetchedConsignment,
+        witness_recipient_id: String,
+        blinding: u64,
+        min_confirmations: u8,
+        expected: ExpectedTransfer,
+    ) -> Result<AcceptedTransfer, Error> {
+        info!(self.logger(), "Accepting pinned transfer...");
+        self.check_online(online)?;
+        let outpoint = Outpoint {
+            txid: fetched.txid.clone(),
+            vout: fetched.vout,
+        };
+        let (consignment, assignments) = self.accept_pinned(
+            online,
+            fetched,
+            &witness_recipient_id,
+            blinding,
+            min_confirmations,
+            expected,
         )?;
+        self.save_new_asset(online, consignment.clone(), outpoint.txid.clone())?;
+        info!(self.logger(), "Accept pinned transfer completed");
+        Ok(AcceptedTransfer {
+            consignment,
+            assignments,
+            outpoint,
+        })
+    }
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn accept_pinned(
+        &mut self,
+        online: Online,
+        fetched: FetchedConsignment,
+        witness_recipient_id: &str,
+        blinding: u64,
+        min_confirmations: u8,
+        expected: ExpectedTransfer,
+    ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
         pin_witness_output_to_recipient_id(
             self.blockchain_resolver(),
             self.indexer(),
             self.chain_net(),
-            &witness_recipient_id,
-            &txid,
-            vout,
+            witness_recipient_id,
+            &fetched.txid,
+            fetched.vout,
             min_confirmations,
         )?;
         self.accept_transfer_from_consignment_unchecked(
             online,
-            consignment,
-            txid,
-            vout,
+            fetched.consignment,
+            fetched.txid,
+            fetched.vout,
             blinding,
             expected,
         )
