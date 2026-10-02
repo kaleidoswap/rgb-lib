@@ -3696,6 +3696,41 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
         Ok(())
     }
 
+    /// Zip the wallet's data for a backup at `backup_path`, without encrypting it.
+    ///
+    /// This is the part of [`backup`](WalletOffline::backup) that needs the wallet. Encrypting and
+    /// writing the file is left to [`seal_backup`](crate::wallet::seal_backup), which doesn't, so
+    /// the wallet keeps working meanwhile. Once the sealed file is safely stored, record it with
+    /// [`backup_mark_done`](WalletOffline::backup_mark_done); until then
+    /// [`backup_info`](WalletOffline::backup_info) keeps reporting a backup as due.
+    ///
+    /// A wallet restored from such a backup reports a backup as due until its next one.
+    fn backup_snapshot(&self, backup_path: &str) -> Result<BackupSnapshot, Error> {
+        info!(self.logger(), "Taking backup snapshot...");
+        let snapshot = self.backup_snapshot_raw(backup_path)?;
+        info!(self.logger(), "Backup snapshot completed");
+        Ok(snapshot)
+    }
+
+    /// Record a backup written by [`seal_backup`](crate::wallet::seal_backup) as the wallet's
+    /// latest.
+    ///
+    /// The backup counts from the moment its snapshot was taken, so a change made after that keeps
+    /// [`backup_info`](WalletOffline::backup_info) reporting a backup as due.
+    fn backup_mark_done(&self, sealed: &SealedBackup) -> Result<(), Error> {
+        info!(self.logger(), "Marking backup done...");
+        if &sealed.wallet_dir != self.wallet_dir() {
+            return Err(Error::Internal {
+                details: s!("the sealed backup was taken from another wallet"),
+            });
+        }
+        let txn = self.database().begin_transaction()?;
+        self.record_backup_taken_at(&txn, sealed.taken_at)?;
+        txn.commit()?;
+        info!(self.logger(), "Mark backup done completed");
+        Ok(())
+    }
+
     /// Return whether the wallet requires to perform a backup.
     fn backup_info(&self) -> Result<bool, Error> {
         info!(self.logger(), "Getting backup info...");

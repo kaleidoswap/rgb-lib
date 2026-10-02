@@ -23,7 +23,7 @@ pub mod vss;
 #[cfg(test)]
 pub(crate) mod test;
 
-pub use backup::restore_backup;
+pub use backup::{BackupSnapshot, SealedBackup, restore_backup, seal_backup};
 #[cfg(feature = "mpc")]
 pub use mpc::MpcWallet;
 pub use multisig::{Cosigner, MultisigKeys, MultisigWallet};
