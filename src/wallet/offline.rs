@@ -3299,12 +3299,20 @@ pub(crate) fn swap_append_side_change(
         });
     }
     let change = input_total - required;
-    if change > 0 {
-        outputs.push(TxOut {
-            value: BdkAmount::from_sat(change),
-            script_pubkey: swap_parse_script(change_script_hex)?,
-        });
+    if change == 0 {
+        return Ok(());
     }
+    let script_pubkey = swap_parse_script(change_script_hex)?;
+    // Change below the script's dust limit would make the swap non-standard, so it goes to the
+    // fee. Maker and taker both build the transaction here, so they agree on leaving it out. A
+    // side whose RGB change needs this output then fails to color, before anyone signs.
+    if change < script_pubkey.minimal_non_dust().to_sat() {
+        return Ok(());
+    }
+    outputs.push(TxOut {
+        value: BdkAmount::from_sat(change),
+        script_pubkey,
+    });
     Ok(())
 }
 
@@ -3843,6 +3851,58 @@ mod swap_unit_tests {
             consignments: vec![],
             maker_history: None,
         }
+    }
+
+    #[test]
+    fn side_change_below_dust_goes_to_the_fee() {
+        // P2TR: dust below 330 sat at the default dust relay fee
+        let p2tr = format!("5120{}", "11".repeat(32));
+        let dust = swap_parse_script(&p2tr)
+            .unwrap()
+            .minimal_non_dust()
+            .to_sat();
+        assert_eq!(dust, 330);
+        let gives = btc(1_000);
+        let receives = rgb(ASSET_1, 1);
+        let rgb_output_sat = 500;
+        let fee_sat = 100;
+        let required = 1_000 + rgb_output_sat + fee_sat;
+        let change_outputs = |input_sat: u64| {
+            let mut outputs = vec![];
+            swap_append_side_change(
+                &mut outputs,
+                &[swap_input(
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                    0,
+                    input_sat,
+                )],
+                &gives,
+                &receives,
+                rgb_output_sat,
+                fee_sat,
+                &p2tr,
+            )
+            .unwrap();
+            outputs.iter().map(|o| o.value.to_sat()).collect::<Vec<_>>()
+        };
+        assert_eq!(change_outputs(required), Vec::<u64>::new());
+        assert_eq!(change_outputs(required + 2), Vec::<u64>::new());
+        assert_eq!(change_outputs(required + dust - 1), Vec::<u64>::new());
+        assert_eq!(change_outputs(required + dust), vec![dust]);
+        let result = swap_append_side_change(
+            &mut vec![],
+            &[swap_input(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                0,
+                required - 1,
+            )],
+            &gives,
+            &receives,
+            rgb_output_sat,
+            fee_sat,
+            &p2tr,
+        );
+        assert!(matches!(result, Err(Error::InsufficientBitcoins { .. })));
     }
 
     #[test]
