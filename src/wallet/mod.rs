@@ -19,7 +19,7 @@ pub mod vss;
 #[cfg(test)]
 pub(crate) mod test;
 
-pub use backup::restore_backup;
+pub use backup::{BackupSnapshot, SealedBackup, restore_backup, seal_backup};
 pub use multisig::{Cosigner, MultisigKeys, MultisigWallet};
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub use multisig::{
