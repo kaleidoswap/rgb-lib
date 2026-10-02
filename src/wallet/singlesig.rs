@@ -722,7 +722,7 @@ impl Wallet {
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
         let mut psbt =
-            self.create_utxos_begin_impl(&txn, up_to, num, size, fee_rate, skip_sync, true)?;
+            self.create_utxos_begin_impl(&txn, up_to, num, size, fee_rate, skip_sync, true, &[])?;
         self.sign_psbt_impl(&mut psbt, None)?;
         let res = self.create_utxos_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
@@ -769,11 +769,47 @@ impl Wallet {
         skip_sync: bool,
         dry_run: bool,
     ) -> Result<String, Error> {
+        self.create_utxos_begin_excluding(
+            online,
+            up_to,
+            num,
+            size,
+            fee_rate,
+            skip_sync,
+            dry_run,
+            vec![],
+        )
+    }
+
+    /// [`create_utxos_begin`](Wallet::create_utxos_begin) that never spends an outpoint in
+    /// `exclude_outpoints`.
+    ///
+    /// The split is funded from every other vanilla UTXO the wallet hasn't reserved, so a caller
+    /// keeping its own reservations (e.g. the inputs of in-flight swaps) can still create UTXOs
+    /// while they are held. Outpoints the wallet doesn't own are ignored.
+    ///
+    /// Returns a PSBT ready to be signed.
+    pub fn create_utxos_begin_excluding(
+        &mut self,
+        online: Online,
+        up_to: bool,
+        num: Option<u8>,
+        size: Option<u32>,
+        fee_rate: u64,
+        skip_sync: bool,
+        dry_run: bool,
+        exclude_outpoints: Vec<Outpoint>,
+    ) -> Result<String, Error> {
         info!(self.logger(), "Creating UTXOs (begin)...");
         self.check_online(online)?;
+        let exclude = exclude_outpoints
+            .iter()
+            .map(BdkOutPoint::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
         let txn = self.database().begin_transaction()?;
-        let res =
-            self.create_utxos_begin_impl(&txn, up_to, num, size, fee_rate, skip_sync, dry_run)?;
+        let res = self.create_utxos_begin_impl(
+            &txn, up_to, num, size, fee_rate, skip_sync, dry_run, &exclude,
+        )?;
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }
@@ -1139,8 +1175,15 @@ impl Wallet {
         self.check_xprv()?;
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let mut psbt =
-            self.send_btc_begin_impl(&txn, address, amount, fee_rate, skip_sync, true, lock_time)?;
+        let mut psbt = self.send_btc_begin_impl(
+            &txn,
+            &[(address, amount)],
+            fee_rate,
+            skip_sync,
+            true,
+            lock_time,
+            &[],
+        )?;
         self.sign_psbt_impl(&mut psbt, None)?;
         let res = self.send_btc_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
@@ -1172,11 +1215,56 @@ impl Wallet {
         dry_run: bool,
         lock_time: Option<u32>,
     ) -> Result<String, Error> {
+        self.send_btc_many_begin(
+            online,
+            vec![(address, amount)],
+            fee_rate,
+            skip_sync,
+            dry_run,
+            lock_time,
+            vec![],
+        )
+    }
+
+    /// Prepare the PSBT to send bitcoins using the vanilla wallet to several `recipients` in one
+    /// transaction, with the specified `fee_rate` (in sat/vB).
+    ///
+    /// Each recipient is a Bitcoin address and the amount (in sats) it receives, one output each.
+    /// Outpoints in `exclude_outpoints` are never spent; outpoints the wallet doesn't own are
+    /// ignored. `skip_sync`, `dry_run` and `lock_time` are as in
+    /// [`send_btc_begin`](Wallet::send_btc_begin).
+    ///
+    /// Signing of the returned PSBT needs to be carried out separately. The signed PSBT then needs
+    /// to be fed to the [`send_btc_end`](Wallet::send_btc_end) function.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    ///
+    /// Returns a PSBT ready to be signed.
+    pub fn send_btc_many_begin(
+        &mut self,
+        online: Online,
+        recipients: Vec<(String, u64)>,
+        fee_rate: u64,
+        skip_sync: bool,
+        dry_run: bool,
+        lock_time: Option<u32>,
+        exclude_outpoints: Vec<Outpoint>,
+    ) -> Result<String, Error> {
         info!(self.logger(), "Sending BTC (begin)...");
         self.check_online(online)?;
+        let exclude = exclude_outpoints
+            .iter()
+            .map(BdkOutPoint::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
         let txn = self.database().begin_transaction()?;
         let res = self.send_btc_begin_impl(
-            &txn, address, amount, fee_rate, skip_sync, dry_run, lock_time,
+            &txn,
+            &recipients,
+            fee_rate,
+            skip_sync,
+            dry_run,
+            lock_time,
+            &exclude,
         )?;
         if !dry_run {
             self.update_backup_info(&txn, false)?;

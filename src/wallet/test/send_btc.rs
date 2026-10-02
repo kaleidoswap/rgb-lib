@@ -507,3 +507,108 @@ fn begin_end() {
     let bak_info_after = party.db_backup_info();
     assert!(bak_info_after.last_operation_timestamp > bak_info_before.last_operation_timestamp);
 }
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn many_begin() {
+    initialize();
+
+    // two vanilla UTXOs
+    let mut party = get_empty_party!();
+    fund_wallet(party.get_address());
+    fund_wallet(party.get_address());
+    let vanilla: Vec<BdkOutPoint> = party
+        .list_unspents_vanilla(None)
+        .into_iter()
+        .map(|u| u.outpoint)
+        .collect();
+    assert_eq!(vanilla.len(), 2);
+    let kept = vanilla[0];
+    let mut rcv_party_1 = get_empty_party!();
+    let mut rcv_party_2 = get_empty_party!();
+    let address_1 = rcv_party_1.get_address();
+    let address_2 = rcv_party_2.get_address();
+
+    // one transaction pays every recipient, never from an excluded outpoint
+    let psbt = party
+        .wallet
+        .send_btc_many_begin(
+            party.online,
+            vec![(address_1.clone(), 1000), (address_2.clone(), 2000)],
+            FEE_RATE,
+            false,
+            true,
+            None,
+            vec![Outpoint::from(kept)],
+        )
+        .unwrap();
+    let unsigned = Psbt::from_str(&psbt).unwrap().unsigned_tx;
+    assert!(unsigned.input.iter().all(|i| i.previous_output != kept));
+    let pays = |address: &str, sat: u64| {
+        let script = parse_address_str(address, BitcoinNetwork::Regtest)
+            .unwrap()
+            .script_pubkey();
+        unsigned
+            .output
+            .iter()
+            .any(|o| o.script_pubkey == script && o.value.to_sat() == sat)
+    };
+    assert!(pays(&address_1, 1000));
+    assert!(pays(&address_2, 2000));
+    assert_eq!(unsigned.output.len(), 3); // the two recipients and the change
+
+    let signed = party.wallet.sign_psbt(psbt, None).unwrap();
+    let txid = party.wallet.send_btc_end(party.online, signed).unwrap();
+    assert_eq!(txid, unsigned.compute_txid().to_string());
+    mine(false);
+    assert_eq!(
+        rcv_party_1.get_btc_balance_with_sync().vanilla.settled,
+        1000
+    );
+    assert_eq!(
+        rcv_party_2.get_btc_balance_with_sync().vanilla.settled,
+        2000
+    );
+    let vanilla: HashSet<BdkOutPoint> = party
+        .list_unspents_vanilla(None)
+        .into_iter()
+        .map(|u| u.outpoint)
+        .collect();
+    assert!(vanilla.contains(&kept));
+
+    // nothing left to fund the send once every vanilla UTXO is excluded
+    let all: Vec<Outpoint> = vanilla.into_iter().map(Outpoint::from).collect();
+    let result = party.wallet.send_btc_many_begin(
+        party.online,
+        vec![(address_1.clone(), 1000)],
+        FEE_RATE,
+        false,
+        true,
+        None,
+        all,
+    );
+    assert_matches!(result, Err(Error::InsufficientBitcoins { .. }));
+
+    // no recipients
+    let result =
+        party
+            .wallet
+            .send_btc_many_begin(party.online, vec![], FEE_RATE, false, true, None, vec![]);
+    assert_matches!(result, Err(Error::InvalidRecipientData { .. }));
+
+    // a malformed TXID is refused, not ignored
+    let result = party.wallet.send_btc_many_begin(
+        party.online,
+        vec![(address_1, 1000)],
+        FEE_RATE,
+        false,
+        true,
+        None,
+        vec![Outpoint {
+            txid: s!("not a txid"),
+            vout: 0,
+        }],
+    );
+    assert_matches!(result, Err(Error::InvalidTxid));
+}
