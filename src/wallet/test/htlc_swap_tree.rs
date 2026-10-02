@@ -462,6 +462,7 @@ struct PreparedSpend {
     psbt: Psbt,
     operation_id: String,
     operation_dir: String,
+    allocations: Vec<PsbtOpAllocation>,
     dest_vout: u32,
     receive_data: ReceiveData,
     proxy_recipient_id: String,
@@ -497,6 +498,7 @@ fn prepare_htlc_spend_to(
     let PsbtOpPrepareResult {
         operation_id,
         operation_dir,
+        allocations,
         ..
     } = party.wallet.psbt_op_prepare(
         &mut psbt,
@@ -513,6 +515,7 @@ fn prepare_htlc_spend_to(
         psbt,
         operation_id,
         operation_dir,
+        allocations,
         dest_vout,
         receive_data,
         proxy_recipient_id,
@@ -1032,4 +1035,231 @@ fn swap_tree_witnesses_verify() {
             "{path:?}"
         );
     }
+}
+
+/// Import the lock with the wallet-free fetch and the pinned accept, then save the asset.
+fn accept_htlc_lock_pinned(party: &mut SinglesigParty, locked: &LockedHtlc) -> AcceptedTransfer {
+    let fetched = crate::wallet::rust_only::fetch_consignment_by_recipient_id_unchecked(
+        locked.recipient_id.clone(),
+        &PROXY_ENDPOINT,
+    )
+    .unwrap();
+    let online = party.party_online();
+    let accepted = party
+        .wallet
+        .accept_transfer_pinned(
+            online,
+            fetched,
+            locked.recipient_id.clone(),
+            LOCK_BLINDING,
+            MIN_CONFIRMATIONS,
+            expected_nia(&locked.asset_id, LOCK_AMOUNT),
+        )
+        .unwrap();
+    party
+        .wallet
+        .save_new_asset(
+            online,
+            accepted.consignment.clone(),
+            accepted.outpoint.txid.clone(),
+        )
+        .unwrap();
+    accepted
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn pinned_accept_then_claim_settles_through_the_operation() {
+    initialize();
+
+    let mut sender = get_funded_party!();
+    let mut claimer = funded_party_with_fee_utxos();
+    let locked = lock_in_htlc(&mut sender, None);
+
+    // nothing posted under an unknown key
+    let missing = crate::wallet::rust_only::fetch_consignment_by_recipient_id_unchecked(
+        claimer.witness_receive().recipient_id,
+        &PROXY_ENDPOINT,
+    );
+    assert_matches!(missing, Err(Error::NoConsignment));
+
+    // the consignment is pinned to the HTLC output, not to another script
+    let fetched = crate::wallet::rust_only::fetch_consignment_by_recipient_id_unchecked(
+        locked.recipient_id.clone(),
+        &PROXY_ENDPOINT,
+    )
+    .unwrap();
+    let online = claimer.party_online();
+    let other = claimer.witness_receive().recipient_id;
+    let result = claimer.wallet.accept_transfer_pinned(
+        online,
+        fetched,
+        other,
+        LOCK_BLINDING,
+        MIN_CONFIRMATIONS,
+        expected_nia(&locked.asset_id, LOCK_AMOUNT),
+    );
+    assert_matches!(result, Err(Error::WitnessOutputMismatch { .. }));
+
+    let accepted = accept_htlc_lock_pinned(&mut claimer, &locked);
+    assert_eq!(
+        accepted.assignments,
+        vec![Assignment::Fungible(LOCK_AMOUNT)]
+    );
+    assert_eq!(accepted.outpoint, Outpoint::from(locked.outpoint));
+    assert_htlc_holds_lock(&claimer, &locked);
+
+    // the operation reports what its transition assigns, at prepare and on lookup
+    // an out-of-band receive, as a maker's claim uses: only those settle through the handover,
+    // proxy invoices settle through refresh
+    let receive_data = claimer
+        .wallet
+        .witness_receive(
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![],
+            MIN_CONFIRMATIONS,
+        )
+        .unwrap();
+    let prepared =
+        prepare_htlc_spend_to(&mut claimer, &locked, HtlcPath::Claim, 893, receive_data).unwrap();
+    let expected = vec![PsbtOpAllocation {
+        asset_id: locked.asset_id.clone(),
+        vout: Some(prepared.dest_vout),
+        assignment: Assignment::Fungible(LOCK_AMOUNT),
+    }];
+    assert_eq!(prepared.allocations, expected);
+    let txid = prepared.psbt.unsigned_tx.compute_txid().to_string();
+    assert_eq!(
+        claimer.wallet.psbt_op_by_txid(&txid).unwrap().allocations,
+        expected
+    );
+
+    let tx = sign_htlc_spend(&claimer, &locked, &prepared.psbt, HtlcPath::Claim);
+    claimer.wallet.broadcast_tx(tx).unwrap();
+    // not before the operation is applied
+    let online = claimer.party_online();
+    let result = claimer.wallet.psbt_op_provide_receive_consignment(
+        online,
+        &prepared.operation_id,
+        &locked.asset_id,
+    );
+    assert_matches!(result, Err(Error::InvalidPsbtOperationStatus { .. }));
+    claimer
+        .wallet
+        .psbt_op_apply(online, &prepared.operation_id)
+        .unwrap();
+    mine_tx(false, &txid);
+
+    // a contract the operation doesn't move
+    let other_asset = claimer.issue_asset_nia(Some(&[AMOUNT]));
+    let result = claimer.wallet.psbt_op_provide_receive_consignment(
+        online,
+        &prepared.operation_id,
+        &other_asset.asset_id,
+    );
+    assert_matches!(result, Err(Error::CannotProvideOutOfBandConsignment { .. }));
+
+    // any spelling rgb-lib parses: no `rgb:` prefix, no dashes
+    let bare_asset_id = locked.asset_id.trim_start_matches("rgb:").replace('-', "");
+    claimer
+        .wallet
+        .psbt_op_provide_receive_consignment(online, &prepared.operation_id, &bare_asset_id)
+        .unwrap();
+    mine(false);
+    claimer.wait_for_refresh(None);
+    let receive = claimer
+        .list_transfers(Some(&locked.asset_id))
+        .into_iter()
+        .find(|t| {
+            t.kind == TransferKind::ReceiveWitness
+                && t.recipient_id.as_deref() == Some(prepared.receive_data.recipient_id.as_str())
+        })
+        .expect("incoming witness transfer");
+    assert_eq!(receive.status, TransferStatus::Settled);
+    assert_eq!(receive.assignments, vec![Assignment::Fungible(LOCK_AMOUNT)]);
+    assert_eq!(
+        claimer.get_asset_balance(&locked.asset_id).settled,
+        LOCK_AMOUNT
+    );
+
+    // the receive was handed over once; there is nothing left to match
+    let result = claimer.wallet.psbt_op_provide_receive_consignment(
+        online,
+        &prepared.operation_id,
+        &locked.asset_id,
+    );
+    assert_matches!(result, Err(Error::CannotProvideOutOfBandConsignment { .. }));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn ops_spending_lists_every_operation_on_an_outpoint() {
+    initialize();
+
+    let mut sender = get_funded_party!();
+    let mut claimer = funded_party_with_fee_utxos();
+    let locked = lock_in_htlc(&mut sender, None);
+    accept_htlc_lock(&mut claimer, &locked);
+    let htlc: Outpoint = locked.outpoint.into();
+
+    assert!(
+        claimer
+            .wallet
+            .psbt_ops_spending(htlc.clone())
+            .unwrap()
+            .is_empty()
+    );
+
+    let aborted = prepare_htlc_spend(&mut claimer, &locked, HtlcPath::Claim, 894);
+    let ops = claimer.wallet.psbt_ops_spending(htlc.clone()).unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].operation_id, aborted.operation_id);
+    assert_eq!(ops[0].status, PsbtOperationStatus::Prepared);
+    assert_eq!(ops[0].allocations, aborted.allocations);
+
+    // an aborted operation is still listed, with its status
+    claimer
+        .wallet
+        .psbt_op_abort(claimer.party_online(), &aborted.operation_id)
+        .unwrap();
+    let prepared = prepare_htlc_spend(&mut claimer, &locked, HtlcPath::Claim, 895);
+    let ops = claimer.wallet.psbt_ops_spending(htlc.clone()).unwrap();
+    // both may be created within the same second, so compare regardless of order
+    let mut listed: Vec<(&str, PsbtOperationStatus)> = ops
+        .iter()
+        .map(|op| (op.operation_id.as_str(), op.status))
+        .collect();
+    listed.sort_by_key(|(id, _)| *id);
+    let mut expected = vec![
+        (aborted.operation_id.as_str(), PsbtOperationStatus::Failed),
+        (
+            prepared.operation_id.as_str(),
+            PsbtOperationStatus::Prepared,
+        ),
+    ];
+    expected.sort_by_key(|(id, _)| *id);
+    assert_eq!(listed, expected);
+
+    // another output of the lock transaction is spent by neither
+    let unrelated = Outpoint {
+        txid: htlc.txid.clone(),
+        vout: htlc.vout + 1,
+    };
+    assert!(
+        claimer
+            .wallet
+            .psbt_ops_spending(unrelated)
+            .unwrap()
+            .is_empty()
+    );
+
+    let result = claimer.wallet.psbt_ops_spending(Outpoint {
+        txid: s!("not a txid"),
+        vout: 0,
+    });
+    assert_matches!(result, Err(Error::InvalidTxid));
 }

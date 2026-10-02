@@ -26,6 +26,30 @@ pub(crate) const UTXO_NUM: u8 = 5;
 pub(crate) const MIN_BLOCK_ESTIMATION: u16 = 1;
 pub(crate) const MAX_BLOCK_ESTIMATION: u16 = 1008;
 
+/// GET the consignment posted under `recipient_id` from the proxy at `proxy_url`. A failed
+/// request or an empty result is [`Error::NoConsignment`].
+pub(crate) fn proxy_get_consignment(
+    proxy_url: &str,
+    recipient_id: &str,
+    logger: &Logger,
+) -> Result<GetConsignmentResponse, Error> {
+    let proxy_client = ProxyClient::new(proxy_url)?;
+    let consignment_res = proxy_client.get_consignment(recipient_id);
+    if consignment_res.is_err() || consignment_res.as_ref().unwrap().result.as_ref().is_none() {
+        debug!(
+            logger,
+            "Consignment GET response error: {:?}", &consignment_res
+        );
+        return Err(Error::NoConsignment);
+    }
+
+    let consignment_res = consignment_res.unwrap().result.unwrap();
+    #[cfg(test)]
+    debug!(logger, "Consignment GET response: {:?}", consignment_res);
+
+    Ok(consignment_res)
+}
+
 /// Compute the proxy routing key for a transfer.
 ///
 /// For witness transfers with a per-invoice nonce, this is
@@ -909,24 +933,7 @@ pub trait WalletOnline: WalletOffline {
         proxy_url: &str,
         recipient_id: String,
     ) -> Result<GetConsignmentResponse, Error> {
-        let proxy_client = ProxyClient::new(proxy_url)?;
-        let consignment_res = proxy_client.get_consignment(&recipient_id);
-        if consignment_res.is_err() || consignment_res.as_ref().unwrap().result.as_ref().is_none() {
-            debug!(
-                self.logger(),
-                "Consignment GET response error: {:?}", &consignment_res
-            );
-            return Err(Error::NoConsignment);
-        }
-
-        let consignment_res = consignment_res.unwrap().result.unwrap();
-        #[cfg(test)]
-        debug!(
-            self.logger(),
-            "Consignment GET response: {:?}", consignment_res
-        );
-
-        Ok(consignment_res)
+        proxy_get_consignment(proxy_url, &recipient_id, self.logger())
     }
 
     fn extract_received_assignments(
@@ -960,30 +967,16 @@ pub trait WalletOnline: WalletOffline {
                     let opout = Opout::new(*opid, *ass_type, no as u16);
                     if let Assign::ConfidentialSeal { seal, state, .. } = fungible_assignment
                         && Some(*seal) == known_concealed
+                        && let Some(assignment) = Assignment::fungible(*ass_type, state.as_u64())
                     {
-                        match *ass_type {
-                            OS_ASSET => {
-                                received.insert(opout, Assignment::Fungible(state.as_u64()));
-                            }
-                            OS_INFLATION => {
-                                received.insert(opout, Assignment::InflationRight(state.as_u64()));
-                            }
-                            _ => {}
-                        }
+                        received.insert(opout, assignment);
                     };
                     if let Assign::Revealed { seal, state, .. } = fungible_assignment
                         && seal.txid == TxPtr::WitnessTx
                         && Some(seal.vout.into_u32()) == vout
+                        && let Some(assignment) = Assignment::fungible(*ass_type, state.as_u64())
                     {
-                        match *ass_type {
-                            OS_ASSET => {
-                                received.insert(opout, Assignment::Fungible(state.as_u64()));
-                            }
-                            OS_INFLATION => {
-                                received.insert(opout, Assignment::InflationRight(state.as_u64()));
-                            }
-                            _ => {}
-                        }
+                        received.insert(opout, assignment);
                     };
                 }
                 for (no, structured_assignment) in typed_assigns.as_structured().iter().enumerate()
@@ -5202,13 +5195,7 @@ pub(crate) fn swap_validate_fascia_received_leg(
                         && seal.vout.into_u32() == vout
                         && seal.blinding == blinding
                     {
-                        match *ass_type {
-                            OS_ASSET => assignments.push(Assignment::Fungible(state.as_u64())),
-                            OS_INFLATION => {
-                                assignments.push(Assignment::InflationRight(state.as_u64()))
-                            }
-                            _ => {}
-                        }
+                        assignments.extend(Assignment::fungible(*ass_type, state.as_u64()));
                     }
                 }
                 for structured_assignment in typed_assigns.as_structured().iter() {

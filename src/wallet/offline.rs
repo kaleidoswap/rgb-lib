@@ -2669,10 +2669,8 @@ pub trait WalletOffline: WalletBackup {
                                 (None, amount, true, is_ours)
                             }
                         };
-                        let assignment = match *ass_type {
-                            OS_ASSET => Assignment::Fungible(amount),
-                            OS_INFLATION => Assignment::InflationRight(amount),
-                            _ => continue,
+                        let Some(assignment) = Assignment::fungible(*ass_type, amount) else {
+                            continue;
                         };
                         transition_outputs.push(RgbOutputInfo {
                             vout,

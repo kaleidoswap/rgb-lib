@@ -2331,6 +2331,7 @@ fn psbt_op_prepare_writes_op_dir_for_wallet_owned_input() {
         operation_id,
         colored_psbt,
         operation_dir,
+        ..
     } = party_send
         .wallet
         .psbt_op_prepare(
