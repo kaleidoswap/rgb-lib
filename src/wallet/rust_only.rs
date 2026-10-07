@@ -1252,6 +1252,119 @@ impl Wallet {
         Ok(Fascia::new(seal_witness, bundles))
     }
 
+    /// Validate a counterparty's colored HTLC spend without reserving inputs or
+    /// consuming its transitions. The wallet must already know the lock's RGB history.
+    /// Only one contract/transition, consuming all state on `locked_outpoint`
+    /// and assigning exactly `amount` to `payment_vout`, is accepted.
+    /// Bitcoin prevout identity, fee policy and signing authorization are the caller's job.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn validate_htlc_spend(
+        &self,
+        psbt: &Psbt,
+        contract_id: ContractId,
+        locked_outpoint: OutPoint,
+        amount: u64,
+        payment_vout: u32,
+        indexer_url: &str,
+    ) -> Result<Vec<PsbtOpAllocation>, Error> {
+        let invalid = |details: &str| Error::InvalidColoringInfo {
+            details: details.to_owned(),
+        };
+        if psbt.unsigned_tx.output.get(payment_vout as usize).is_none()
+            || psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .filter(|i| i.previous_output == locked_outpoint)
+                .count()
+                != 1
+        {
+            return Err(invalid(
+                "HTLC spend must contain the pinned input and payment output",
+            ));
+        }
+        let fascia = self.fascia_from_finalized_psbt(psbt)?;
+        let bundles: Vec<_> = fascia.bundles().iter().collect();
+        if bundles.len() != 1
+            || *bundles[0].0 != contract_id
+            || bundles[0].1.known_transitions.len() != 1
+        {
+            return Err(invalid(
+                "HTLC spend must contain exactly one known contract transition",
+            ));
+        }
+        let allocations = fascia_allocations(&fascia)?;
+        if allocations
+            != vec![PsbtOpAllocation {
+                asset_id: contract_id.to_string(),
+                vout: Some(payment_vout),
+                assignment: Assignment::Fungible(amount),
+            }]
+        {
+            return Err(invalid(
+                "HTLC spend does not preserve the exact allocation at the payment output",
+            ));
+        }
+        let runtime = self.rgb_runtime()?;
+        let other_inputs: Vec<_> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|i| i.previous_output)
+            .filter(|outpoint| *outpoint != locked_outpoint)
+            .collect();
+        if !runtime.contracts_assigning(other_inputs)?.is_empty()
+            || runtime.contracts_assigning([locked_outpoint])? != BTreeSet::from([contract_id])
+        {
+            return Err(invalid(
+                "HTLC spend would leave another known RGB allocation uncolored",
+            ));
+        }
+        let mut expected = BTreeSet::new();
+        for (_, states) in runtime.contract_assignments_for(contract_id, [locked_outpoint])? {
+            expected.extend(states.keys().copied());
+        }
+        let bundle = bundles[0].1;
+        let consumed: BTreeSet<_> = bundle.known_transitions[0]
+            .transition
+            .inputs
+            .iter()
+            .copied()
+            .collect();
+        let mapped: BTreeSet<_> = bundle.input_map.keys().copied().collect();
+        if expected.is_empty() || consumed != expected || mapped != expected {
+            return Err(invalid(
+                "HTLC transition must consume precisely the pinned lock's known RGB state",
+            ));
+        }
+        let witness_id = fascia.witness_id();
+        let consignment = runtime.transfer_from_fascia(
+            contract_id,
+            vec![ExplicitSeal::with(witness_id, payment_vout)],
+            Vec::new(),
+            &fascia,
+        )?;
+        let fallback = get_resolver(indexer_url, self.bitcoin_network())?;
+        let resolver = crate::utils::OffchainResolver {
+            witness_id,
+            consignment: &consignment,
+            fallback: &fallback,
+        };
+        let schema: AssetSchema = consignment.schema_id().try_into()?;
+        let config = ValidationConfig {
+            chain_net: self.bitcoin_network().into(),
+            trusted_typesystem: schema.types(),
+            ..Default::default()
+        };
+        consignment
+            .clone()
+            .validate(&resolver, &config)
+            .map_err(|e| Error::InvalidColoringInfo {
+                details: format!("invalid HTLC spend proof: {e}"),
+            })?;
+        Ok(allocations)
+    }
+
     /// Stage RGB coloring information onto a PSBT without finalizing the MPC commitment.
     ///
     /// Multiple parties may each call this method on the same PSBT (each for their own contracts),
