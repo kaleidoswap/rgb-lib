@@ -2580,6 +2580,96 @@ fn psbt_op_prepare_foreign_escrow_input_persists_claim_change() {
         )
         .unwrap();
 
+    // The cooperative signer validates the colored transition without applying or reserving it.
+    let txos_before_validation = party.db_txos();
+    let allocations = party
+        .wallet
+        .validate_htlc_spend(
+            &claim_psbt,
+            contract_id,
+            escrow_outpoint,
+            AMOUNT,
+            claim_vout,
+            DEFAULT_INDEXER_URL,
+        )
+        .unwrap();
+    assert_eq!(
+        allocations,
+        vec![PsbtOpAllocation {
+            asset_id: asset.asset_id.clone(),
+            vout: Some(claim_vout),
+            assignment: Assignment::Fungible(AMOUNT)
+        }]
+    );
+    assert_eq!(
+        party.db_txos(),
+        txos_before_validation,
+        "verification is read-only"
+    );
+    assert_eq!(
+        party.wallet.psbt_op_reconcile(&operation_id).unwrap(),
+        PsbtOperationStatus::Prepared
+    );
+    assert!(
+        party
+            .wallet
+            .validate_htlc_spend(
+                &claim_psbt,
+                contract_id,
+                escrow_outpoint,
+                AMOUNT - 1,
+                claim_vout,
+                DEFAULT_INDEXER_URL
+            )
+            .is_err()
+    );
+    assert!(
+        party
+            .wallet
+            .validate_htlc_spend(
+                &claim_psbt,
+                contract_id,
+                fee_utxo,
+                AMOUNT,
+                claim_vout,
+                DEFAULT_INDEXER_URL
+            )
+            .is_err()
+    );
+    let mut tampered = claim_psbt.clone();
+    tampered.unsigned_tx.output[0].script_pubkey = bdk_wallet::bitcoin::ScriptBuf::from_bytes(
+        vec![0x6a, 0x20].into_iter().chain([0u8; 32]).collect(),
+    );
+    assert!(
+        party
+            .wallet
+            .validate_htlc_spend(
+                &tampered,
+                contract_id,
+                escrow_outpoint,
+                AMOUNT,
+                claim_vout,
+                DEFAULT_INDEXER_URL
+            )
+            .is_err(),
+        "a fabricated RGB commitment must fail"
+    );
+    let mut missing = claim_psbt.clone();
+    missing.proprietary.clear();
+    assert!(
+        party
+            .wallet
+            .validate_htlc_spend(
+                &missing,
+                contract_id,
+                escrow_outpoint,
+                AMOUNT,
+                claim_vout,
+                DEFAULT_INDEXER_URL
+            )
+            .is_err()
+    );
+
     let op_dir = party.wallet.get_wallet_dir().join(&operation_dir);
     let escrow_raw = std::fs::read_to_string(op_dir.join("foreign_inputs.json")).unwrap();
     let escrow: serde_json::Value = serde_json::from_str(&escrow_raw).unwrap();
