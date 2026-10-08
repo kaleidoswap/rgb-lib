@@ -2,21 +2,39 @@ name: Run tests
 
 on:
   push:
-    branches: [ "utexo-master", "dev", "stage", "master" ]
+    branches: [ "utexo-master", "dev", "stage", "master", "ks/dev" ]
   pull_request:
-    branches: [ "utexo-master", "dev", "stage", "master" ]
+    branches: [ "utexo-master", "dev", "stage", "master", "ks/dev" ]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test_and_coverage:
-    timeout-minutes: 120
-    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","kaleido-regtest"]') || 'ubuntu-latest' }}
 
+    env:
+      COMPOSE_PROJECT_NAME: rgb-lib-${{ github.run_id }}-${{ github.run_attempt }}-test-and-coverage
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Check regtest prerequisites
+        run: |
+          command -v cc
+          command -v cmake
+          command -v pkg-config
+          command -v ss
+          docker info >/dev/null
+          docker compose version
+      - name: Acquire shared regtest host lock
+        id: host-lock
+        run: ./scripts/ci/regtest-lock.sh acquire
       - name: Setup rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -24,12 +42,36 @@ jobs:
       - name: Test with all features
         run: cargo test --all-features
 
-  test_features:
-    timeout-minutes: 60
-    runs-on: ubuntu-latest
+      - name: Stop regtest services
+        if: always() && steps.host-lock.outcome == 'success'
+        run: docker compose -f tests/compose.yaml --profile '*' down -v --remove-orphans
+      - name: Release shared regtest host lock
+        if: always() && steps.host-lock.outcome == 'success'
+        run: ./scripts/ci/regtest-lock.sh release
 
+  test_features:
+    needs: test_and_coverage
+    if: always() && !cancelled()
+    timeout-minutes: 120
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","kaleido-regtest"]') || 'ubuntu-latest' }}
+
+    env:
+      COMPOSE_PROJECT_NAME: rgb-lib-${{ github.run_id }}-${{ github.run_attempt }}-test-features
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Check regtest prerequisites
+        run: |
+          command -v cc
+          command -v cmake
+          command -v pkg-config
+          command -v ss
+          docker info >/dev/null
+          docker compose version
+      - name: Acquire shared regtest host lock
+        id: host-lock
+        run: ./scripts/ci/regtest-lock.sh acquire
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
@@ -48,12 +90,26 @@ jobs:
       - name: Test with no default features
         run: cargo test --profile reldebug --no-default-features
 
+      - name: Stop regtest services
+        if: always() && steps.host-lock.outcome == 'success'
+        run: docker compose -f tests/compose.yaml --profile '*' down -v --remove-orphans
+      - name: Release shared regtest host lock
+        if: always() && steps.host-lock.outcome == 'success'
+        run: ./scripts/ci/regtest-lock.sh release
+
   test_doc:
     timeout-minutes: 30
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","kaleido-maker-ci"]') || 'ubuntu-latest' }}
+    container: ubuntu:24.04
 
     steps:
+      - name: Install Linux build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config libssl-dev clang cmake
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""

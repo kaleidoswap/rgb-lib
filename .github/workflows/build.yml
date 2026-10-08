@@ -2,9 +2,12 @@ name: Build
 
 on:
   push:
-    branches: [ "utexo-master", "dev", "stage", "master" ]
+    branches: [ "utexo-master", "dev", "stage", "master", "ks/dev" ]
   pull_request:
-    branches: [ "utexo-master", "dev", "stage", "master" ]
+    branches: [ "utexo-master", "dev", "stage", "master", "ks/dev" ]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,7 +15,8 @@ env:
 jobs:
   build_all_features:
     timeout-minutes: 30
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.name == 'linux' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","kaleido-maker-ci"]') || matrix.os }}
+    container: ${{ matrix.name == 'linux' && 'ubuntu:24.04' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -27,8 +31,15 @@ jobs:
             os: macos-latest
 
     steps:
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config libssl-dev clang cmake
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Setup rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -38,7 +49,8 @@ jobs:
 
   build_no_default_features:
     timeout-minutes: 30
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.name == 'linux' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","kaleido-maker-ci"]') || matrix.os }}
+    container: ${{ matrix.name == 'linux' && 'ubuntu:24.04' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -52,14 +64,22 @@ jobs:
             os: macos-latest
 
     steps:
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config libssl-dev clang cmake
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Build with no default features
         run: cargo build --release --no-default-features
 
   build_feature_electrum:
     timeout-minutes: 30
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.name == 'linux' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","kaleido-maker-ci"]') || matrix.os }}
+    container: ${{ matrix.name == 'linux' && 'ubuntu:24.04' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -73,14 +93,22 @@ jobs:
             os: macos-latest
 
     steps:
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config libssl-dev clang cmake
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Build with electrum feature
         run: cargo build --release --no-default-features --features electrum
 
   build_feature_esplora:
     timeout-minutes: 30
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.name == 'linux' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","kaleido-maker-ci"]') || matrix.os }}
+    container: ${{ matrix.name == 'linux' && 'ubuntu:24.04' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -94,7 +122,14 @@ jobs:
             os: macos-latest
 
     steps:
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config libssl-dev clang cmake
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Build with esplora feature
         run: cargo build --release --no-default-features --features esplora
