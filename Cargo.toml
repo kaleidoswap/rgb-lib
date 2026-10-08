@@ -149,9 +149,6 @@ required-features = ["vss"]
 name = "vss_unencrypted_example"
 required-features = ["vss"]
 
-[[example]]
-name = "bdk_peer"
-required-features = ["electrum"]
 [profile.release]
 # make overflow bugs fail loudly instead of producing wrong amounts
 overflow-checks = true
