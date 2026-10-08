@@ -2410,6 +2410,63 @@ fn psbt_op_prepare_writes_op_dir_for_wallet_owned_input() {
     );
 }
 
+// A deterministic Electrum fixture: startup/network checks succeed, but history lookup fails.
+// Two clients are opened by get_resolver (protocol detection and consensus resolution).
+#[cfg(feature = "electrum")]
+fn failing_history_indexer() -> (String, std::thread::JoinHandle<usize>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = listener.local_addr().unwrap().to_string();
+    let header = hex::encode(bdk_wallet::bitcoin::consensus::serialize(
+        &bdk_wallet::bitcoin::blockdata::constants::genesis_block(
+            bdk_wallet::bitcoin::Network::Regtest,
+        )
+        .header,
+    ));
+    let server = std::thread::spawn(move || {
+        let mut clients = vec![];
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let header = header.clone();
+            clients.push(std::thread::spawn(move || {
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut failures = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 { break; }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let mut response = serde_json::json!({"jsonrpc":"2.0", "id":request["id"]});
+                    match request["method"].as_str().unwrap() {
+                        "server.version" => response["result"] = serde_json::json!(["test", "1.4"]),
+                        "blockchain.block.header" => response["result"] = serde_json::json!(header),
+                        "blockchain.transaction.get" => response["error"] = serde_json::json!({
+                            "code": -1,
+                            "message": "genesis block coinbase is not considered an ordinary transaction",
+                        }),
+                        "blockchain.headers.subscribe" => {
+                            failures += 1;
+                            response["error"] = serde_json::json!({
+                                "code": -1, "message": "temporary indexer outage",
+                            });
+                        }
+                        method => panic!("unexpected Electrum request: {method}"),
+                    }
+                    writeln!(stream, "{response}").unwrap();
+                }
+                failures
+            }));
+        }
+        clients
+            .into_iter()
+            .map(|client| client.join().unwrap())
+            .sum()
+    });
+    (url, server)
+}
+
 /// Central HTLC path: spend RGB sitting on a foreign escrow outpoint (not a wallet TXO),
 /// claim onto a plain wallet-owned script (no `witness_receive`), and assert SQL accounting +
 /// foreign_inputs.json. The issue #90 claim destination is covered by
@@ -2610,6 +2667,43 @@ fn psbt_op_prepare_foreign_escrow_input_persists_claim_change() {
         party.wallet.psbt_op_reconcile(&operation_id).unwrap(),
         PsbtOperationStatus::Prepared
     );
+
+    // The indexer connects and passes the network check, then fails while resolving history.
+    // This must remain a retryable network error rather than an accusation of an invalid proof.
+    let (indexer_url, indexer) = failing_history_indexer();
+    let outage = party.wallet.validate_htlc_spend(
+        &claim_psbt,
+        contract_id,
+        escrow_outpoint,
+        AMOUNT,
+        claim_vout,
+        &indexer_url,
+    );
+    assert!(matches!(outage, Err(Error::Network { .. })), "{outage:?}");
+    assert!(
+        indexer.join().unwrap() > 0,
+        "history resolution must reach the failing indexer"
+    );
+    assert_eq!(party.db_txos(), txos_before_validation);
+    assert_eq!(
+        party.wallet.psbt_op_reconcile(&operation_id).unwrap(),
+        PsbtOperationStatus::Prepared
+    );
+    // Retry the exact same PSBT against the recovered indexer.
+    assert_eq!(
+        party
+            .wallet
+            .validate_htlc_spend(
+                &claim_psbt,
+                contract_id,
+                escrow_outpoint,
+                AMOUNT,
+                claim_vout,
+                DEFAULT_INDEXER_URL,
+            )
+            .unwrap(),
+        allocations
+    );
     assert!(
         party
             .wallet
@@ -2641,18 +2735,18 @@ fn psbt_op_prepare_foreign_escrow_input_persists_claim_change() {
         vec![0x6a, 0x20].into_iter().chain([0u8; 32]).collect(),
     );
     assert!(
-        party
-            .wallet
-            .validate_htlc_spend(
+        matches!(
+            party.wallet.validate_htlc_spend(
                 &tampered,
                 contract_id,
                 escrow_outpoint,
                 AMOUNT,
                 claim_vout,
                 DEFAULT_INDEXER_URL
-            )
-            .is_err(),
-        "a fabricated RGB commitment must fail"
+            ),
+            Err(Error::InvalidColoringInfo { .. })
+        ),
+        "a fabricated RGB commitment must remain an invalid proof"
     );
     let mut missing = claim_psbt.clone();
     missing.proprietary.clear();

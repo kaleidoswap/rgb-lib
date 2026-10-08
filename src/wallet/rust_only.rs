@@ -1359,8 +1359,13 @@ impl Wallet {
         consignment
             .clone()
             .validate(&resolver, &config)
-            .map_err(|e| Error::InvalidColoringInfo {
-                details: format!("invalid HTLC spend proof: {e}"),
+            .map_err(|e| match e {
+                ValidationError::ResolverError(e) => Error::Network {
+                    details: e.to_string(),
+                },
+                ValidationError::InvalidConsignment(e) => Error::InvalidColoringInfo {
+                    details: format!("invalid HTLC spend proof: {e}"),
+                },
             })?;
         Ok(allocations)
     }
