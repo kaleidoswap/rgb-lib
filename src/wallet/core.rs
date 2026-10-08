@@ -38,6 +38,8 @@ pub(crate) struct WalletManifest {
     pub(crate) bitcoin_network: BitcoinNetwork,
     pub(crate) database_type: DatabaseType,
     pub(crate) max_allocations_per_utxo: u32,
+    #[serde(default)]
+    pub(crate) reuse_addresses: bool,
     pub(crate) supported_schemas: Vec<AssetSchema>,
     pub(crate) account_xpub_vanilla: String,
     pub(crate) account_xpub_colored: String,
@@ -53,6 +55,7 @@ impl WalletManifest {
             bitcoin_network: wallet_data.bitcoin_network,
             database_type: wallet_data.database_type.clone(),
             max_allocations_per_utxo: wallet_data.max_allocations_per_utxo,
+            reuse_addresses: wallet_data.reuse_addresses,
             supported_schemas: wallet_data.supported_schemas.clone(),
             account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
             account_xpub_colored: keys.account_xpub_colored.clone(),
@@ -68,7 +71,11 @@ impl WalletManifest {
 
     pub(crate) fn write(&self, wallet_dir: &Path) -> Result<(), Error> {
         let json = serde_json::to_string_pretty(self).map_err(InternalError::from)?;
-        atomic_write(&Self::path(wallet_dir), json.as_bytes())?;
+        let path = Self::path(wallet_dir);
+        if fs::read(&path).is_ok_and(|existing| existing == json.as_bytes()) {
+            return Ok(());
+        }
+        atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
 
@@ -143,6 +150,7 @@ impl WalletManifest {
                 bitcoin_network: self.bitcoin_network,
                 database_type: self.database_type,
                 max_allocations_per_utxo: self.max_allocations_per_utxo,
+                reuse_addresses: self.reuse_addresses,
                 supported_schemas: self.supported_schemas,
             },
             SinglesigKeys {
@@ -219,8 +227,6 @@ pub struct WalletInternals {
     pub(crate) online_data: Option<OnlineData>,
     #[cfg(feature = "vss")]
     pub(crate) vss_client: Option<Arc<super::vss::VssBackupClient>>,
-    #[cfg(feature = "vss")]
-    pub(crate) auto_backup_in_progress: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) fn setup_rgb<P: AsRef<Path>>(
@@ -487,7 +493,7 @@ pub trait WalletCore {
     fn persist_and_commit(&mut self, txn: DbTxn) -> Result<(), Error> {
         self.persist_bdk(&txn)?;
         txn.commit()
-}
+    }
 
     /// Whether a transaction is already known to the wallet's BDK graph
     /// (broadcast or confirmed as of the latest sync).
@@ -499,7 +505,7 @@ pub trait WalletCore {
         self.bdk_wallet()
             .transactions()
             .any(|canonical_tx| canonical_tx.tx_node.txid == *txid)
-        }
+    }
 
     fn database(&self) -> &RgbLibDatabase {
         &self.internals().database
@@ -516,10 +522,6 @@ pub trait WalletCore {
     #[cfg(feature = "vss")]
     fn set_vss_client(&mut self, client: Option<Arc<super::vss::VssBackupClient>>) {
         self.internals_mut().vss_client = client;
-    }
-    #[cfg(feature = "vss")]
-    fn auto_backup_in_progress(&self) -> &Arc<std::sync::atomic::AtomicBool> {
-        &self.internals().auto_backup_in_progress
     }
 
     fn logger(&self) -> &Logger {

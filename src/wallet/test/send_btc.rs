@@ -79,12 +79,17 @@ fn fail() {
     };
     let result = offline_party
         .wallet
-        .send_btc(Online { id: 0 }, s!(""), 0, FEE_RATE, false);
+        .send_btc(Online { id: 0 }, s!(""), 0, FEE_RATE, false, None);
     assert_matches!(result, Err(Error::Offline));
-    let result =
-        offline_party
-            .wallet
-            .send_btc_begin(Online { id: 0 }, s!(""), 0, FEE_RATE, false, false);
+    let result = offline_party.wallet.send_btc_begin(
+        Online { id: 0 },
+        s!(""),
+        0,
+        FEE_RATE,
+        false,
+        false,
+        None,
+    );
     assert_matches!(result, Err(Error::Offline));
     let result = offline_party.wallet.send_btc_end(Online { id: 0 }, s!(""));
     assert_matches!(result, Err(Error::Offline));
@@ -466,7 +471,15 @@ fn begin_end() {
     let bak_info_before = party.db_backup_info();
     let _psbt = party
         .wallet
-        .send_btc_begin(party.online, address.clone(), 1000, FEE_RATE, false, true)
+        .send_btc_begin(
+            party.online,
+            address.clone(),
+            1000,
+            FEE_RATE,
+            false,
+            true,
+            None,
+        )
         .unwrap();
     let bak_info_after = party.db_backup_info();
     assert_eq!(
@@ -478,7 +491,7 @@ fn begin_end() {
     let bak_info_before = party.db_backup_info();
     let psbt = party
         .wallet
-        .send_btc_begin(party.online, address, 1000, FEE_RATE, false, false)
+        .send_btc_begin(party.online, address, 1000, FEE_RATE, false, false, None)
         .unwrap();
     let bak_info_after = party.db_backup_info();
     assert!(bak_info_after.last_operation_timestamp > bak_info_before.last_operation_timestamp);

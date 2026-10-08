@@ -160,12 +160,12 @@ pub(crate) fn create_test_data_dir() -> PathBuf {
 
 pub(crate) fn get_test_wallet_data(data_dir: &str) -> WalletData {
     WalletData {
+        reuse_addresses: false,
         data_dir: data_dir.to_string(),
         bitcoin_network: BitcoinNetwork::Regtest,
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
         supported_schemas: AssetSchema::VALUES.to_vec(),
-        reuse_addresses: false,
     }
 }
 
@@ -235,12 +235,12 @@ fn get_test_wallet_raw_in(
 ) -> Wallet {
     let wallet = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: data_dir.to_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: max_allocations_per_utxo.unwrap_or(MAX_ALLOCATIONS_PER_UTXO),
             supported_schemas: AssetSchema::VALUES.to_vec(),
-            reuse_addresses: false,
         },
         wallet_keys.clone(),
     )
@@ -447,22 +447,35 @@ pub(crate) fn default_send_expiration() -> u64 {
     (now().unix_timestamp() + DURATION_SEND_TRANSFER as i64) as u64
 }
 
+// Used by the VSS test modules (gated behind the `vss` feature); unused under plain electrum/esplora.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
-pub(crate) fn assert_colorable_unspent_count(
-    wallet: &mut Wallet,
-    online: Option<&Online>,
-    settled_only: bool,
-    expected_len: usize,
-) {
-    let colorable_len = get_colorable_unspents(wallet, online, settled_only).len();
-    assert_eq!(colorable_len, expected_len);
+#[allow(dead_code)]
+pub(crate) fn get_funded_wallet(
+    private_keys: bool,
+    indexer_url: Option<String>,
+) -> (Wallet, Online) {
+    let (mut wallet, online) = get_funded_noutxo_wallet(private_keys, indexer_url);
+    wallet
+        .create_utxos(online, false, None, None, FEE_RATE, false)
+        .unwrap();
+    (wallet, online)
 }
 
+#[allow(dead_code)]
+pub(crate) fn test_get_wallet_dir(wallet: &Wallet) -> std::path::PathBuf {
+    wallet.get_wallet_dir()
+}
+
+/// Drop and recreate a party's wallet from its persisted data + keys, then bring it back online.
+/// Used by offline-receiver tests to simulate a wallet restart.
 #[cfg(feature = "electrum")]
-pub(crate) fn restart_test_wallet(wallet_data: WalletData, keys: SinglesigKeys) -> (Wallet, Online) {
+pub(crate) fn restart_party(party: SinglesigParty) -> SinglesigParty {
+    let wallet_data = party.wallet.get_wallet_data();
+    let keys = party.wallet.get_keys();
+    drop(party);
     let mut wallet = Wallet::new(wallet_data, keys).expect("wallet recreate failed");
     let online = wallet
-        .go_online(true, ELECTRUM_URL.to_string())
+        .go_online(test_go_online_options(None))
         .expect("go_online after recreate failed");
-    (wallet, online)
+    party!(wallet, online)
 }

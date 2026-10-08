@@ -410,7 +410,7 @@ fn manual_smoke_autobackup_async_restore() {
         .get_asset_metadata(asset_id.clone())
         .expect("metadata");
     let transfers_pre = wallet_a
-        .list_transfers(Some(asset_id.clone()))
+        .list_transfers(AssetFilter::Id(asset_id.clone()), None)
         .expect("list_transfers");
 
     // Configure auto-backup Async and wait for the backup to complete.
@@ -456,7 +456,8 @@ fn manual_smoke_autobackup_async_restore() {
 
     let mut restored_data = wallet_a.get_wallet_data();
     restored_data.data_dir = restore_root.to_string();
-    let mut wallet_r = Wallet::new(restored_data).expect("Wallet::new restored");
+    let restored_keys = wallet_a.get_keys();
+    let mut wallet_r = Wallet::new(restored_data, restored_keys).expect("Wallet::new restored");
     let online_r = wallet_r
         .go_online(test_go_online_options(None))
         .expect("go_online restored");
@@ -469,7 +470,7 @@ fn manual_smoke_autobackup_async_restore() {
         .get_asset_metadata(asset_id.clone())
         .expect("metadata");
     let transfers_post = wallet_r
-        .list_transfers(Some(asset_id.clone()))
+        .list_transfers(AssetFilter::Id(asset_id.clone()), None)
         .expect("list_transfers");
 
     assert_eq!(bal_post, bal_pre, "balance mismatch after restore");
@@ -538,7 +539,8 @@ fn manual_smoke_autobackup_blocking_restore() {
 
     let mut restored_data = wallet_a.get_wallet_data();
     restored_data.data_dir = restore_root.to_string();
-    let mut wallet_r = Wallet::new(restored_data).expect("Wallet::new restored");
+    let restored_keys = wallet_a.get_keys();
+    let mut wallet_r = Wallet::new(restored_data, restored_keys).expect("Wallet::new restored");
     let online_r = wallet_r
         .go_online(test_go_online_options(None))
         .expect("go_online restored");

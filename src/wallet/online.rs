@@ -622,11 +622,13 @@ pub trait WalletOnline: WalletOffline {
                 }
             }
 
-            transfers_changed = true;
-            if let TryFailBatchTransferOutcome::Refreshed =
-                self.try_fail_batch_transfer(txn, &batch_transfer, &db_data)?
-            {
-                cannot_fail = true;
+            match self.try_fail_batch_transfer(txn, &batch_transfer, &db_data)? {
+                TryFailBatchTransferOutcome::Failed => transfers_changed = true,
+                TryFailBatchTransferOutcome::Refreshed => {
+                    transfers_changed = true;
+                    cannot_fail = true;
+                }
+                TryFailBatchTransferOutcome::CannotFail => cannot_fail = true,
             }
         } else {
             // fail all expired transfers that are in a fallible status
@@ -644,8 +646,12 @@ pub trait WalletOnline: WalletOffline {
                         continue;
                     }
                 }
-                transfers_changed = true;
-                self.try_fail_batch_transfer(txn, batch_transfer, &db_data)?;
+                if !matches!(
+                    self.try_fail_batch_transfer(txn, batch_transfer, &db_data)?,
+                    TryFailBatchTransferOutcome::CannotFail
+                ) {
+                    transfers_changed = true;
+                }
             }
         }
 
@@ -1148,7 +1154,9 @@ pub trait WalletOnline: WalletOffline {
                             warn!(self.logger(), "Pre-existing NACK found when trying ACK");
                             return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?));
                         }
-                        return Err(Error::Proxy { details: err.message });
+                        return Err(Error::Proxy {
+                            details: err.message,
+                        });
                     }
                     debug!(self.logger(), "Consignment ACK response: {:?}", r);
                 }
@@ -1251,7 +1259,10 @@ pub trait WalletOnline: WalletOffline {
                     };
 
                 if result.validated == Some(false) {
-                    warn!(self.logger(), "Proxy already NACKed consignment for {recipient_id}");
+                    warn!(
+                        self.logger(),
+                        "Proxy already NACKed consignment for {recipient_id}"
+                    );
                     return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?));
                 }
                 proxy_res = Some((
@@ -1323,19 +1334,25 @@ pub trait WalletOnline: WalletOffline {
         batch_transfer: &DbBatchTransfer,
         asset_transfer: &DbAssetTransfer,
         transfer: &DbTransfer,
-        recipient_id: String,
+        _recipient_id: String,
         consignment_path: &Path,
         txid: String,
         vout: Option<u32>,
         mode: ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        let proxy_rid = proxy_routing_id_for_transfer(transfer);
         let mut runtime = self.rgb_runtime()?;
         let consignment = match RgbTransfer::load_file(consignment_path) {
             Ok(c) => c,
             Err(e) => {
                 error!(self.logger(), "Failed to load consignment file: {e}");
-                return self.refuse_consignment(txn, &mode, proxy_rid.clone(), updated_batch_transfer);
+                return self.refuse_consignment(
+                    txn,
+                    &mode,
+                    proxy_rid.clone(),
+                    updated_batch_transfer,
+                );
             }
         };
         let contract_id = consignment.contract_id();
@@ -1359,7 +1376,12 @@ pub trait WalletOnline: WalletOffline {
                     self.logger(),
                     "Received a different asset than the expected one"
                 );
-                return self.refuse_consignment(txn, &mode, proxy_rid.clone(), updated_batch_transfer);
+                return self.refuse_consignment(
+                    txn,
+                    &mode,
+                    proxy_rid.clone(),
+                    updated_batch_transfer,
+                );
             }
         }
 
@@ -1368,7 +1390,12 @@ pub trait WalletOnline: WalletOffline {
             Ok(txid) => txid,
             Err(_) => {
                 error!(self.logger(), "Received an invalid TXID");
-                return self.refuse_consignment(txn, &mode, proxy_rid.clone(), updated_batch_transfer);
+                return self.refuse_consignment(
+                    txn,
+                    &mode,
+                    proxy_rid.clone(),
+                    updated_batch_transfer,
+                );
             }
         };
 
@@ -1390,7 +1417,12 @@ pub trait WalletOnline: WalletOffline {
             Ok(consignment) => consignment,
             Err(ValidationError::InvalidConsignment(e)) => {
                 error!(self.logger(), "Consignment is invalid: {}", e);
-                return self.refuse_consignment(txn, &mode, proxy_rid.clone(), updated_batch_transfer);
+                return self.refuse_consignment(
+                    txn,
+                    &mode,
+                    proxy_rid.clone(),
+                    updated_batch_transfer,
+                );
             }
             Err(ValidationError::ResolverError(e)) => {
                 warn!(self.logger(), "Network error during consignment validation");
@@ -1412,7 +1444,12 @@ pub trait WalletOnline: WalletOffline {
                     self.logger(),
                     "Cannot find the provided TXID in the consignment"
                 );
-                return self.refuse_consignment(txn, &mode, proxy_rid.clone(), updated_batch_transfer);
+                return self.refuse_consignment(
+                    txn,
+                    &mode,
+                    proxy_rid.clone(),
+                    updated_batch_transfer,
+                );
             }
         };
 
@@ -1430,7 +1467,7 @@ pub trait WalletOnline: WalletOffline {
                                 return self.refuse_consignment(
                                     txn,
                                     &mode,
-                                    recipient_id,
+                                    proxy_rid.clone(),
                                     updated_batch_transfer,
                                 );
                             }
@@ -1472,6 +1509,41 @@ pub trait WalletOnline: WalletOffline {
             error!(self.logger(), "Cannot find any receiving assignment");
             return self.refuse_consignment(txn, &mode, proxy_rid.clone(), updated_batch_transfer);
         };
+
+        // replay guard (both transports funnel here): an on-chain assignment output that already
+        // credited another incoming transfer of this asset must not be credited again. Under
+        // sequential address reuse a settled consignment can otherwise be re-submitted to a later
+        // invoice on the same script (new nonce) and double-credit it. Reject with a hard error and
+        // do not NACK, so a replayed consignment cannot fail a legitimate proxy transfer.
+        if let Some(vout) = vout {
+            let db_data = txn.get_db_data(false)?;
+            let already_settled = db_data.batch_transfers.iter().any(|bt| {
+                if !bt.incoming
+                    || bt.idx == batch_transfer.idx
+                    || bt.txid.as_deref() != Some(txid.as_str())
+                {
+                    return false;
+                }
+                let Ok((at, t)) =
+                    bt.get_incoming_transfer(&db_data.asset_transfers, &db_data.transfers)
+                else {
+                    return false;
+                };
+                at.asset_id.as_deref() == Some(asset_id.as_str())
+                    && matches!(
+                        &t.recipient_type,
+                        Some(RecipientTypeFull::Witness { vout: Some(v), .. }) if *v == vout
+                    )
+            });
+            if already_settled {
+                return Err(Error::CannotProvideOutOfBandConsignment {
+                    details: format!(
+                        "consignment output {txid}:{vout} already settled a previous transfer: \
+                         refusing replay"
+                    ),
+                });
+            }
+        }
 
         if asset_schema == AssetSchema::Ifa {
             let url = if let Ok(ass) = txn.check_asset_exists(asset_id.clone()) {
@@ -1667,10 +1739,7 @@ pub trait WalletOnline: WalletOffline {
             {
                 continue;
             }
-            // skip transfers that are not set up for out-of-band exchange
-            if !transfer.uses_out_of_band_exchange() {
-                continue;
-            }
+            // Include proxy invoices when checking ambiguity on reused scripts.
 
             // check if the provided consignment matches the transfer
             let matched = match transfer.receive_matcher()? {
@@ -1717,10 +1786,36 @@ pub trait WalletOnline: WalletOffline {
             });
         }
 
+        // under address reuse multiple pending invoices (any transport) can share the same
+        // script-derived recipient ID: error out, as the paid invoice cannot be identified. The
+        // consignment carries no per-invoice recipient nonce, so it cannot be bound to a specific
+        // reused invoice here.
+        let mut seen_recipient_ids = HashSet::new();
+        for (_, _, transfer, _, _) in &matches {
+            let recipient_id = transfer
+                .recipient_id
+                .clone()
+                .expect("matched transfer should have a recipient ID");
+            if !seen_recipient_ids.insert(recipient_id.clone()) {
+                return Err(Error::CannotProvideOutOfBandConsignment {
+                    details: format!(
+                        "ambiguous recipient {recipient_id}: multiple pending transfers share \
+                         this recipient ID (address reuse), cannot disambiguate out-of-band"
+                    ),
+                });
+            }
+        }
+
+        // the replayed-output guard lives in validate_received_consignment (the shared settlement
+        // chokepoint), so it covers this OOB path and the proxy path alike.
+
         // a single consignment (for one asset) can pay more than one of this wallet's pending
         // invoices (e.g. a sender batched a send to two of them), so process every matched receive
         let mut results: RefreshResult = HashMap::new();
         for (batch_transfer, asset_transfer, transfer, txid, vout) in matches {
+            if !transfer.uses_out_of_band_exchange() {
+                continue;
+            }
             let recipient_id = transfer
                 .recipient_id
                 .clone()
@@ -1732,7 +1827,8 @@ pub trait WalletOnline: WalletOffline {
 
             // copy the provided consignment to the canonical receive path, so later refresh stages
             // (safe height, confirmations) find it where they expect it
-            let consignment_path = self.get_receive_consignment_path(&recipient_id);
+            let consignment_path =
+                self.get_receive_consignment_path(&proxy_routing_id_for_transfer(&transfer));
             atomic_write_with(&consignment_path, |tmp| {
                 fs::copy(consignment_path_in, tmp)?;
                 Ok(())
@@ -1963,27 +2059,48 @@ pub trait WalletOnline: WalletOffline {
     ) -> Result<Option<OperationResult>, Error> {
         let db_data = txn.get_db_data(false)?;
 
-        // recipient IDs are unique per transfer, so this identifies a single recipient transfer
-        let transfer = db_data
+        // recipient IDs can be shared by multiple transfers under address reuse: error out when
+        // more than one pending outgoing transfer matches, as the ACK target cannot be identified
+        let mut candidates = vec![];
+        for transfer in db_data
             .transfers
             .iter()
-            .find(|t| t.recipient_id.as_deref() == Some(recipient_id.as_str()))
-            .cloned()
-            .ok_or(Error::CannotProvideOutOfBandAck {
+            .filter(|t| t.recipient_id.as_deref() == Some(recipient_id.as_str()))
+        {
+            let asset_transfer = db_data
+                .asset_transfers
+                .iter()
+                .find(|at| at.idx == transfer.asset_transfer_idx)
+                .expect("transfer should have an asset transfer");
+            let batch_transfer = db_data
+                .batch_transfers
+                .iter()
+                .find(|bt| bt.idx == asset_transfer.batch_transfer_idx)
+                .cloned()
+                .expect("asset transfer should have a batch transfer");
+            candidates.push((transfer.clone(), batch_transfer));
+        }
+        if candidates.is_empty() {
+            return Err(Error::CannotProvideOutOfBandAck {
                 details: s!("no transfer found for the provided recipient ID"),
-            })?;
-        let asset_transfer = db_data
-            .asset_transfers
+            });
+        }
+        let pending: Vec<usize> = candidates
             .iter()
-            .find(|at| at.idx == transfer.asset_transfer_idx)
-            .cloned()
-            .expect("transfer should have an asset transfer");
-        let batch_transfer = db_data
-            .batch_transfers
-            .iter()
-            .find(|bt| bt.idx == asset_transfer.batch_transfer_idx)
-            .cloned()
-            .expect("asset transfer should have a batch transfer");
+            .enumerate()
+            .filter(|(_, (_, bt))| !bt.incoming && bt.status == TransferStatus::WaitingCounterparty)
+            .map(|(i, _)| i)
+            .collect();
+        if pending.len() > 1 {
+            return Err(Error::CannotProvideOutOfBandAck {
+                details: format!(
+                    "ambiguous recipient {recipient_id}: multiple pending transfers share this \
+                     recipient ID (address reuse), cannot disambiguate out-of-band"
+                ),
+            });
+        }
+        let (transfer, batch_transfer) =
+            candidates.swap_remove(pending.first().copied().unwrap_or(0));
 
         // check if the transfer can receive an out-of-band ACK
         if batch_transfer.incoming {
@@ -3260,7 +3377,7 @@ pub trait WalletOnline: WalletOffline {
                 let transfer = DbTransferActMod {
                     asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
                     requested_assignment: ActiveValue::Set(Some(Assignment::LinkRight)),
-                    incoming: ActiveValue::Set(false),
+
                     recipient_id: ActiveValue::Set(None),
                     recipient_type: ActiveValue::Set(None),
                     ..Default::default()

@@ -34,6 +34,7 @@ use crate::error::Error;
 use crate::utils::LOG_FILE;
 use crate::utils::setup_logger;
 use crate::wallet::backup::stream_be32_nonce;
+#[cfg(test)]
 use crate::wallet::core::WALLET_MANIFEST_FILE;
 
 /// Whether auto-backup uploads block the calling operation or run asynchronously.
@@ -78,8 +79,10 @@ const SANITIZED_DIR_NAME: &str = "wallet";
 /// consistency check, so a failure there can be attributed to the restore.
 pub(crate) const VSS_RESTORE_MARKER: &str = ".vss_restored";
 /// BDK database filename
+#[cfg(test)]
 const BDK_DB_NAME: &str = "bdk_db";
 /// BDK watch-only database filename
+#[cfg(test)]
 const BDK_DB_WO_NAME: &str = "bdk_db_watch_only";
 
 /// Salt length for HKDF key derivation (32 bytes, hex-encoded = 64 chars)
@@ -119,11 +122,9 @@ impl VssEncryptionMetadata {
         let bytes = hex::decode(&self.nonce).map_err(|e| Error::Internal {
             details: format!("Invalid nonce hex: {e}"),
         })?;
-        bytes[0..BACKUP_NONCE_LENGTH]
-            .try_into()
-            .map_err(|_| Error::Internal {
-                details: "Invalid nonce length".to_string(),
-            })
+        bytes.as_slice().try_into().map_err(|_| Error::Internal {
+            details: "Invalid nonce length".to_string(),
+        })
     }
 }
 
@@ -160,7 +161,9 @@ impl VssBackupConfig {
         }
     }
 
-    /// Set encryption enabled/disabled
+    /// Select encrypted uploads (required) or legacy plaintext restore support.
+    ///
+    /// Disabling encryption rejects uploads and wallet backup configuration.
     pub fn with_encryption(mut self, enabled: bool) -> Self {
         self.encryption_enabled = enabled;
         self
@@ -192,6 +195,19 @@ pub struct BackupManifest {
     pub version: u8,
 }
 
+pub(crate) struct PendingAutoBackup {
+    pub(crate) data: Vec<u8>,
+    pub(crate) timestamp: i128,
+    pub(crate) database: Arc<crate::database::RgbLibDatabase>,
+}
+
+#[derive(Default)]
+struct AutoBackupState {
+    generation: u64,
+    running: bool,
+    pending: Option<PendingAutoBackup>,
+}
+
 /// VSS backup client wrapper
 pub struct VssBackupClient {
     client: VssClient<VssRetryPolicy>,
@@ -202,6 +218,7 @@ pub struct VssBackupClient {
     backup_mode: VssBackupMode,
     runtime: Option<tokio::runtime::Runtime>,
     last_auto_backup_error: std::sync::Mutex<Option<String>>,
+    auto_backup_state: std::sync::Mutex<AutoBackupState>,
 }
 
 impl Drop for VssBackupClient {
@@ -241,7 +258,50 @@ impl VssBackupClient {
             backup_mode: config.backup_mode,
             runtime: Some(runtime),
             last_auto_backup_error: std::sync::Mutex::new(None),
+            auto_backup_state: std::sync::Mutex::new(AutoBackupState::default()),
         })
+    }
+
+    /// Queue the latest complete snapshot while a prior upload is running.
+    pub(crate) fn queue_auto_backup(&self, snapshot: PendingAutoBackup) -> Option<u64> {
+        let mut state = self
+            .auto_backup_state
+            .lock()
+            .expect("auto backup state lock");
+        state.pending = Some(snapshot);
+        if state.running {
+            return None;
+        }
+        state.running = true;
+        state.generation = state.generation.wrapping_add(1);
+        Some(state.generation)
+    }
+
+    pub(crate) fn next_auto_backup(&self, generation: u64) -> Option<PendingAutoBackup> {
+        let mut state = self
+            .auto_backup_state
+            .lock()
+            .expect("auto backup state lock");
+        if state.generation != generation {
+            return None;
+        }
+        let pending = state.pending.take();
+        if pending.is_none() {
+            state.running = false;
+        }
+        pending
+    }
+
+    pub(crate) fn finish_auto_backup(&self, generation: u64) {
+        let mut state = self
+            .auto_backup_state
+            .lock()
+            .expect("auto backup state lock");
+        if state.generation == generation && state.running {
+            state.running = false;
+            state.pending = None;
+            self.record_auto_backup_result(Some("auto backup task interrupted".to_string()));
+        }
     }
 
     /// Error message of the most recent failed auto-backup, cleared on the
@@ -268,25 +328,20 @@ impl VssBackupClient {
     /// If encryption is enabled, data will be encrypted before upload.
     /// The encryption key is derived from the signing key using HKDF-SHA256.
     ///
-    /// If encryption is disabled, the backup is sanitized to exclude sensitive
-    /// data (master fingerprint in paths, BDK database with xpubs). The
-    /// fingerprint is stored separately for use during restore.
+    /// New backups require encryption and preserve the complete wallet state.
+    /// Encryption-disabled clients remain usable for restoring legacy backups.
     ///
     /// Returns the version number of the uploaded backup.
     pub async fn upload_backup(&self, data: Vec<u8>) -> Result<i64, Error> {
+        if !self.encryption_enabled {
+            return Err(Error::VssEncryptionRequired);
+        }
         // Extract fingerprint from zip data
         let fingerprint = get_fingerprint_from_zip_bytes(&data)?;
 
-        // Encrypt or sanitize data
-        let (upload_data, encryption_metadata) = if self.encryption_enabled {
-            let metadata = VssEncryptionMetadata::new();
-            let encrypted = encrypt_data(&data, &self.signing_key, &metadata, None)?;
-            (encrypted, Some(metadata))
-        } else {
-            // Sanitize for plaintext: remove fingerprint from paths, exclude bdk_db
-            let (sanitized, _) = sanitize_zip_for_plaintext(&data)?;
-            (sanitized, None)
-        };
+        let metadata = VssEncryptionMetadata::new();
+        let upload_data = encrypt_data(&data, &self.signing_key, &metadata, None)?;
+        let encryption_metadata = Some(metadata);
 
         let total_size = upload_data.len();
 
@@ -630,9 +685,11 @@ impl VssBackupClient {
             .map(|kv| kv.value)
             .ok_or(Error::VssBackupNotFound)?;
 
-        String::from_utf8(fingerprint_bytes).map_err(|e| Error::Internal {
+        let fingerprint = String::from_utf8(fingerprint_bytes).map_err(|e| Error::Internal {
             details: format!("Invalid fingerprint encoding: {e}"),
-        })
+        })?;
+        validate_wallet_fingerprint(&fingerprint)?;
+        Ok(fingerprint)
     }
 
     /// Get the current version of a key
@@ -872,7 +929,9 @@ pub fn decrypt_data(
                     })?;
             decrypted.extend(cleartext);
         } else if read_count == 0 {
-            break;
+            return Err(Error::VssError {
+                details: "encrypted backup is missing its final authentication block".to_string(),
+            });
         } else {
             let nonce = stream_be32_nonce(&nonce_prefix, position, true);
             let cleartext =
@@ -888,6 +947,15 @@ pub fn decrypt_data(
     }
 
     Ok(decrypted)
+}
+
+fn validate_wallet_fingerprint(fingerprint: &str) -> Result<(), Error> {
+    if fingerprint.len() != 8 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::VssError {
+            details: "invalid wallet fingerprint in backup".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Convert VSS error to RGB-lib error
@@ -1011,6 +1079,7 @@ fn get_fingerprint_from_zip_bytes(data: &[u8]) -> Result<String, Error> {
 /// Matches the `bdk_db`/`bdk_db_watch_only` stems and any recovery sidecar the store
 /// leaves behind (`bdk_db.corrupt[.N]`, `bdk_db.recovering`, …): those copies hold full
 /// descriptors and must never ride into a plaintext backup.
+#[cfg(test)]
 fn is_bdk_db_file(path: &str) -> bool {
     let filename = path.rsplit('/').next().unwrap_or(path);
     let stem = filename.split('.').next().unwrap_or(filename);
@@ -1019,6 +1088,7 @@ fn is_bdk_db_file(path: &str) -> bool {
 
 /// Check if a zip entry path is the wallet manifest, or a temp copy orphaned by a crash
 /// mid-write (contains xpubs and the fingerprint)
+#[cfg(test)]
 fn is_wallet_manifest_file(path: &str) -> bool {
     let filename = path.rsplit('/').next().unwrap_or(path);
     filename == WALLET_MANIFEST_FILE || filename == format!("{WALLET_MANIFEST_FILE}.tmp")
@@ -1033,7 +1103,8 @@ fn is_wallet_manifest_file(path: &str) -> bool {
 ///   the first `Wallet::new` after restore rewrites it
 ///
 /// Returns the sanitized zip bytes and the extracted fingerprint.
-fn sanitize_zip_for_plaintext(data: &[u8]) -> Result<(Vec<u8>, String), Error> {
+#[cfg(test)]
+pub(crate) fn sanitize_zip_for_plaintext(data: &[u8]) -> Result<(Vec<u8>, String), Error> {
     let fingerprint = get_fingerprint_from_zip_bytes(data)?;
 
     let reader = std::io::Cursor::new(data);
@@ -1224,6 +1295,46 @@ mod tests {
         let secp = Secp256k1::new();
         let (sk, _) = secp.generate_keypair(&mut OsRng);
         sk
+    }
+
+    #[test]
+    fn legacy_stream_ciphertext_remains_readable_and_truncation_fails() {
+        // Generated by chacha20poly1305 0.10.1 EncryptorBE32 using two full
+        // 239-byte blocks and its mandatory final empty authenticated block.
+        let key = SecretKey::from_slice(&[1; 32]).unwrap();
+        let metadata = VssEncryptionMetadata {
+            salt: hex::encode([2; 32]),
+            nonce: hex::encode([3; 19]),
+            version: 1,
+        };
+        let encrypted = include_bytes!("test/fixtures/legacy-vss-v1.bin");
+        assert_eq!(
+            decrypt_data(encrypted, &key, &metadata, None).unwrap(),
+            vec![42; 478]
+        );
+        assert_eq!(
+            encrypt_data(&[42; 478], &key, &metadata, None).unwrap(),
+            encrypted
+        );
+        assert!(decrypt_data(&encrypted[..encrypted.len() - 16], &key, &metadata, None).is_err());
+        let mut invalid = metadata;
+        invalid.nonce = "00".into();
+        assert!(decrypt_data(encrypted, &key, &invalid, None).is_err());
+    }
+
+    #[test]
+    fn restore_fingerprint_cannot_escape_the_target_directory() {
+        assert!(validate_wallet_fingerprint("a1b2c3d4").is_ok());
+        for invalid in [
+            "",
+            "wallet",
+            "../other",
+            "/tmp/abc",
+            "abcdefgh",
+            "012345678",
+        ] {
+            assert!(validate_wallet_fingerprint(invalid).is_err());
+        }
     }
 
     #[test]

@@ -229,8 +229,6 @@ impl Wallet {
                 online_data: None,
                 #[cfg(feature = "vss")]
                 vss_client: None,
-                #[cfg(feature = "vss")]
-                auto_backup_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             keys,
         })
@@ -383,14 +381,16 @@ impl Wallet {
             .get(&keychain)
             .copied()
             .unwrap_or(0);
-        let new_index = index + 1;
-        self.internals_mut()
-            .reuse_address_index
-            .insert(keychain, new_index);
+        let new_index = index.checked_add(1).ok_or_else(|| Error::Internal {
+            details: "address derivation index exhausted".to_string(),
+        })?;
         let txn = self.database().begin_transaction()?;
         txn.set_reuse_address_index(keychain, new_index)?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
+        self.internals_mut()
+            .reuse_address_index
+            .insert(keychain, new_index);
         self.trigger_auto_backup();
         let address = self.bdk_wallet().peek_address(keychain, new_index).address;
         Ok(address.to_string())
@@ -990,7 +990,9 @@ impl Wallet {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
-        if !dry_run { self.trigger_auto_backup(); }
+        if !dry_run {
+            self.trigger_auto_backup();
+        }
         info!(self.logger(), "Send (begin) completed");
         Ok(SendBeginResult {
             psbt: begin_op_data.psbt.to_string(),
@@ -1161,7 +1163,9 @@ impl Wallet {
         info!(self.logger(), "Sending BTC (begin)...");
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let res = self.send_btc_begin_impl(&txn, address, amount, fee_rate, skip_sync, dry_run, lock_time)?;
+        let res = self.send_btc_begin_impl(
+            &txn, address, amount, fee_rate, skip_sync, dry_run, lock_time,
+        )?;
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }
@@ -1279,7 +1283,9 @@ impl Wallet {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
-        if !dry_run { self.trigger_auto_backup(); }
+        if !dry_run {
+            self.trigger_auto_backup();
+        }
         info!(self.logger(), "Inflate (begin) completed");
         Ok(InflateBeginResult {
             psbt: begin_operation_data.psbt.to_string(),

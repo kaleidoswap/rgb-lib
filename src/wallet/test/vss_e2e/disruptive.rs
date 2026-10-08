@@ -126,20 +126,20 @@ fn scenario_4_5_interrupt_during_chunked_upload_keeps_baseline_atomic() {
     let vss_url = vss_server_url();
     let rt = tokio_runtime();
 
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut wallet = Wallet::new(WalletData {
-        data_dir: tmp.path().to_str().unwrap().to_string(),
-        bitcoin_network: BitcoinNetwork::Regtest,
-        database_type: DatabaseType::Sqlite,
-        max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
-        vanilla_keychain: None,
-        supported_schemas: vec![AssetSchema::Nia],
-    })
+    let mut wallet = Wallet::new(
+        WalletData {
+            data_dir: tmp.path().to_str().unwrap().to_string(),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
+            supported_schemas: vec![AssetSchema::Nia],
+            reuse_addresses: false,
+        },
+        wallet_keys,
+    )
     .expect("Wallet::new");
 
     // Make baseline non-empty.

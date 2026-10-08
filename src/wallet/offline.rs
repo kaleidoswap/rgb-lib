@@ -1058,24 +1058,24 @@ pub trait WalletOffline: WalletBackup {
             invoice_builder = invoice_builder.set_contract(contract_id);
         }
         if !out_of_band {
-        let nonce_for_invoice: &[u8] = match &recipient_type_full {
-            RecipientTypeFull::Witness {
-                recipient_nonce, ..
-            } => recipient_nonce.as_slice(),
-            RecipientTypeFull::Blind { .. } => &[],
-        };
-        let decorated_transports: Vec<String> = transport_endpoints
-            .iter()
-            .map(|ep| {
-                if nonce_for_invoice.is_empty() {
-                    ep.clone()
-                } else {
-                    crate::utils::append_recipient_nonce(ep, nonce_for_invoice)
-                }
-            })
-            .collect();
-        let transports: Vec<&str> = decorated_transports.iter().map(AsRef::as_ref).collect();
-        invoice_builder = invoice_builder.add_transports(transports).unwrap();
+            let nonce_for_invoice: &[u8] = match &recipient_type_full {
+                RecipientTypeFull::Witness {
+                    recipient_nonce, ..
+                } => recipient_nonce.as_slice(),
+                RecipientTypeFull::Blind { .. } => &[],
+            };
+            let decorated_transports: Vec<String> = transport_endpoints
+                .iter()
+                .map(|ep| {
+                    if nonce_for_invoice.is_empty() {
+                        ep.clone()
+                    } else {
+                        crate::utils::append_recipient_nonce(ep, nonce_for_invoice)
+                    }
+                })
+                .collect();
+            let transports: Vec<&str> = decorated_transports.iter().map(AsRef::as_ref).collect();
+            invoice_builder = invoice_builder.add_transports(transports).unwrap();
         }
         let detected_assignment = match (&assignment, schema) {
             (
@@ -1299,9 +1299,16 @@ pub trait WalletOffline: WalletBackup {
         _count: u32,
     ) -> Result<BdkAddress, Error> {
         if self.wallet_data().reuse_addresses {
-            let index = self.internals().reuse_address_index.get(&keychain).copied().unwrap_or(0);
+            let index = self
+                .internals()
+                .reuse_address_index
+                .get(&keychain)
+                .copied()
+                .unwrap_or(0);
             let address = self.bdk_wallet().peek_address(keychain, index).address;
-            self.bdk_wallet_mut().reveal_addresses_to(keychain, index).for_each(drop);
+            self.bdk_wallet_mut()
+                .reveal_addresses_to(keychain, index)
+                .for_each(drop);
             return Ok(address);
         }
         Ok(self.bdk_wallet_mut().reveal_next_address(keychain).address)

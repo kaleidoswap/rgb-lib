@@ -235,6 +235,50 @@ pub struct RgbLibDatabase {
 }
 
 impl RgbLibDatabase {
+    /// Snapshot committed SQLite state, including BDK changesets, using SQLite's backup mechanism.
+    #[cfg(feature = "vss")]
+    pub(crate) fn snapshot_into(&self, destination: &Path) -> Result<(), Error> {
+        block_on(
+            self.connection
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "VACUUM INTO ?",
+                    [destination.to_string_lossy().into_owned().into()],
+                )),
+        )?;
+        Ok(())
+    }
+
+    /// Mark the staged database as a complete backup without changing the live wallet.
+    #[cfg(feature = "vss")]
+    pub(crate) fn finalize_vss_snapshot(destination: &Path, timestamp: i128) -> Result<(), Error> {
+        let mut options =
+            sea_orm::ConnectOptions::new(format!("sqlite://{}?mode=rw", destination.display()));
+        options.max_connections(1).sqlx_logging(false);
+        let connection = block_on(sea_orm::Database::connect(options))?;
+        let snapshot = Self::new(connection);
+        snapshot.mark_vss_snapshot_backed_up(timestamp)?;
+        block_on(snapshot.connection.close())?;
+        Ok(())
+    }
+
+    #[cfg(feature = "vss")]
+    pub(crate) fn mark_vss_snapshot_backed_up(&self, timestamp: i128) -> Result<(), Error> {
+        let txn = self.begin_transaction()?;
+        if let Some(info) = txn.get_backup_info()?
+            && timestamp
+                > info
+                    .last_backup_timestamp
+                    .parse::<i128>()
+                    .map_err(InternalError::from)?
+        {
+            let mut info: DbBackupInfoActMod = info.into();
+            info.last_backup_timestamp = ActiveValue::Set(timestamp.to_string());
+            txn.update_backup_info(&mut info)?;
+        }
+        txn.commit()
+    }
+
     pub(crate) fn new(connection: DatabaseConnection) -> Self {
         Self { connection }
     }
@@ -1080,16 +1124,6 @@ impl DbTxn {
             })
             .collect()
     }
-
-
-
-
-
-
-
-
-
-
 }
 
 pub(crate) mod enums;

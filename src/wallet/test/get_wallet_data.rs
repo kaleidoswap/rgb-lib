@@ -10,12 +10,12 @@ fn success() {
     let keys = generate_keys(BitcoinNetwork::Signet, WitnessVersion::Taproot);
     let wallet_1 = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: test_data_dir_str.clone(),
             bitcoin_network: BitcoinNetwork::Signet,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 1,
             supported_schemas: AssetSchema::VALUES.to_vec(),
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys(&keys, Some(2)),
     )
@@ -37,12 +37,12 @@ fn success() {
     let keys_2 = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet_2 = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: test_data_dir_str.clone(),
             bitcoin_network: BitcoinNetwork::Regtest,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: AssetSchema::VALUES.to_vec(),
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys_no_mnemonic(&keys_2, None),
     )
