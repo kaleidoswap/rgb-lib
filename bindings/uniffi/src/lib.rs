@@ -1,7 +1,5 @@
 #![allow(clippy::large_const_arrays)]
 #![allow(clippy::too_many_arguments)]
-// Generated UniFFI scaffolding defines a large metadata const; not under our control.
-#![allow(clippy::large_const_arrays)]
 
 use std::{
     collections::HashMap,
@@ -26,14 +24,9 @@ use rgb_lib::wallet::vss::{
     VssBackupInfo, VssBackupMode, restore_from_vss as rgb_lib_restore_from_vss,
 };
 use rgb_lib::{
-    AssetSchema, Assignment as RgbLibAssignment, CloseMethod, ConsignmentExt, ContractId, Error as RgbLibError,
-    FileContent, RgbTransfer, RgbTransport, TransferStatus, TransportType, WalletTransactionType,
-    bdk_wallet::bitcoin::{
-        OutPoint as BitcoinOutPoint,
-        Psbt,
-        Txid,
-        ScriptBuf,
-    },
+    AssetSchema, Assignment as RgbLibAssignment, CloseMethod, ContractId, Error as RgbLibError,
+    FileContent, RgbTransfer, TransferStatus, TransportType, WalletTransactionType,
+    bdk_wallet::bitcoin::{OutPoint as BitcoinOutPoint, Psbt, Txid},
     keys::{Keys, WitnessVersion},
     utils::BitcoinNetwork,
     wallet::{
@@ -312,12 +305,6 @@ fn save_rgb_transfer(transfer: &RgbTransfer) -> Result<Vec<u8>, RgbLibError> {
         .save(&mut buf)
         .map_err(|_| RgbLibError::InvalidConsignment)?;
     Ok(buf)
-}
-
-fn parse_rgb_transport(endpoint: &str) -> Result<RgbTransport, RgbLibError> {
-    RgbTransport::from_str(endpoint).map_err(|e| RgbLibError::InvalidTransportEndpoint {
-        details: e.to_string(),
-    })
 }
 
 pub struct InvoiceData {
@@ -1087,59 +1074,6 @@ fn validate_consignment_offchain(
     })
 }
 
-fn restore_backup(
-    backup_path: String,
-    password: String,
-    data_dir: String,
-) -> Result<(), RgbLibError> {
-    rgb_lib::wallet::restore_backup(&backup_path, &password, &data_dir)
-}
-
-pub struct ValidateConsignmentResult {
-    pub valid: bool,
-    pub warnings: Option<Vec<String>>,
-    pub error: Option<String>,
-    pub details: Option<String>,
-}
-
-fn validate_consignment(
-    file_path: String,
-    indexer_url: String,
-    bitcoin_network: BitcoinNetwork,
-) -> Result<ValidateConsignmentResult, RgbLibError> {
-    let r = rgb_lib::wallet::rust_only::validate_consignment(
-        &file_path,
-        &indexer_url,
-        bitcoin_network,
-    )?;
-    Ok(ValidateConsignmentResult {
-        valid: r.valid,
-        warnings: r.warnings,
-        error: r.error,
-        details: r.details,
-    })
-}
-
-fn validate_consignment_offchain(
-    file_path: String,
-    txid: String,
-    indexer_url: String,
-    bitcoin_network: BitcoinNetwork,
-) -> Result<ValidateConsignmentResult, RgbLibError> {
-    let r = rgb_lib::wallet::rust_only::validate_consignment_offchain(
-        &file_path,
-        &txid,
-        &indexer_url,
-        bitcoin_network,
-    )?;
-    Ok(ValidateConsignmentResult {
-        valid: r.valid,
-        warnings: r.warnings,
-        error: r.error,
-        details: r.details,
-    })
-}
-
 fn script_hex_from_recipient_id(recipient_id: String) -> Result<Option<String>, RgbLibError> {
     Ok(rgb_lib::utils::script_buf_from_recipient_id(recipient_id)?
         .map(|script| script.to_hex_string()))
@@ -1417,6 +1351,7 @@ impl Wallet {
 
     fn fetch_and_accept_transfer_by_recipient_id(
         &self,
+        online: Online,
         proxy_recipient_id: String,
         witness_recipient_id: String,
         consignment_endpoint: String,
@@ -1424,13 +1359,13 @@ impl Wallet {
         min_confirmations: u8,
         expected: ExpectedTransfer,
     ) -> Result<AcceptTransferResult, RgbLibError> {
-        let endpoint = parse_rgb_transport(&consignment_endpoint)?;
         let (transfer, assignments) = self
             ._get_wallet()
             .fetch_and_accept_transfer_by_recipient_id(
+                online,
                 proxy_recipient_id,
                 witness_recipient_id,
-                endpoint,
+                &consignment_endpoint,
                 blinding,
                 min_confirmations,
                 expected.into(),
@@ -2390,6 +2325,14 @@ impl MultisigWallet {
 
 uniffi::deps::static_assertions::assert_impl_all!(MultisigWallet: Sync, Send);
 uniffi::deps::static_assertions::assert_impl_all!(VssBackupClient: Sync, Send);
+
+fn restore_backup(
+    backup_path: String,
+    password: String,
+    data_dir: String,
+) -> Result<(), RgbLibError> {
+    rgb_lib::wallet::restore_backup(&backup_path, &password, &data_dir)
+}
 
 #[cfg(test)]
 mod tests {

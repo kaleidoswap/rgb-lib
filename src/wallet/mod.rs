@@ -28,12 +28,13 @@ pub use multisig::{
 };
 pub use objects::{
     Address, AssetCFA, AssetFilter, AssetIFA, AssetNIA, AssetUDA, Assets, AssignmentsCollection,
-    Balance, BlockTime, BtcBalance, DatabaseType, EmbeddedMedia, IfaIssuanceType, Invoice, InvoiceData, Media,
-    Metadata, Online, Outpoint, PendingVanillaTx, ProofOfReserves, PsbtInputInfo, PsbtInspection,
-    PsbtOutputInfo, ReceiveData, Recipient, RecipientInfo, RecipientType, RgbAllocation,
-    RgbInputInfo, RgbInspection, RgbOperationInfo, RgbOutputInfo, RgbTransitionInfo, Token,
-    TokenLight, Transaction, TransactionType, Transfer, TransferKind, TransferTransportEndpoint,
-    TransportEndpoint, TypeOfTransition, Unspent, Utxo, WalletData, WalletDescriptors, WitnessData,
+    Balance, BlockTime, BtcBalance, DatabaseType, EmbeddedMedia, IfaIssuanceType, Invoice,
+    InvoiceData, Media, Metadata, Online, Outpoint, PendingVanillaTx, ProofOfReserves,
+    PsbtInputInfo, PsbtInspection, PsbtOutputInfo, ReceiveData, Recipient, RecipientInfo,
+    RecipientType, RgbAllocation, RgbInputInfo, RgbInspection, RgbOperationInfo, RgbOutputInfo,
+    RgbTransitionInfo, Token, TokenLight, Transaction, TransactionType, Transfer, TransferKind,
+    TransferTransportEndpoint, TransportEndpoint, TypeOfTransition, Unspent, Utxo, WalletData,
+    WalletDescriptors, WitnessData,
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub use objects::{

@@ -514,12 +514,12 @@ fn fail() {
     let keys = generate_keys(bitcoin_network, WitnessVersion::Taproot);
     let mut wallet_nia = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: get_test_data_dir_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys(&keys, None),
     )
@@ -556,12 +556,12 @@ fn fail() {
     drop(party_nia);
     let mut wallet_nia = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: get_test_data_dir_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: vec![AssetSchema::Nia],
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys(&keys, None),
     )

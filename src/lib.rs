@@ -107,13 +107,14 @@ pub use bdk_wallet::bitcoin;
 pub use rgbstd::{
     ChainNet, ContractId, Txid as RgbTxid,
     containers::{
-        ConsignmentExt, Contract as RgbContract, Fascia, FileContent, PubWitness, Transfer as RgbTransfer, WitnessBundle,
+        ConsignmentExt, Contract as RgbContract, Fascia, FileContent, PubWitness,
+        Transfer as RgbTransfer, WitnessBundle,
     },
     indexers::AnyResolver,
-    validation::{ValidationConfig, ValidationError},
     persistence::UpdateRes,
     schema::SchemaId,
     txout::CloseMethod,
+    validation::{ValidationConfig, ValidationError},
     vm::WitnessOrd,
 };
 
@@ -128,8 +129,6 @@ pub use crate::{
         backup::restore_backup,
     },
 };
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use std::collections::BTreeSet;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -223,9 +222,8 @@ use rgbinvoice::{
 #[cfg(feature = "electrum")]
 use rgbstd::indexers::electrum_blocking::electrum_client::ConfigBuilder;
 use rgbstd::{
-    Allocation, Amount, Assign, Genesis, GraphSeal, Identity, KnownTransition, Layer1,
-    Operation as _, Opout, OutputSeal, OwnedFraction, Precision, Schema, SecretSeal, TokenIndex,
-    Transition, TypeSystem,
+    Allocation, Amount, Assign, Genesis, GraphSeal, Identity, KnownTransition, Layer1, Opout,
+    OutputSeal, OwnedFraction, Precision, Schema, SecretSeal, TokenIndex, Transition, TypeSystem,
     containers::{BuilderSeal, Kit, ValidContract, ValidKit, ValidTransfer},
     contract::{
         AllocatedState, ContractBuilder, IssuerWrapper, LinkableSchemaWrapper, SchemaWrapper,

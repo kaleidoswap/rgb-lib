@@ -232,6 +232,33 @@ pub fn restart_multisig_hub() {
         .expect("failed to start hub service");
 }
 
+#[cfg(all(feature = "vss", feature = "electrum"))]
+macro_rules! get_empty_wallet {
+    () => {
+        get_empty_wallet(true, None)
+    };
+    ($i:expr) => {
+        get_empty_wallet(true, Some($i.to_string()))
+    };
+}
+#[cfg(all(feature = "vss", feature = "electrum"))]
+macro_rules! get_funded_noutxo_wallet {
+    () => {
+        get_funded_noutxo_wallet(true, None)
+    };
+    ($i:expr) => {
+        get_funded_noutxo_wallet(true, Some($i.to_string()))
+    };
+}
+#[cfg(all(feature = "vss", feature = "electrum"))]
+macro_rules! get_funded_wallet {
+    () => {
+        get_funded_wallet(true, None)
+    };
+    ($i:expr) => {
+        get_funded_wallet(true, Some($i.to_string()))
+    };
+}
 // the get_*_wallet! macros can be called with no arguments to use defaults
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 macro_rules! get_empty_party {
@@ -456,8 +483,12 @@ mod sign_psbt;
 mod sync;
 mod witness_receive;
 
+#[cfg(feature = "electrum")]
 mod tx_known_to_wallet;
-#[cfg(feature = "vss")]
+#[cfg(all(feature = "vss", feature = "electrum"))]
 mod vss;
-#[cfg(feature = "vss")]
+#[cfg(all(feature = "vss", feature = "electrum"))]
 mod vss_e2e;
+
+#[cfg(feature = "vss")]
+mod vss_sqlite;

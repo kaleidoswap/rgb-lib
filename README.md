@@ -43,6 +43,21 @@ Each time the wallet is brought online, a consistency check is carried out to
 make sure the UTXO set has not changed since the last synchronization and an
 error is returned in case discrepancies are detected.
 
+## VSS backups
+
+The optional `vss` feature uploads encrypted backups of the complete wallet state,
+including a consistent SQLite snapshot of RGB and BDK data, public wallet settings,
+and address reuse indices. New uploads require encryption; configuring a wallet
+with `with_encryption(false)` returns `VssEncryptionRequired`. Existing plaintext
+VSS backups can still be downloaded and restored with their original signing key
+and store ID. They may need the original wallet settings and a Bitcoin rescan,
+because the historical sanitized format omitted BDK files and the wallet manifest.
+
+Auto-backup queues the latest snapshot while an upload is running. A completed
+upload marks only the operations captured in that snapshot as backed up. The
+signing key derives the encryption key, so it must be recoverable independently
+of the encrypted backup. Keep the mnemonic outside the wallet backup as before.
+
 ## Language bindings
 Bindings for other languages are available. Check the [bindings] directory.
 

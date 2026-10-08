@@ -949,64 +949,49 @@ fn invoice_new() {
 fn offline_receiver_insufficient_slots_recovery() {
     initialize();
 
-    let mut wallet = get_test_wallet(true, Some(1));
-    let online = test_go_online(&mut wallet, true, None);
+    let mut party = offline_party!(get_test_wallet(true, Some(1)));
+    let online = party.go_online(true, None);
+    let mut party = party!(party.wallet, online);
 
-    fund_wallet(test_get_address(&mut wallet));
-    test_create_utxos(
-        &mut wallet,
-        &online,
-        false,
-        Some(2),
-        None,
-        FEE_RATE,
-        Some(2),
-    );
+    fund_wallet(party.get_address());
+    party.create_utxos(false, Some(2), None, FEE_RATE, Some(2));
 
-    assert_colorable_unspent_count(&mut wallet, Some(&online), false, 2);
+    assert_eq!(party.get_colorable_unspents_with_sync(false).len(), 2);
 
-    let receive_data_1 = test_blind_receive(&wallet);
-    let receive_data_2 = test_blind_receive(&wallet);
-    assert!(check_test_transfer_status_recipient(
-        &wallet,
+    let receive_data_1 = party.blind_receive();
+    let receive_data_2 = party.blind_receive();
+    assert!(party.check_test_transfer_status_recipient(
         &receive_data_1.recipient_id,
         TransferStatus::WaitingCounterparty
     ));
-    assert!(check_test_transfer_status_recipient(
-        &wallet,
+    assert!(party.check_test_transfer_status_recipient(
         &receive_data_2.recipient_id,
         TransferStatus::WaitingCounterparty
     ));
 
-    let err = test_blind_receive_result(&wallet)
+    let err = party
+        .blind_receive_result()
         .expect_err("blind_receive must fail once all allocation slots are occupied");
     assert!(
         matches!(err, Error::InsufficientAllocationSlots),
         "expected InsufficientAllocationSlots after exhausting all slots, got: {err:?}"
     );
 
-    test_create_utxos(
-        &mut wallet,
-        &online,
-        false,
-        Some(2),
-        None,
-        FEE_RATE,
-        Some(2),
-    );
+    party.create_utxos(false, Some(2), None, FEE_RATE, Some(2));
 
-    assert_colorable_unspent_count(&mut wallet, Some(&online), false, 4);
+    assert_eq!(party.get_colorable_unspents_with_sync(false).len(), 4);
 
-    let receive_data_3 = test_blind_receive_result(&wallet)
+    let receive_data_3 = party
+        .blind_receive_result()
         .expect("blind_receive must succeed again after create_utxos adds fresh slots");
     assert!(!receive_data_3.recipient_id.is_empty());
-    assert!(check_test_transfer_status_recipient(
-        &wallet,
+    assert!(party.check_test_transfer_status_recipient(
         &receive_data_3.recipient_id,
         TransferStatus::WaitingCounterparty
     ));
 
-    let pending_transfers = test_list_transfers(&wallet, None)
+    let pending_transfers = party
+        .list_transfers(None)
         .into_iter()
         .filter(|t| t.status == TransferStatus::WaitingCounterparty)
         .count();

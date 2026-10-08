@@ -1531,6 +1531,7 @@ impl SinglesigParty {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
         )
     }
 
@@ -1547,6 +1548,7 @@ impl SinglesigParty {
             MIN_CONFIRMATIONS,
             default_send_expiration(),
             false,
+            None,
         )
     }
 
@@ -1557,8 +1559,14 @@ impl SinglesigParty {
 
     #[cfg(feature = "electrum")]
     pub(crate) fn send_btc_result(&mut self, address: &str, amount: u64) -> Result<String, Error> {
-        self.wallet
-            .send_btc(self.online, address.to_string(), amount, FEE_RATE, false)
+        self.wallet.send_btc(
+            self.online,
+            address.to_string(),
+            amount,
+            FEE_RATE,
+            false,
+            None,
+        )
     }
 
     #[cfg(feature = "electrum")]
@@ -1597,6 +1605,7 @@ impl SinglesigParty {
                 fee_rate,
                 MIN_CONFIRMATIONS,
                 expiration_timestamp.unwrap_or_else(default_send_expiration),
+                None,
             )
             .unwrap()
     }

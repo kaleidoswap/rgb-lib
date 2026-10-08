@@ -76,6 +76,7 @@ fn success() {
     let party = offline_party!(
         Wallet::new(
             WalletData {
+                reuse_addresses: false,
                 data_dir: data_dir.string(),
                 bitcoin_network,
                 database_type: DatabaseType::Sqlite,
@@ -104,24 +105,9 @@ fn signet_success() {
     assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
 }
 
-#[cfg(feature = "esplora")]
-#[test]
-#[parallel]
-fn signet_esplora_success() {
-    let data_dir = PrivateDataDir::new();
-    let bitcoin_network = BitcoinNetwork::Signet;
-    let mut party = offline_party!(data_dir.wallet_with_net(true, None, bitcoin_network));
-    check_wallet(&party, bitcoin_network, None);
-    // UTEXO Signet Esplora (electrs REST API on Hetzner)
-    party.go_online(false, Some("https://esplora-api.utexo.com"));
-    assert!(!party.wallet.watch_only());
-    assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
-}
-
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-#[ignore = "no testnet electrum server available"]
 fn testnet_success() {
     let data_dir = PrivateDataDir::new();
 
@@ -137,7 +123,6 @@ fn testnet_success() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-#[ignore = "no testnet4 electrum server available"]
 fn testnet4_success() {
     let data_dir = PrivateDataDir::new();
 
@@ -145,38 +130,6 @@ fn testnet4_success() {
     let mut party = offline_party!(data_dir.wallet_with_net(true, None, bitcoin_network));
     check_wallet(&party, bitcoin_network, None);
     let indexer_url = "ssl://electrum.iriswallet.com:50053";
-    party.go_online(false, Some(indexer_url));
-    assert!(!party.wallet.watch_only());
-    assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
-}
-
-#[cfg(feature = "esplora")]
-#[test]
-#[ignore = "frequently fails due to public esplora endpoint being unreachable from CI"]
-#[parallel]
-fn mainnet_esplora_success() {
-    create_test_data_dir();
-
-    let bitcoin_network = BitcoinNetwork::Mainnet;
-    let keys = generate_keys(bitcoin_network, WitnessVersion::Taproot);
-    let mut party = offline_party!(
-        Wallet::new(
-            WalletData {
-                data_dir: get_test_data_dir_string(),
-                bitcoin_network,
-                database_type: DatabaseType::Sqlite,
-                max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
-                supported_schemas: vec![AssetSchema::Cfa, AssetSchema::Nia, AssetSchema::Uda],
-                reuse_addresses: false,
-            },
-            SinglesigKeys::from_keys(&keys, None),
-        )
-        .unwrap()
-    );
-
-    check_wallet(&party, bitcoin_network, None);
-    // UTEXO Mainnet Esplora (Hetzner)
-    let indexer_url = "https://esplora-mainnet.utexo.com";
     party.go_online(false, Some(indexer_url));
     assert!(!party.wallet.watch_only());
     assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
@@ -193,6 +146,7 @@ fn mainnet_success_electrum() {
     let mut party = offline_party!(
         Wallet::new(
             WalletData {
+                reuse_addresses: false,
                 data_dir: data_dir.string(),
                 bitcoin_network,
                 database_type: DatabaseType::Sqlite,
@@ -224,6 +178,7 @@ fn mainnet_success_esplora() {
     let mut party = offline_party!(
         Wallet::new(
             WalletData {
+                reuse_addresses: false,
                 data_dir: data_dir.string(),
                 bitcoin_network,
                 database_type: DatabaseType::Sqlite,
@@ -400,12 +355,12 @@ fn watch_only_success() {
     // watch-only wallet
     let mut wallet_watch = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: get_test_data_dir_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: AssetSchema::VALUES.to_vec(),
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys_no_mnemonic(&keys, None),
     )
@@ -418,12 +373,12 @@ fn watch_only_success() {
     // signer wallet
     let mut wallet_sign = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: get_test_data_dir_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: AssetSchema::VALUES.to_vec(),
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys(&keys, None),
     )
@@ -466,12 +421,12 @@ fn watch_only_fail() {
     keys_bad.master_fingerprint = s!("invalid");
     let result = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: data_dir.string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: AssetSchema::VALUES.to_vec(),
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys_no_mnemonic(&keys_bad, None),
     );
@@ -541,12 +496,12 @@ fn supported_schemas() {
     let keys = generate_keys(bitcoin_network, WitnessVersion::Taproot);
     let mut wallet_nia = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: get_test_data_dir_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: vec![AssetSchema::Nia],
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys(&keys, None),
     )
@@ -571,12 +526,12 @@ fn supported_schemas() {
     let keys_rcv = generate_keys(bitcoin_network, WitnessVersion::Taproot);
     let mut rcv_wallet_uda = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: get_test_data_dir_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: vec![AssetSchema::Uda],
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys(&keys_rcv, None),
     )
@@ -617,12 +572,12 @@ fn supported_schemas() {
     // wallet (CFA schema supported)
     let mut wallet_cfa = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: get_test_data_dir_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: vec![AssetSchema::Cfa],
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys(&keys, None),
     )
@@ -647,12 +602,12 @@ fn supported_schemas() {
     // wallet (no schema supported)
     let result = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: get_test_data_dir_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: vec![],
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys(&keys, None),
     );
@@ -666,12 +621,12 @@ fn supported_schemas() {
     let keys_mainnet = generate_keys(bitcoin_network, WitnessVersion::Taproot);
     let result = Wallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir: get_test_data_dir_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
-            reuse_addresses: false,
         },
         SinglesigKeys::from_keys(&keys_mainnet, None),
     );
@@ -739,4 +694,69 @@ fn legacy_bdk_store_is_imported() {
 
     // the legacy store is gone, so an older rgb-lib cannot pick up the stale copy
     assert!(!dir.sub_path(BDK_DB_NAME).exists());
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+#[ignore = "electrum TCP port not accessible from GitHub runners"]
+fn signet_electrum_success() {
+    create_test_data_dir();
+
+    let bitcoin_network = BitcoinNetwork::Signet;
+    let mut party = offline_party!(get_test_wallet_with_net(true, None, bitcoin_network));
+    check_wallet(&party, bitcoin_network, None);
+    // UTEXO Signet Electrum (electrs on Hetzner), domain pending — using IP temporarily
+    let indexer_url = "tcp://46.224.75.237:50001";
+    party.go_online(false, Some(indexer_url));
+    assert!(!party.wallet.watch_only());
+    assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
+}
+
+#[cfg(feature = "esplora")]
+#[test]
+#[parallel]
+fn signet_esplora_success() {
+    create_test_data_dir();
+
+    let bitcoin_network = BitcoinNetwork::Signet;
+    let mut party = offline_party!(get_test_wallet_with_net(true, None, bitcoin_network));
+    check_wallet(&party, bitcoin_network, None);
+    // UTEXO Signet Esplora (electrs REST API on Hetzner)
+    let indexer_url = "https://esplora-api.utexo.com";
+    party.go_online(false, Some(indexer_url));
+    assert!(!party.wallet.watch_only());
+    assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
+}
+
+#[cfg(feature = "esplora")]
+#[test]
+#[ignore = "frequently fails due to public esplora endpoint being unreachable from CI"]
+#[parallel]
+fn mainnet_esplora_success() {
+    create_test_data_dir();
+
+    let bitcoin_network = BitcoinNetwork::Mainnet;
+    let keys = generate_keys(bitcoin_network, WitnessVersion::Taproot);
+    let mut party = offline_party!(
+        Wallet::new(
+            WalletData {
+                data_dir: get_test_data_dir_string(),
+                bitcoin_network,
+                database_type: DatabaseType::Sqlite,
+                max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
+                supported_schemas: vec![AssetSchema::Cfa, AssetSchema::Nia, AssetSchema::Uda],
+                reuse_addresses: false,
+            },
+            SinglesigKeys::from_keys(&keys, None),
+        )
+        .unwrap()
+    );
+
+    check_wallet(&party, bitcoin_network, None);
+    // UTEXO Mainnet Esplora (Hetzner)
+    let indexer_url = "https://esplora-mainnet.utexo.com";
+    party.go_online(false, Some(indexer_url));
+    assert!(!party.wallet.watch_only());
+    assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
 }

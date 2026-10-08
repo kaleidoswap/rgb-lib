@@ -261,11 +261,9 @@ impl WalletOffline for MultisigWallet {
             let address = self.bdk_wallet().peek_address(keychain, index).address;
             let revealed = self.bdk_wallet().derivation_index(keychain).unwrap_or(0);
             if revealed <= index {
-                let (bdk_wallet, bdk_db) = self.bdk_wallet_db_mut();
-                for _ in revealed..=index {
-                    bdk_wallet.reveal_next_address(keychain);
-                }
-                bdk_wallet.persist(bdk_db)?;
+                self.bdk_wallet_mut()
+                    .reveal_addresses_to(keychain, index)
+                    .for_each(drop);
             }
             return Ok(address);
         }
@@ -1059,8 +1057,6 @@ impl MultisigWallet {
                 online_data: None,
                 #[cfg(feature = "vss")]
                 vss_client: None,
-                #[cfg(feature = "vss")]
-                auto_backup_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             keys,
         })
@@ -1223,13 +1219,17 @@ impl MultisigWallet {
             .get(&keychain)
             .copied()
             .unwrap_or(0);
-        let new_index = index + 1;
+        let new_index = index.checked_add(1).ok_or_else(|| Error::Internal {
+            details: "address derivation index exhausted".to_string(),
+        })?;
+        let txn = self.database().begin_transaction()?;
+        txn.set_reuse_address_index(keychain, new_index)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
         self.internals_mut()
             .reuse_address_index
             .insert(keychain, new_index);
-        let txn = self.database().begin_transaction()?;
-        txn.set_reuse_address_index(keychain, new_index)?;
-        txn.commit()?;
+        self.trigger_auto_backup();
         let address = self.bdk_wallet().peek_address(keychain, new_index).address;
         Ok(address.to_string())
     }
@@ -1934,7 +1934,7 @@ impl MultisigWallet {
             let txn = self.database().begin_transaction()?;
             let _ = self.refresh_impl(&txn, None, vec![], true)?;
             self.persist_and_commit(txn)?;
-        self.trigger_auto_backup();
+            self.trigger_auto_backup();
             if !matches!(
                 op.operation_type,
                 OperationType::Inflation | OperationType::Burn
@@ -1942,7 +1942,7 @@ impl MultisigWallet {
                 let txn = self.database().begin_transaction()?;
                 let _ = self.refresh_impl(&txn, None, vec![], true);
                 self.persist_and_commit(txn)?;
-        self.trigger_auto_backup();
+                self.trigger_auto_backup();
             }
         }
 
@@ -2075,7 +2075,7 @@ impl MultisigWallet {
                 self.update_backup_info(&txn, false)?;
                 self.mark_operation_as_processed(&txn, op.operation_idx)?;
                 self.persist_and_commit(txn)?;
-        self.trigger_auto_backup();
+                self.trigger_auto_backup();
                 let status = Self::build_voting_status(op, op.my_response)?;
                 Ok(H::completed(txid, details, status))
             }
@@ -2083,7 +2083,7 @@ impl MultisigWallet {
                 let txn = self.database().begin_transaction()?;
                 self.mark_operation_as_processed(&txn, op.operation_idx)?;
                 self.persist_and_commit(txn)?;
-        self.trigger_auto_backup();
+                self.trigger_auto_backup();
                 let status = Self::build_voting_status(op, my_response)?;
                 Ok(H::discarded(details, status))
             }
@@ -2106,7 +2106,7 @@ impl MultisigWallet {
                     let asset_id = self.accept_issuance_consignment(&files, &txn)?;
                     self.mark_operation_as_processed(&txn, op.operation_idx)?;
                     self.persist_and_commit(txn)?;
-        self.trigger_auto_backup();
+                    self.trigger_auto_backup();
                     Operation::IssuanceCompleted { asset_id }
                 }
                 _ => {
@@ -2121,7 +2121,7 @@ impl MultisigWallet {
                     let details = self.import_receive_data(&txn, &files, &op.operation_type)?;
                     self.mark_operation_as_processed(&txn, op.operation_idx)?;
                     self.persist_and_commit(txn)?;
-        self.trigger_auto_backup();
+                    self.trigger_auto_backup();
                     match op.operation_type {
                         OperationType::BlindReceive => Operation::BlindReceiveCompleted { details },
                         _ => Operation::WitnessReceiveCompleted { details },
@@ -2317,7 +2317,8 @@ impl MultisigWallet {
         self.check_online(online)?;
         self.check_is_cosigner()?;
         let txn = self.database().begin_transaction()?;
-        let psbt = self.send_btc_begin_impl(&txn, address, amount, fee_rate, skip_sync, true, None)?;
+        let psbt =
+            self.send_btc_begin_impl(&txn, address, amount, fee_rate, skip_sync, true, None)?;
         let res = self.post_operation(OperationType::SendBtc, PostData::Psbt(psbt))?;
         self.persist_and_commit(txn)?;
         self.trigger_auto_backup();

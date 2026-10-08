@@ -33,6 +33,13 @@ namespace rgb_lib {
 
 [Error, Remote]
 interface RgbLibError {
+  VssAuth(string details);
+  VssBackupNotFound();
+  VssError(string details);
+  VssVersionConflict(string details);
+  VssEncryptionRequired();
+  BatchTransferAlreadyExists(string txid, i32 idx);
+  UnsafeTransferHistory(string details);
   AddressReuseDisabled();
   AllocationsAlreadyAvailable();
   AssetNotFound(string asset_id);
@@ -1036,6 +1043,7 @@ interface Wallet {
   // Raw fetch/accept halves are Rust-only (`*_unchecked`) — do not re-export them here.
   [Throws=RgbLibError]
   AcceptTransferResult fetch_and_accept_transfer_by_recipient_id(
+    Online online,
     string proxy_recipient_id,
     string witness_recipient_id,
     string consignment_endpoint,
@@ -1211,6 +1219,17 @@ interface Wallet {
 
   [Throws=RgbLibError]
   void abort_pending_vanilla_tx(string txid);
+
+  [Throws=RgbLibError]
+  void configure_vss_backup(VssBackupConfig config);
+
+  void disable_vss_auto_backup();
+
+  [Throws=RgbLibError]
+  i64 vss_backup(VssBackupClient client);
+
+  [Throws=RgbLibError]
+  VssBackupInfo vss_backup_info(VssBackupClient client);
 };
 
 interface MultisigWallet {

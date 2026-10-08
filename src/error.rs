@@ -8,6 +8,24 @@ use super::*;
 /// The error variants returned by functions.
 #[derive(Debug, Clone, PartialEq, thiserror::Error, Deserialize, Serialize)]
 pub enum Error {
+    /// An outgoing batch already exists for the transaction.
+    #[error("Batch transfer {idx} already exists for {txid}")]
+    BatchTransferAlreadyExists {
+        /// Transaction identifier.
+        txid: String,
+        /// Existing batch index.
+        idx: i32,
+    },
+    /// Consignment history is not yet safe from reorgs.
+    #[error("Unsafe consignment history: {details}")]
+    UnsafeTransferHistory {
+        /// Offending transaction details.
+        details: String,
+    },
+    /// New VSS uploads require encryption.
+    #[error("VSS backup encryption is required")]
+    VssEncryptionRequired,
+
     /// Address rotation called when reuse_addresses is false
     #[error("Address reuse is not enabled")]
     AddressReuseDisabled,
@@ -474,7 +492,6 @@ pub enum Error {
         /// TXID of the transfer having fee issues
         txid: String,
     },
-
 
     /// Cannot mark operation as processed
     #[error("Cannot mark operation as processed: {details}")]

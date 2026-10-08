@@ -221,8 +221,6 @@ impl Indexer {
                 .map_err(|e| IndexerError::from(*e)),
         }
     }
-
-
 }
 
 #[cfg(test)]

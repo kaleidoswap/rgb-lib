@@ -6,7 +6,7 @@ fn reuse_returns_same_address() {
     create_test_data_dir();
 
     let bitcoin_network = BitcoinNetwork::Regtest;
-    let keys = generate_keys(bitcoin_network);
+    let keys = generate_keys(bitcoin_network, WitnessVersion::Taproot);
     let mut wallet = Wallet::new(
         WalletData {
             data_dir: get_test_data_dir_string(),
@@ -38,7 +38,7 @@ fn rotate_changes_address() {
     create_test_data_dir();
 
     let bitcoin_network = BitcoinNetwork::Regtest;
-    let keys = generate_keys(bitcoin_network);
+    let keys = generate_keys(bitcoin_network, WitnessVersion::Taproot);
     let mut wallet = Wallet::new(
         WalletData {
             data_dir: get_test_data_dir_string(),
@@ -110,7 +110,7 @@ fn send_btc_change_reuses_address() {
     initialize();
 
     let bitcoin_network = BitcoinNetwork::Regtest;
-    let keys = generate_keys(bitcoin_network);
+    let keys = generate_keys(bitcoin_network, WitnessVersion::Taproot);
     let mut wallet = Wallet::new(
         WalletData {
             data_dir: get_test_data_dir_string(),
@@ -131,7 +131,9 @@ fn send_btc_change_reuses_address() {
 
     // fund and create utxos
     fund_wallet(pinned_addr.clone());
-    test_create_utxos_default(&mut wallet, online);
+    wallet
+        .create_utxos(online, false, None, None, FEE_RATE, false)
+        .unwrap();
     mine(false);
 
     // send BTC to a separate wallet (generates change)
@@ -148,7 +150,9 @@ fn send_btc_change_reuses_address() {
         .peek_address(KeychainKind::Internal, 0)
         .address
         .script_pubkey();
-    let vanilla_unspents = test_list_unspents_vanilla(&mut wallet, online, None);
+    let vanilla_unspents = wallet
+        .list_unspents_vanilla(online, MIN_CONFIRMATIONS, false)
+        .unwrap();
     assert!(!vanilla_unspents.is_empty());
     for unspent in &vanilla_unspents {
         assert_eq!(
@@ -345,7 +349,7 @@ fn proxy_recipient_id_unique_per_invoice_under_reuse() {
     }
 
     // Transfers expose the same per-invoice IDs.
-    let transfers = wallet.list_transfers(None).unwrap();
+    let transfers = wallet.list_transfers(AssetFilter::None, None).unwrap();
     for (inv, data) in [(&inv1, &data1), (&inv2, &data2)] {
         let transfer = transfers
             .iter()
@@ -394,7 +398,10 @@ fn proxy_recipient_id_matches_recipient_id_without_nonce() {
             .invoice_data();
         assert_eq!(data.proxy_recipient_id, data.recipient_id);
 
-        let transfers = party.wallet.list_transfers(None).unwrap();
+        let transfers = party
+            .wallet
+            .list_transfers(AssetFilter::None, None)
+            .unwrap();
         let transfer = transfers
             .iter()
             .find(|t| t.batch_transfer_idx == receive_data.batch_transfer_idx)

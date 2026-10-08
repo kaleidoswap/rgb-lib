@@ -10,6 +10,7 @@ fn success() {
 
     let keys = generate_keys(BitcoinNetwork::Signet, WitnessVersion::Taproot);
     let wallet_data = WalletData {
+        reuse_addresses: false,
         data_dir: test_data_dir_str.clone(),
         bitcoin_network: BitcoinNetwork::Signet,
         database_type: DatabaseType::Sqlite,
@@ -85,6 +86,7 @@ fn new_updates_manifest_success() {
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet_data = WalletData {
+        reuse_addresses: false,
         data_dir: test_data_dir_str.clone(),
         bitcoin_network: BitcoinNetwork::Regtest,
         database_type: DatabaseType::Sqlite,
@@ -106,6 +108,7 @@ fn new_updates_manifest_success() {
     // new is the way to change the settings that aren't fixed at creation, so it rewrites the
     // manifest and later loads pick the new values up
     let updated_wallet_data = WalletData {
+        reuse_addresses: false,
         max_allocations_per_utxo: 3,
         supported_schemas: vec![AssetSchema::Nia, AssetSchema::Cfa],
         ..wallet_data
@@ -211,6 +214,7 @@ fn new_immutable_settings_fail() {
     // else would stop the same directory being reused for a different chain. the network keeps
     // the error BDK's genesis check has always raised for this
     let other_network_wallet_data = WalletData {
+        reuse_addresses: false,
         bitcoin_network: BitcoinNetwork::Testnet,
         ..wallet_data.clone()
     };
@@ -475,4 +479,110 @@ fn manifest_fingerprint_mismatch_fail() {
         .err()
         .unwrap();
     assert_matches!(err, Error::FingerprintMismatch);
+}
+
+#[test]
+#[parallel]
+fn reuse_addresses_roundtrip_success() {
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
+
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let mut wallet_data = get_test_wallet_data(&test_data_dir_str);
+    wallet_data.reuse_addresses = true;
+    let wallet = Wallet::new(wallet_data, SinglesigKeys::from_keys(&keys, None)).unwrap();
+    drop(wallet);
+
+    // the manifest records reuse_addresses, so load doesn't silently fall back to false
+    let loaded = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None).unwrap();
+    assert!(loaded.get_wallet_data().reuse_addresses);
+}
+
+#[test]
+#[parallel]
+fn corrupt_manifest_fail() {
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
+
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet = Wallet::new(
+        get_test_wallet_data(&test_data_dir_str),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+    let manifest_path = wallet.get_wallet_dir().join(WALLET_MANIFEST_FILE);
+    drop(wallet);
+
+    fs::write(&manifest_path, "{ not json").unwrap();
+
+    // garbled manifest yields a clean error from both open paths
+    let err = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None)
+        .err()
+        .unwrap();
+    assert_matches!(err, Error::Internal { .. });
+    let err = Wallet::new(
+        get_test_wallet_data(&test_data_dir_str),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .err()
+    .unwrap();
+    assert_matches!(err, Error::Internal { .. });
+}
+
+#[test]
+#[parallel]
+fn manifest_rewrite_skipped_when_unchanged() {
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
+
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet = Wallet::new(
+        get_test_wallet_data(&test_data_dir_str),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+    let manifest_path = wallet.get_wallet_dir().join(WALLET_MANIFEST_FILE);
+    drop(wallet);
+
+    let mtime_before = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+
+    let wallet = Wallet::new(
+        get_test_wallet_data(&test_data_dir_str),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+    drop(wallet);
+
+    // identical settings leave the manifest untouched and no temp file behind
+    let mtime_after = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+    assert_eq!(mtime_before, mtime_after);
+    assert!(!manifest_path.with_extension("json.tmp").exists());
+}
+
+#[test]
+fn legacy_wallet_with_retired_signer_migration_loads() {
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+    let dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet = Wallet::new(
+        get_test_wallet_data(&dir.string()),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+    let path = wallet.get_wallet_dir().join(RGB_LIB_DB_NAME);
+    drop(wallet);
+    let connection = block_on(Database::connect(format!(
+        "sqlite:{}?mode=rw",
+        path.display()
+    )))
+    .unwrap();
+    block_on(connection.execute_raw(Statement::from_string(DatabaseBackend::Sqlite,
+        "INSERT INTO seaql_migrations (version, applied_at) VALUES ('m20260401_000001_create_mpc_address_table', 1)"))).unwrap();
+    block_on(connection.close()).unwrap();
+    let loaded =
+        Wallet::load(&dir.string(), &keys.master_fingerprint, Some(keys.mnemonic)).unwrap();
+    assert_eq!(
+        loaded.get_keys().master_fingerprint,
+        keys.master_fingerprint
+    );
 }
