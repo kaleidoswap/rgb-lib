@@ -13,8 +13,6 @@ pub use super::bdk_wallet::Entity as BdkWallet;
 pub use super::bdk_wallet_locked_outpoint::Entity as BdkWalletLockedOutpoint;
 pub use super::coloring::Entity as Coloring;
 pub use super::media::Entity as Media;
-#[cfg(feature = "mpc")]
-pub use super::mpc_address::Entity as MpcAddress;
 pub use super::pending_witness_script::Entity as PendingWitnessScript;
 pub use super::reserved_txo::Entity as ReservedTxo;
 pub use super::reuse_address_index::Entity as ReuseAddressIndex;

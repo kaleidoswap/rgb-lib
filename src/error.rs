@@ -475,12 +475,6 @@ pub enum Error {
         txid: String,
     },
 
-    /// MPC provider error
-    #[error("MPC provider error: {details}")]
-    MpcProvider {
-        /// Error details
-        details: String,
-    },
 
     /// Cannot mark operation as processed
     #[error("Cannot mark operation as processed: {details}")]

@@ -35,8 +35,7 @@ pub struct WalletData {
     /// Default: `false`
     ///
     /// **Privacy:** enabling this reduces on-chain privacy since all incoming transactions to the
-    /// same keychain become linkable. Only enable when address reuse is acceptable (e.g. MPC
-    /// wallets, CEX deposit addresses).
+    /// same keychain become linkable. Only enable when address reuse is acceptable (e.g. exchange deposit addresses).
     #[serde(default)]
     pub reuse_addresses: bool,
 }
