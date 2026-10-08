@@ -2,9 +2,9 @@ name: Run tests
 
 on:
   push:
-    branches: [ "utexo-master", "dev", "stage", "master" ]
+    branches: [ "utexo-master", "dev", "stage", "master", "ks/dev" ]
   pull_request:
-    branches: [ "utexo-master", "dev", "stage", "master" ]
+    branches: [ "utexo-master", "dev", "stage", "master", "ks/dev" ]
 
 env:
   CARGO_TERM_COLOR: always
