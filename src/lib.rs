@@ -80,6 +80,7 @@
 //!         database_type: DatabaseType::Sqlite,
 //!         max_allocations_per_utxo: 5,
 //!         supported_schemas: vec![AssetSchema::Nia],
+//!         reuse_addresses: false,
 //!     };
 //!     let wallet = Wallet::new(wallet_data, SinglesigKeys::from_keys(&keys, None))?;
 //!     drop(wallet);

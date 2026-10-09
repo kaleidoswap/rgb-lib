@@ -11,8 +11,6 @@
 //! Low-level `color_psbt_*` / `consume_transfer_fascia` and unchecked fetch/accept stay rust-only.
 
 use super::*;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-use crate::utils::recipient_id_from_script_buf;
 use bdk_wallet::bitcoin::Transaction;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
@@ -3256,8 +3254,16 @@ impl Wallet {
                             ),
                         });
                     }
+                    let address_payload = AddressPayload::from_script(&txout.script_pubkey)
+                        .map_err(|_| Error::InvalidColoringInfo {
+                            details: format!(
+                                "output_map vout {vout} script is not a standard address payload"
+                            ),
+                        })?;
+                    let beneficiary =
+                        Beneficiary::WitnessVout(Pay2Vout::new(address_payload), None);
                     let recipient_id =
-                        recipient_id_from_script_buf(txout.script_pubkey.clone(), bitcoin_network);
+                        XChainNet::with(bitcoin_network.into(), beneficiary).to_string();
                     let output_assignment =
                         Self::assignment_for_coloring_output(asset_schema, amount);
                     let owned_by_witness_receive =

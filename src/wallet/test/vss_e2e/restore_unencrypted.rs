@@ -15,6 +15,7 @@ fn legacy_plaintext_restore_preserves_rgb_files_without_bdk_or_manifest() {
     {
         let mut zip = zip::ZipWriter::new(&mut bytes);
         let options = zip::write::SimpleFileOptions::default();
+        zip.add_directory("a1b2c3d4/", options).unwrap();
         for (path, contents) in [
             ("a1b2c3d4/rgb_lib_db", b"historical RGB database".as_slice()),
             ("a1b2c3d4/assets/asset.dat", b"historical asset".as_slice()),
