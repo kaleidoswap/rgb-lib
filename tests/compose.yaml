@@ -90,6 +90,9 @@ services:
     image: ghcr.io/rgb-tools/rgb-multisig-hub:0.1.1
     ports:
       - 8141:3001
+    volumes:
+      - hub:/srv/data
+      - ./hub/config.toml:/srv/data/config.toml:ro
   vss-postgres:
     image: postgres:16-alpine
     profiles: ['vss']
