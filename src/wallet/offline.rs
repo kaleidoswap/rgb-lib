@@ -25,10 +25,6 @@ pub trait WalletOffline: WalletBackup {
         self.wallet_data().bitcoin_network
     }
 
-    // NOTE: Dev-only struct/impl block removed during merge.
-    // All structs (Metadata, AssetNIA, AssetUDA, etc.) now live in objects.rs.
-    // Wallet struct and Wallet::new() now live in singlesig.rs/core.rs.
-
     fn chain_net(&self) -> ChainNet {
         self.bitcoin_network().into()
     }
@@ -334,7 +330,10 @@ pub trait WalletOffline: WalletBackup {
         let src = original_file_path.as_ref().to_string_lossy().to_string();
         let dst = media.clone().file_path;
         if src != dst {
-            fs::copy(src, dst)?;
+            atomic_write_with(Path::new(&dst), |tmp| {
+                fs::copy(&src, tmp)?;
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -410,7 +409,7 @@ pub trait WalletOffline: WalletBackup {
         let valid_contract = builder.issue_contract().expect("issuance should succeed");
         let asset_id = valid_contract.contract_id().to_string();
         let contract_path = self.get_issue_consignment_path(&asset_id);
-        valid_contract.save_file(&contract_path)?;
+        atomic_write_with(&contract_path, |tmp| Ok(valid_contract.save_file(tmp)?))?;
         Ok((asset_id, contract_path, valid_contract))
     }
 
@@ -1000,7 +999,7 @@ pub trait WalletOffline: WalletBackup {
             }
             RecipientType::Witness => {
                 let script_pubkey = self.get_new_address()?.script_pubkey();
-                let beneficiary = beneficiary_from_script_buf(script_pubkey.clone())?;
+                let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
                 // Per-invoice nonce is only needed when address reuse is on:
                 // without reuse, each witness_receive draws a fresh script, so
                 // the script-derived recipient_id is already unique per call.
@@ -1307,39 +1306,16 @@ pub trait WalletOffline: WalletBackup {
                 .copied()
                 .unwrap_or(0);
             let address = self.bdk_wallet().peek_address(keychain, index).address;
-            // Ensure BDK has revealed up to this index so UTXO scanning finds it
-            let revealed = self.bdk_wallet().derivation_index(keychain).unwrap_or(0);
-            if revealed <= index {
-                let (bdk_wallet, bdk_db) = self.bdk_wallet_db_mut();
-                for _ in revealed..=index {
-                    bdk_wallet.reveal_next_address(keychain);
-                }
-                bdk_wallet.persist(bdk_db)?;
-            }
+            self.bdk_wallet_mut()
+                .reveal_addresses_to(keychain, index)
+                .for_each(drop);
             return Ok(address);
         }
-        let (bdk_wallet, bdk_db) = self.bdk_wallet_db_mut();
-        let address = bdk_wallet.reveal_next_address(keychain).address;
-        bdk_wallet.persist(bdk_db)?;
-        Ok(address)
+        Ok(self.bdk_wallet_mut().reveal_next_address(keychain).address)
     }
 
     fn get_new_address(&mut self) -> Result<BdkAddress, Error> {
         self.get_new_addresses(KeychainKind::External, 1)
-    }
-
-    /// Return a new Bitcoin address from the vanilla wallet.
-    fn get_address(&mut self) -> Result<String, Error> {
-        info!(self.logger(), "Getting address...");
-        let address = self.get_new_addresses(KeychainKind::Internal, 1)?;
-
-        let txn = self.database().begin_transaction()?;
-        self.update_backup_info(&txn, false)?;
-        txn.commit()?;
-        self.trigger_auto_backup();
-
-        info!(self.logger(), "Get address completed");
-        Ok(address.to_string())
     }
 
     fn get_asset_balance_impl(&self, txn: &DbTxn, asset_id: String) -> Result<Balance, Error> {
@@ -2259,24 +2235,15 @@ pub trait WalletOffline: WalletBackup {
             .filter(|t| t.user_driven)
             .map(|t| t.idx)
             .collect();
-        self.build_transfers(txn, &db_data, &asset_transfer_ids)
-    }
-
-    fn build_transfers(
-        &self,
-        txn: &DbTxn,
-        db_data: &crate::database::DbData,
-        asset_transfer_ids: &[i32],
-    ) -> Result<Vec<Transfer>, Error> {
         db_data
             .transfers
-            .iter()
+            .into_iter()
             .filter(|t| asset_transfer_ids.contains(&t.asset_transfer_idx))
             .map(|t| {
                 let (asset_transfer, batch_transfer) =
                     t.related_transfers(&db_data.asset_transfers, &db_data.batch_transfers);
                 let td = self.get_transfer_data(
-                    t,
+                    &t,
                     &asset_transfer,
                     &batch_transfer,
                     &db_data.txos,
@@ -2798,7 +2765,7 @@ pub trait WalletOffline: WalletBackup {
             let asset_transfer_dir = self.get_asset_transfer_dir(transfer_dir, asset_id);
             fs::create_dir_all(&asset_transfer_dir)?;
             let consignment_path = self.get_send_consignment_path_impl(asset_transfer_dir);
-            consignment.save_file(&consignment_path)?;
+            atomic_write_with(&consignment_path, |tmp| Ok(consignment.save_file(tmp)?))?;
         }
         Ok(())
     }
@@ -2877,7 +2844,7 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
         info!(self.logger(), "Getting BTC balance...");
         let txn = self.database().begin_transaction()?;
         let balance = self.get_btc_balance_impl(&txn, online, skip_sync)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Get BTC balance completed");
         Ok(balance)
     }
@@ -2907,7 +2874,7 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
         info!(self.logger(), "Listing transactions...");
         let txn = self.database().begin_transaction()?;
         let transactions = self.list_transactions_impl(&txn, online, skip_sync)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "List transactions completed");
         Ok(transactions)
     }
@@ -2949,7 +2916,7 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
         info!(self.logger(), "Listing unspents...");
         let txn = self.database().begin_transaction()?;
         let unspents = self.list_unspents_impl(&txn, online, settled_only, skip_sync)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "List unspents completed");
         Ok(unspents)
     }
@@ -2995,9 +2962,6 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
             self.update_backup_info(&txn, false)?;
         }
         txn.commit()?;
-        if changed {
-            self.trigger_auto_backup();
-        }
         info!(self.logger(), "Delete transfer completed");
         Ok(changed)
     }

@@ -168,6 +168,22 @@ impl From<BitcoinNetwork> for ChainNet {
     }
 }
 
+/// Make a newly created file's directory entry durable.
+///
+/// [`File::sync_all`](fs::File::sync_all) covers a file's own data and metadata but not the entry
+/// that names it, so without this a freshly created file can still vanish on power loss.
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn sync_dir<P: AsRef<Path>>(dir: P) -> Result<(), io::Error> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Windows cannot open a directory as a file and offers no portable equivalent, so the directory
+/// entry is left to the filesystem's own ordering there.
+#[cfg(target_os = "windows")]
+pub(crate) fn sync_dir<P: AsRef<Path>>(_dir: P) -> Result<(), io::Error> {
+    Ok(())
+}
+
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
     p.as_ref().display().to_string()
@@ -444,24 +460,18 @@ pub fn script_buf_from_recipient_id(recipient_id: String) -> Result<Option<Scrip
     }
 }
 
-pub(crate) fn beneficiary_from_script_buf(script_buf: ScriptBuf) -> Result<Beneficiary, Error> {
-    let address_payload =
-        AddressPayload::from_script(&script_buf).map_err(|e| Error::InvalidAddress {
-            details: e.to_string(),
-        })?;
-    Ok(Beneficiary::WitnessVout(
-        Pay2Vout::new(address_payload),
-        None,
-    ))
+pub(crate) fn beneficiary_from_script_buf(script_buf: ScriptBuf) -> Beneficiary {
+    let address_payload = AddressPayload::from_script(&script_buf).unwrap();
+    Beneficiary::WitnessVout(Pay2Vout::new(address_payload), None)
 }
 
 /// Return the recipient ID for a specific script buf
 pub fn recipient_id_from_script_buf(
     script_buf: ScriptBuf,
     bitcoin_network: BitcoinNetwork,
-) -> Result<String, Error> {
-    let beneficiary = beneficiary_from_script_buf(script_buf)?;
-    Ok(XChainNet::with(bitcoin_network.into(), beneficiary).to_string())
+) -> String {
+    let beneficiary = beneficiary_from_script_buf(script_buf);
+    XChainNet::with(bitcoin_network.into(), beneficiary).to_string()
 }
 
 fn get_derivation_path(keychain: u8) -> DerivationPath {
@@ -531,24 +541,21 @@ pub(crate) fn calculate_descriptor_from_xpub(
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn check_proxy(proxy_url: &str) -> Result<(), Error> {
     let proxy_client = ProxyClient::new(proxy_url)?;
-    let mut err_details = s!("unable to connect to proxy");
-    if let Ok(server_info) = proxy_client.get_info() {
-        if let Some(info) = server_info.result {
-            if info.protocol_version == *PROXY_PROTOCOL_VERSION {
-                return Ok(());
-            } else {
-                return Err(Error::InvalidProxyProtocol {
-                    version: info.protocol_version,
-                });
-            }
+    let server_info = proxy_client.get_info()?;
+    if let Some(info) = server_info.result {
+        if info.protocol_version == *PROXY_PROTOCOL_VERSION {
+            return Ok(());
+        } else {
+            return Err(Error::InvalidProxyProtocol {
+                version: info.protocol_version,
+            });
         }
-        if let Some(err) = server_info.error {
-            err_details = err.message;
-        }
+    }
+    let details = match server_info.error {
+        Some(err) => err.message,
+        None => s!("proxy response has neither result nor error"),
     };
-    Err(Error::Proxy {
-        details: err_details,
-    })
+    Err(Error::Proxy { details })
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -636,6 +643,57 @@ pub(crate) fn hash_bytes(data: &[u8]) -> Vec<u8> {
 
 pub(crate) fn hash_bytes_hex(data: &[u8]) -> String {
     hex::encode(hash_bytes(data))
+}
+
+/// Atomically materialize a file at `path`.
+///
+/// The `write` closure writes to a temporary file in the same directory, which
+/// is then fsynced and renamed into place. Since `rename` is atomic on a
+/// single filesystem, a reader (or a crash) never observes a partially-written
+/// file. The fsync (plus a best-effort directory fsync) makes the result
+/// durable across a power loss.
+pub(crate) fn atomic_write_with<F>(path: &Path, write: F) -> Result<(), Error>
+where
+    F: FnOnce(&Path) -> Result<(), Error>,
+{
+    let parent = path.parent().ok_or_else(|| Error::Internal {
+        details: format!("cannot atomically write {path:?}: no parent directory"),
+    })?;
+    fs::create_dir_all(parent)?;
+    let tmp = atomic_tmp_path(path)?;
+    // drop any temp file leaked by an earlier crash
+    let _ = fs::remove_file(&tmp);
+    write(&tmp)?;
+    // fsync the temp file contents before making them visible
+    fs::File::open(&tmp)?.sync_all()?;
+    fs::rename(&tmp, path)?;
+    // fsync the parent directory so the rename entry itself is durable (a no-op on Windows, where
+    // a directory can't be opened as a file: the data is already fsynced and only the durability
+    // of the rename across a power loss is left to the filesystem)
+    sync_dir(parent)?;
+    Ok(())
+}
+
+/// The temporary file `atomic_write_with` stages `path` in before renaming it into place.
+///
+/// Exposed so a loader can recover a temp file left behind by a crash between the write and the
+/// rename.
+pub(crate) fn atomic_tmp_path(path: &Path) -> Result<PathBuf, Error> {
+    let parent = path.parent().ok_or_else(|| Error::Internal {
+        details: format!("cannot atomically write {path:?}: no parent directory"),
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| Error::Internal {
+            details: format!("cannot atomically write {path:?}: invalid file name"),
+        })?;
+    Ok(parent.join(format!(".{file_name}.tmp")))
+}
+
+/// Atomically write `bytes` to `path`.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    atomic_write_with(path, |tmp| Ok(fs::write(tmp, bytes)?))
 }
 
 /// Derive the proxy routing key for a witness recipient.
@@ -923,6 +981,24 @@ impl RgbRuntime {
     pub(crate) fn store_secret_seal(&mut self, seal: GraphSeal) -> Result<bool, InternalError> {
         self.stock
             .store_secret_seal(seal)
+            .map_err(InternalError::from)
+    }
+
+    /// Build a consignment from stock after the fascia has been consumed.
+    ///
+    /// Prefer [`Self::transfer_from_fascia`] when the consignment must be built before
+    /// `consume_fascia`, so a mid-loop failure cannot leave the stash advanced without a
+    /// consignment.
+    #[allow(dead_code)]
+    pub(crate) fn transfer(
+        &self,
+        contract_id: ContractId,
+        outputs: impl AsRef<[OutputSeal]>,
+        secret_seals: impl AsRef<[SecretSeal]>,
+        witness_id: Option<RgbTxid>,
+    ) -> Result<RgbTransfer, InternalError> {
+        self.stock
+            .transfer(contract_id, outputs, secret_seals, [], witness_id)
             .map_err(InternalError::from)
     }
 
@@ -1222,6 +1298,38 @@ mod tests {
         mock.assert();
     }
 
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[test]
+    fn test_check_proxy_invalid_body_error_details() {
+        // server returns HTTP 200 with a body that is not a JSON-RPC response: the transport
+        // error (body decoding) must be reported, not the generic connection message
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("not json")
+            .create();
+        let result = check_proxy(&server.url());
+        let expected = format!("error decoding response body for url ({}/)", server.url());
+        assert_matches!(result, Err(Error::Proxy { details }) if details == expected);
+        mock.assert();
+    }
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[test]
+    fn test_check_proxy_connection_error_details() {
+        // bind then drop a listener to get a port that refuses connections: the transport error
+        // (connection refused) must be reported, not the generic connection message
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let result = check_proxy(&format!("http://127.0.0.1:{port}"));
+        let expected = format!("error sending request for url (http://127.0.0.1:{port}/)");
+        assert_matches!(result, Err(Error::Proxy { details }) if details == expected);
+    }
+
     #[test]
     fn test_load_rgb_runtime_corrupt_stock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1242,6 +1350,20 @@ mod tests {
         // with a lower LOCK_FILE_TIMEOUT_SECS in test builds the error is returned immediately
         let result = write_rgb_runtime_lockfile(dir.path());
         assert_matches!(result, Err(Error::Internal { details }) if details == "unreleased lock file");
+    }
+
+    #[test]
+    fn test_atomic_write() {
+        let dir = tempfile::tempdir().unwrap();
+        // parent dir does not exist yet: it must be created
+        let path = dir.path().join("sub").join("f.bin");
+        atomic_write(&path, b"hello").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"hello");
+        // overwrites cleanly
+        atomic_write(&path, b"world!!").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"world!!");
+        // no temp file is left behind
+        assert!(!path.parent().unwrap().join(".f.bin.tmp").exists());
     }
 
     // The None return from build_indexer is only reachable when electrum is enabled but esplora

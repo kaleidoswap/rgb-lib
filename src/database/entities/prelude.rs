@@ -4,10 +4,15 @@ pub use super::asset::Entity as Asset;
 pub use super::asset_transfer::Entity as AssetTransfer;
 pub use super::backup_info::Entity as BackupInfo;
 pub use super::batch_transfer::Entity as BatchTransfer;
+pub use super::bdk_anchor::Entity as BdkAnchor;
+pub use super::bdk_block::Entity as BdkBlock;
+pub use super::bdk_descriptor_last_revealed::Entity as BdkDescriptorLastRevealed;
+pub use super::bdk_tx::Entity as BdkTx;
+pub use super::bdk_txout::Entity as BdkTxout;
+pub use super::bdk_wallet::Entity as BdkWallet;
+pub use super::bdk_wallet_locked_outpoint::Entity as BdkWalletLockedOutpoint;
 pub use super::coloring::Entity as Coloring;
 pub use super::media::Entity as Media;
-#[cfg(feature = "mpc")]
-pub use super::mpc_address::Entity as MpcAddress;
 pub use super::pending_witness_script::Entity as PendingWitnessScript;
 pub use super::reserved_txo::Entity as ReservedTxo;
 pub use super::reuse_address_index::Entity as ReuseAddressIndex;

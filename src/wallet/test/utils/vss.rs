@@ -232,39 +232,6 @@ pub(crate) async fn vss_key_exists(
     }
 }
 
-pub(crate) async fn assert_vss_key_missing(
-    raw: &RawVssClient,
-    store_id: &str,
-    key: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match get_vss_key(raw, store_id, key).await {
-        Ok(_) => Err(format!("VSS key unexpectedly exists: {key}").into()),
-        Err(e) => {
-            let msg = format!("{e:?}");
-            // Be tolerant: exact error text depends on VSS implementation.
-            if msg.contains("NoSuchKey")
-                || msg.to_lowercase().contains("not found")
-                || msg.contains("Requested key not found")
-            {
-                Ok(())
-            } else {
-                Err(format!("unexpected error when checking missing key {key}: {msg}").into())
-            }
-        }
-    }
-}
-
-pub(crate) fn list_zip_names(zip_bytes: &[u8]) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let reader = std::io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(reader)?;
-    let mut names = Vec::with_capacity(archive.len());
-    for i in 0..archive.len() {
-        names.push(archive.by_index(i)?.name().to_string());
-    }
-    names.sort();
-    Ok(names)
-}
-
 pub(crate) fn vss_server_url() -> String {
     std::env::var("VSS_SERVER_URL").unwrap_or_else(|_| DEFAULT_VSS_SERVER_URL.to_string())
 }
@@ -475,4 +442,46 @@ impl Drop for VssBackupDeleteGuard {
         };
         let _ = client.handle().block_on(client.delete_backup());
     }
+}
+
+// Seed a historical plaintext payload without exposing a production plaintext upload API.
+pub(crate) async fn seed_legacy_plaintext_backup(
+    server_url: &str,
+    store_id: &str,
+    signing_key: SecretKey,
+    data: Vec<u8>,
+) {
+    use vss_client::types::{KeyValue, PutObjectRequest};
+    let (data, fingerprint) = crate::wallet::vss::sanitize_zip_for_plaintext(&data).unwrap();
+    let manifest = crate::wallet::vss::BackupManifest {
+        chunk_count: 1,
+        total_size: data.len(),
+        encrypted: false,
+        version: 1,
+    };
+    build_raw_vss_client(server_url, signing_key)
+        .put_object(&PutObjectRequest {
+            store_id: store_id.to_string(),
+            global_version: None,
+            delete_items: vec![],
+            transaction_items: vec![
+                KeyValue {
+                    key: VSS_KEY_DATA.to_string(),
+                    version: 0,
+                    value: data,
+                },
+                KeyValue {
+                    key: VSS_KEY_MANIFEST.to_string(),
+                    version: 0,
+                    value: serde_json::to_vec(&manifest).unwrap(),
+                },
+                KeyValue {
+                    key: VSS_KEY_FINGERPRINT.to_string(),
+                    version: 0,
+                    value: fingerprint.into_bytes(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
 }

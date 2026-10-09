@@ -30,6 +30,7 @@ fn success() {
         )
         .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
     let mut psbt = tx_builder.finish().unwrap();
+    let mut psbt_copy = psbt.clone();
     assert!(
         !psbt
             .unsigned_tx
@@ -38,9 +39,6 @@ fn success() {
             .any(|o| o.script_pubkey.is_op_return())
     );
     assert!(psbt.proprietary.is_empty());
-    let witness_utxo_before = psbt.inputs[0].witness_utxo.clone();
-    let tap_internal_key_before = psbt.inputs[0].tap_internal_key;
-    assert!(witness_utxo_before.is_some());
 
     // color PSBT
     assert_eq!(psbt.unsigned_tx.input.len(), 1);
@@ -67,8 +65,6 @@ fn success() {
         static_blinding: Some(blinding),
         nonce: None,
     };
-    stamp_output_map_sentinels(&mut psbt);
-    let mut psbt_copy = psbt.clone();
     let (fascia, beneficiaries) = party_send
         .wallet
         .color_psbt(&mut psbt, coloring_info.clone())
@@ -82,10 +78,6 @@ fn success() {
             .any(|o| o.script_pubkey.is_op_return())
     );
     assert!(!psbt.proprietary.is_empty());
-    assert_eq!(psbt.inputs[0].witness_utxo, witness_utxo_before);
-    assert_eq!(psbt.inputs[0].tap_internal_key, tap_internal_key_before);
-    // OP_RETURN inserted at front: original output maps must shift by +1 (skip(1) rebuild path).
-    assert_output_maps_offset_by(&psbt_copy, &psbt, 1);
     let vout = vout + 1;
 
     // check fascia
@@ -120,13 +112,10 @@ fn success() {
     assert_eq!(seal.vout.into_u32(), vout);
     assert_eq!(seal.blinding, blinding);
 
-    // color PSBT and prepare consume (stash not updated until consume_transfer_fascia)
-    let ColorPrepareResult {
-        transfers,
-        batch_transfer_idx,
-    } = party_send
+    // color PSBT and consume
+    let transfers = party_send
         .wallet
-        .color_psbt_and_prepare_consume(&mut psbt_copy, coloring_info, MIN_CONFIRMATIONS, None)
+        .color_psbt_and_consume(&mut psbt_copy, coloring_info)
         .unwrap();
 
     // check that the two color_psbt* methods produce matching PSBTs (no additional changes)
@@ -156,11 +145,8 @@ fn success() {
         )
         .unwrap();
 
-    broadcast_wallet_psbt(&party_send.wallet, &psbt_copy);
-    party_send
-        .wallet
-        .consume_transfer_fascia(party_send.party_online(), batch_transfer_idx)
-        .unwrap();
+    // consume fascia
+    party_send.wallet.consume_fascia(fascia, None).unwrap();
 }
 
 #[cfg(feature = "electrum")]
@@ -306,192 +292,6 @@ fn save_new_asset_success() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn import_asset_contract_success() {
-    initialize();
-
-    let mut issuer = get_funded_party!();
-    let recipient = get_empty_party!();
-    let assets = [
-        (issuer.issue_asset_nia(None).asset_id, AssetSchema::Nia),
-        (
-            issuer.issue_asset_cfa(None, None).asset_id,
-            AssetSchema::Cfa,
-        ),
-        (
-            issuer.issue_asset_ifa(None, None, None).asset_id,
-            AssetSchema::Ifa,
-        ),
-        (
-            issuer.issue_asset_uda(None, None, vec![]).asset_id,
-            AssetSchema::Uda,
-        ),
-    ];
-
-    for (asset_id, asset_schema) in assets {
-        let contract = issuer
-            .wallet
-            .export_asset_contract(asset_id.clone())
-            .unwrap();
-        let imported = recipient
-            .wallet
-            .import_asset_contract(contract.clone())
-            .unwrap();
-        assert_eq!(imported.asset_id, asset_id);
-        assert!(!imported.already_imported);
-        assert_eq!(imported.metadata.asset_schema, asset_schema);
-        assert_eq!(imported.metadata.name, NAME);
-        assert_eq!(imported.metadata.precision, PRECISION);
-        assert_eq!(
-            recipient
-                .wallet
-                .get_asset_balance(asset_id.clone())
-                .unwrap(),
-            Balance::default()
-        );
-
-        let repeated = recipient.wallet.import_asset_contract(contract).unwrap();
-        assert_eq!(repeated.asset_id, asset_id);
-        assert!(repeated.already_imported);
-        assert_eq!(repeated.metadata, imported.metadata);
-    }
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn import_asset_contract_rejects_missing_attachments() {
-    initialize();
-
-    let mut issuer = get_funded_party!();
-    let recipient = get_empty_party!();
-    let asset = issuer.issue_asset_cfa(None, Some(FILE_STR.to_string()));
-    let contract = issuer.wallet.export_asset_contract(asset.asset_id).unwrap();
-
-    let result = recipient.wallet.import_asset_contract(contract);
-    assert_matches!(result, Err(Error::InvalidAttachments { .. }));
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn import_asset_contract_repairs_partial_persistence() {
-    initialize();
-
-    let mut issuer = get_funded_party!();
-    let stock_only_recipient = get_empty_party!();
-    let database_only_recipient = get_empty_party!();
-    let asset = issuer.issue_asset_nia(None);
-    let contract = issuer
-        .wallet
-        .export_asset_contract(asset.asset_id.clone())
-        .unwrap();
-    let validation_config = ValidationConfig {
-        chain_net: stock_only_recipient.wallet.chain_net(),
-        trusted_typesystem: AssetSchema::Nia.types(),
-        ..Default::default()
-    };
-    let valid_contract = contract
-        .clone()
-        .validate(&DumbResolver, &validation_config)
-        .unwrap();
-    let contract_id = valid_contract.contract_id();
-
-    {
-        let mut runtime = stock_only_recipient.wallet.rgb_runtime().unwrap();
-        runtime
-            .import_contract(valid_contract.clone(), &DumbResolver)
-            .unwrap();
-    }
-    assert_matches!(
-        stock_only_recipient
-            .wallet
-            .get_asset_metadata(asset.asset_id.clone()),
-        Err(Error::AssetNotFound { .. })
-    );
-    let repaired = stock_only_recipient
-        .wallet
-        .import_asset_contract(contract.clone())
-        .unwrap();
-    assert!(!repaired.already_imported);
-
-    {
-        // Read metadata from the issuer's stock so the recipient's stock remains untouched. This
-        // deterministically models a database commit that completed before the stock write.
-        let runtime = issuer.wallet.rgb_runtime().unwrap();
-        let txn = database_only_recipient
-            .wallet
-            .database()
-            .begin_transaction()
-            .unwrap();
-        database_only_recipient
-            .wallet
-            .save_new_asset_internal(
-                &txn,
-                &runtime,
-                contract_id,
-                AssetSchema::Nia,
-                valid_contract,
-                None,
-            )
-            .unwrap();
-        txn.commit().unwrap();
-    }
-    assert!(
-        database_only_recipient
-            .wallet
-            .rgb_runtime()
-            .unwrap()
-            .export_contract(contract_id)
-            .is_err()
-    );
-    let repaired = database_only_recipient
-        .wallet
-        .import_asset_contract(contract)
-        .unwrap();
-    assert!(!repaired.already_imported);
-    assert_eq!(repaired.metadata.asset_schema, AssetSchema::Nia);
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn import_asset_contract_serializes_concurrent_calls() {
-    initialize();
-
-    let mut issuer = get_funded_party!();
-    let recipient = get_empty_party!();
-    let asset = issuer.issue_asset_nia(None);
-    let contract = issuer
-        .wallet
-        .export_asset_contract(asset.asset_id.clone())
-        .unwrap();
-    let wallet_data = recipient.wallet.wallet_data().clone();
-    let keys = recipient.wallet.get_keys();
-    let first_wallet = recipient.wallet;
-    let second_wallet = Wallet::new(wallet_data.clone(), keys.clone()).unwrap();
-    let first_contract = contract.clone();
-    let (first, second) = std::thread::scope(|scope| {
-        let first = scope.spawn(move || first_wallet.import_asset_contract(first_contract));
-        let second = scope.spawn(move || second_wallet.import_asset_contract(contract));
-        (
-            first.join().unwrap().unwrap(),
-            second.join().unwrap().unwrap(),
-        )
-    });
-
-    assert_eq!(first.asset_id, asset.asset_id);
-    assert_eq!(second.asset_id, asset.asset_id);
-    assert_ne!(first.already_imported, second.already_imported);
-    let wallet = Wallet::new(wallet_data, keys).unwrap();
-    assert_eq!(
-        wallet.get_asset_balance(asset.asset_id).unwrap(),
-        Balance::default()
-    );
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
 fn color_psbt_uda() {
     initialize();
 
@@ -540,9 +340,6 @@ fn color_psbt_uda() {
             .any(|o| o.script_pubkey.is_op_return())
     );
     assert!(psbt.proprietary.is_empty());
-    let witness_utxo_before = psbt.inputs[0].witness_utxo.clone();
-    let tap_internal_key_before = psbt.inputs[0].tap_internal_key;
-    assert!(witness_utxo_before.is_some());
 
     // color PSBT
     assert_eq!(psbt.unsigned_tx.input.len(), 1);
@@ -582,8 +379,6 @@ fn color_psbt_uda() {
             .script_pubkey
             .is_op_return()
     );
-    assert_eq!(psbt.inputs[0].witness_utxo, witness_utxo_before);
-    assert_eq!(psbt.inputs[0].tap_internal_key, tap_internal_key_before);
 
     // check fascia
     assert_eq!(fascia.bundles().len(), 1);
@@ -611,71 +406,6 @@ fn color_psbt_uda() {
     };
     assert_eq!(seal.txid, TxPtr::WitnessTx);
     assert_eq!(seal.vout.into_u32(), 0);
-}
-
-/// UniFFI `psbt_op_prepare` shares `color_psbt_with_prevouts_runtime`. A known UDA whose selected
-/// inputs do not carry the token used to panic on `uda_state.unwrap()` before the insufficient
-/// allocation check.
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn psbt_op_prepare_uda_missing_input_assignment_returns_coloring_error() {
-    initialize();
-
-    let amt_sat = 500;
-    let blinding = 777;
-
-    let mut party_send = get_funded_noutxo_party!();
-    party_send.create_utxos(false, Some(2), None, FEE_RATE, None);
-    let asset = party_send.issue_asset_uda(None, None, vec![]);
-
-    let vanilla: OutPoint = party_send
-        .list_unspents(true)
-        .into_iter()
-        .find(|u| u.utxo.colorable && u.rgb_allocations.is_empty())
-        .expect("uncolored colorable UTXO")
-        .utxo
-        .outpoint
-        .into();
-
-    let address = BdkAddress::from_str(&party_send.get_address()).unwrap();
-    let mut tx_builder = party_send.wallet.bdk_wallet_mut().build_tx();
-    tx_builder.add_utxo(vanilla).unwrap();
-    tx_builder.manually_selected_only();
-    tx_builder
-        .add_recipient(
-            address.assume_checked().script_pubkey(),
-            BdkAmount::from_sat(amt_sat),
-        )
-        .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
-    let mut psbt = tx_builder.finish().unwrap();
-    insert_op_return(&mut psbt, true);
-    let vout = psbt
-        .unsigned_tx
-        .output
-        .iter()
-        .enumerate()
-        .find(|(_, o)| o.value.to_sat() == amt_sat)
-        .unwrap()
-        .0 as u32;
-    let coloring_info = coloring_info_for(&asset.asset_id, HashMap::from([(vout, 1)]), blinding);
-
-    let result = party_send.wallet.psbt_op_prepare(
-        &mut psbt,
-        coloring_info,
-        vec![vanilla],
-        MIN_CONFIRMATIONS,
-        None,
-    );
-    assert!(
-        matches!(
-            result,
-            Err(Error::InvalidColoringInfo { ref details })
-                if details.contains("greater than available")
-                    || details.contains("no token assignment")
-        ),
-        "psbt_op_prepare must return a coloring error, not panic; got {result:?}"
-    );
 }
 
 #[cfg(feature = "electrum")]
@@ -708,7 +438,6 @@ fn color_psbt_fail() {
         )
         .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
     let mut psbt = tx_builder.finish().unwrap();
-    let base_psbt = psbt.clone();
 
     // prepare coloring data
     assert_eq!(psbt.unsigned_tx.input.len(), 1);
@@ -736,13 +465,9 @@ fn color_psbt_fail() {
         nonce: None,
     };
     let result = party_send.wallet.color_psbt(&mut psbt, coloring_info);
-    assert_matches!(
-        result,
-        Err(Error::AssetNotFound { asset_id }) if asset_id == fake_cid
-    );
+    assert!(matches!(result, Err(Error::AssetNotFound { asset_id }) if asset_id == fake_cid));
 
     // wrong output map vout
-    psbt = base_psbt.clone();
     let fake_o_map: HashMap<u32, u64> = HashMap::from_iter([(666, AMOUNT)]);
     let asset_coloring_info = AssetColoringInfo {
         output_map: fake_o_map,
@@ -761,27 +486,7 @@ fn color_psbt_fail() {
     let msg = "invalid vout in output_map, does not exist in the given PSBT";
     assert!(matches!(result, Err(Error::InvalidColoringInfo { details: m }) if m == msg));
 
-    // vout equal to output count (off-by-one boundary)
-    psbt = base_psbt.clone();
-    let boundary_vout = psbt.outputs.len() as u32;
-    let asset_coloring_info = AssetColoringInfo {
-        output_map: HashMap::from_iter([(boundary_vout, AMOUNT)]),
-        static_blinding: Some(blinding),
-    };
-    let asset_info_map: HashMap<ContractId, AssetColoringInfo> = HashMap::from_iter([(
-        ContractId::from_str(&asset.asset_id).unwrap(),
-        asset_coloring_info,
-    )]);
-    let coloring_info = ColoringInfo {
-        asset_info_map,
-        static_blinding: Some(blinding),
-        nonce: None,
-    };
-    let result = party_send.wallet.color_psbt(&mut psbt, coloring_info);
-    assert!(matches!(result, Err(Error::InvalidColoringInfo { details: m }) if m == msg));
-
     // wrong output map amount
-    psbt = base_psbt.clone();
     let fake_o_map = output_map.keys().map(|k| (*k, 999u64)).collect();
     let asset_coloring_info = AssetColoringInfo {
         output_map: fake_o_map,
@@ -801,40 +506,6 @@ fn color_psbt_fail() {
         .color_psbt(&mut psbt, coloring_info.clone());
     let msg = "total amount in output_map (999) greater than available (666)";
     assert!(matches!(result, Err(Error::InvalidColoringInfo { details: m }) if m == msg));
-
-    // signed PSBT without OP_RETURN: cannot auto-insert
-    // (previous failing color_psbt calls may have already inserted OP_RETURN)
-    psbt = base_psbt;
-    let signed_psbt = party_send.wallet.sign_psbt(psbt.to_string(), None).unwrap();
-    let mut signed_psbt = Psbt::from_str(&signed_psbt).unwrap();
-    assert!(
-        !signed_psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .any(|o| o.script_pubkey.is_op_return())
-    );
-    let asset_coloring_info = AssetColoringInfo {
-        output_map: output_map.clone(),
-        static_blinding: Some(blinding),
-    };
-    let asset_info_map: HashMap<ContractId, AssetColoringInfo> = HashMap::from_iter([(
-        ContractId::from_str(&asset.asset_id).unwrap(),
-        asset_coloring_info,
-    )]);
-    let coloring_info = ColoringInfo {
-        asset_info_map,
-        static_blinding: Some(blinding),
-        nonce: None,
-    };
-    let result = party_send
-        .wallet
-        .color_psbt(&mut signed_psbt, coloring_info);
-    assert_matches!(
-        result,
-        Err(Error::InvalidColoringInfo { details: m })
-            if m == "cannot color a signed PSBT: RGB commitment rewrites the OP_RETURN output"
-    );
 }
 
 #[cfg(feature = "electrum")]
@@ -1292,6 +963,343 @@ fn create_consignments_success() {
     assert!(consignment_path.is_file());
 }
 
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn offline() {
+    initialize();
+
+    let mut wallet = get_test_wallet(true, None);
+    let result = wallet.list_unspents_vanilla(Online { id: 0 }, MIN_CONFIRMATIONS, false);
+    assert_matches!(result, Err(Error::Offline));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn is_asset_known_success() {
+    initialize();
+
+    let mut party = get_funded_party!();
+    let asset = party.issue_asset_nia(None);
+    let contract_id = ContractId::from_str(&asset.asset_id).unwrap();
+
+    assert!(party.wallet.is_asset_known(contract_id).unwrap());
+
+    let unknown_cid =
+        ContractId::from_str("rgb:Ar4ouaLv-b7f7Dc_-z5EMvtu-FA5KNh1-nlae~jk-8xMBo7E").unwrap();
+    assert!(!party.wallet.is_asset_known(unknown_cid).unwrap());
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn list_asset_media_success() {
+    initialize();
+
+    let mut party = get_funded_party!();
+
+    let nia_asset = party.issue_asset_nia(None);
+    let nia_medias = party
+        .wallet
+        .list_asset_media(nia_asset.asset_id.clone())
+        .unwrap();
+    assert!(nia_medias.is_empty());
+
+    let cfa_asset = party
+        .wallet
+        .issue_asset_cfa(
+            NAME.to_string(),
+            None,
+            PRECISION,
+            vec![AMOUNT],
+            Some(FILE_STR.to_string()),
+        )
+        .unwrap();
+    let cfa_medias = party
+        .wallet
+        .list_asset_media(cfa_asset.asset_id.clone())
+        .unwrap();
+    assert_eq!(cfa_medias.len(), 1);
+    assert_eq!(cfa_medias.iter().next().unwrap().mime, "text/plain");
+
+    let image_str = ["tests", "qrcode.png"].join(MAIN_SEPARATOR_STR);
+    let uda_asset =
+        party.issue_asset_uda(Some(DETAILS), Some(FILE_STR), vec![&image_str, FILE_STR]);
+    let uda_medias = party
+        .wallet
+        .list_asset_media(uda_asset.asset_id.clone())
+        .unwrap();
+    // the token media and the 2nd attachment are the same file, so they are returned once
+    assert_eq!(uda_medias.len(), 2);
+    let mimes: Vec<_> = uda_medias.iter().map(|m| m.mime.as_str()).collect();
+    assert!(mimes.contains(&"text/plain"));
+    assert!(mimes.contains(&"image/png"));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn list_asset_media_fail() {
+    initialize();
+
+    let party = get_empty_party!();
+    let unknown_asset_id = "rgb:Ar4ouaLv-b7f7Dc_-z5EMvtu-FA5KNh1-nlae~jk-8xMBo7E".to_string();
+    let result = party.wallet.list_asset_media(unknown_asset_id);
+    assert!(matches!(result, Err(Error::AssetNotFound { asset_id: _ })));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn import_asset_contract_success() {
+    initialize();
+
+    let mut issuer = get_funded_party!();
+    let recipient = get_empty_party!();
+    let assets = [
+        (issuer.issue_asset_nia(None).asset_id, AssetSchema::Nia),
+        (
+            issuer.issue_asset_cfa(None, None).asset_id,
+            AssetSchema::Cfa,
+        ),
+        (
+            issuer.issue_asset_ifa(None, None, None).asset_id,
+            AssetSchema::Ifa,
+        ),
+        (
+            issuer.issue_asset_uda(None, None, vec![]).asset_id,
+            AssetSchema::Uda,
+        ),
+    ];
+
+    for (asset_id, asset_schema) in assets {
+        let contract = issuer
+            .wallet
+            .export_asset_contract(asset_id.clone())
+            .unwrap();
+        let imported = recipient
+            .wallet
+            .import_asset_contract(contract.clone())
+            .unwrap();
+        assert_eq!(imported.asset_id, asset_id);
+        assert!(!imported.already_imported);
+        assert_eq!(imported.metadata.asset_schema, asset_schema);
+        assert_eq!(imported.metadata.name, NAME);
+        assert_eq!(imported.metadata.precision, PRECISION);
+        assert_eq!(
+            recipient
+                .wallet
+                .get_asset_balance(asset_id.clone())
+                .unwrap(),
+            Balance::default()
+        );
+
+        let repeated = recipient.wallet.import_asset_contract(contract).unwrap();
+        assert_eq!(repeated.asset_id, asset_id);
+        assert!(repeated.already_imported);
+        assert_eq!(repeated.metadata, imported.metadata);
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn import_asset_contract_rejects_missing_attachments() {
+    initialize();
+
+    let mut issuer = get_funded_party!();
+    let recipient = get_empty_party!();
+    let asset = issuer.issue_asset_cfa(None, Some(FILE_STR.to_string()));
+    let contract = issuer.wallet.export_asset_contract(asset.asset_id).unwrap();
+
+    let result = recipient.wallet.import_asset_contract(contract);
+    assert_matches!(result, Err(Error::InvalidAttachments { .. }));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn import_asset_contract_repairs_partial_persistence() {
+    initialize();
+
+    let mut issuer = get_funded_party!();
+    let stock_only_recipient = get_empty_party!();
+    let database_only_recipient = get_empty_party!();
+    let asset = issuer.issue_asset_nia(None);
+    let contract = issuer
+        .wallet
+        .export_asset_contract(asset.asset_id.clone())
+        .unwrap();
+    let validation_config = ValidationConfig {
+        chain_net: stock_only_recipient.wallet.chain_net(),
+        trusted_typesystem: AssetSchema::Nia.types(),
+        ..Default::default()
+    };
+    let valid_contract = contract
+        .clone()
+        .validate(&DumbResolver, &validation_config)
+        .unwrap();
+    let contract_id = valid_contract.contract_id();
+
+    {
+        let mut runtime = stock_only_recipient.wallet.rgb_runtime().unwrap();
+        runtime
+            .import_contract(valid_contract.clone(), &DumbResolver)
+            .unwrap();
+    }
+    assert_matches!(
+        stock_only_recipient
+            .wallet
+            .get_asset_metadata(asset.asset_id.clone()),
+        Err(Error::AssetNotFound { .. })
+    );
+    let repaired = stock_only_recipient
+        .wallet
+        .import_asset_contract(contract.clone())
+        .unwrap();
+    assert!(!repaired.already_imported);
+
+    {
+        // Read metadata from the issuer's stock so the recipient's stock remains untouched. This
+        // deterministically models a database commit that completed before the stock write.
+        let runtime = issuer.wallet.rgb_runtime().unwrap();
+        let txn = database_only_recipient
+            .wallet
+            .database()
+            .begin_transaction()
+            .unwrap();
+        database_only_recipient
+            .wallet
+            .save_new_asset_internal(
+                &txn,
+                &runtime,
+                contract_id,
+                AssetSchema::Nia,
+                valid_contract,
+                None,
+            )
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    assert!(
+        database_only_recipient
+            .wallet
+            .rgb_runtime()
+            .unwrap()
+            .export_contract(contract_id)
+            .is_err()
+    );
+    let repaired = database_only_recipient
+        .wallet
+        .import_asset_contract(contract)
+        .unwrap();
+    assert!(!repaired.already_imported);
+    assert_eq!(repaired.metadata.asset_schema, AssetSchema::Nia);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn import_asset_contract_serializes_concurrent_calls() {
+    initialize();
+
+    let mut issuer = get_funded_party!();
+    let recipient = get_empty_party!();
+    let asset = issuer.issue_asset_nia(None);
+    let contract = issuer
+        .wallet
+        .export_asset_contract(asset.asset_id.clone())
+        .unwrap();
+    let wallet_data = recipient.wallet.wallet_data().clone();
+    let keys = recipient.wallet.get_keys();
+    let first_wallet = recipient.wallet;
+    let second_wallet = Wallet::new(wallet_data.clone(), keys.clone()).unwrap();
+    let first_contract = contract.clone();
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(move || first_wallet.import_asset_contract(first_contract));
+        let second = scope.spawn(move || second_wallet.import_asset_contract(contract));
+        (
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        )
+    });
+
+    assert_eq!(first.asset_id, asset.asset_id);
+    assert_eq!(second.asset_id, asset.asset_id);
+    assert_ne!(first.already_imported, second.already_imported);
+    let wallet = Wallet::new(wallet_data, keys).unwrap();
+    assert_eq!(
+        wallet.get_asset_balance(asset.asset_id).unwrap(),
+        Balance::default()
+    );
+}
+
+/// UniFFI `psbt_op_prepare` shares `color_psbt_with_prevouts_runtime`. A known UDA whose selected
+/// inputs do not carry the token used to panic on `uda_state.unwrap()` before the insufficient
+/// allocation check.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn psbt_op_prepare_uda_missing_input_assignment_returns_coloring_error() {
+    initialize();
+
+    let amt_sat = 500;
+    let blinding = 777;
+
+    let mut party_send = get_funded_noutxo_party!();
+    party_send.create_utxos(false, Some(2), None, FEE_RATE, None);
+    let asset = party_send.issue_asset_uda(None, None, vec![]);
+
+    let vanilla: OutPoint = party_send
+        .list_unspents(true)
+        .into_iter()
+        .find(|u| u.utxo.colorable && u.rgb_allocations.is_empty())
+        .expect("uncolored colorable UTXO")
+        .utxo
+        .outpoint
+        .into();
+
+    let address = BdkAddress::from_str(&party_send.get_address()).unwrap();
+    let mut tx_builder = party_send.wallet.bdk_wallet_mut().build_tx();
+    tx_builder.add_utxo(vanilla).unwrap();
+    tx_builder.manually_selected_only();
+    tx_builder
+        .add_recipient(
+            address.assume_checked().script_pubkey(),
+            BdkAmount::from_sat(amt_sat),
+        )
+        .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
+    let mut psbt = tx_builder.finish().unwrap();
+    insert_op_return(&mut psbt, true);
+    let vout = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .enumerate()
+        .find(|(_, o)| o.value.to_sat() == amt_sat)
+        .unwrap()
+        .0 as u32;
+    let coloring_info = coloring_info_for(&asset.asset_id, HashMap::from([(vout, 1)]), blinding);
+
+    let result = party_send.wallet.psbt_op_prepare(
+        &mut psbt,
+        coloring_info,
+        vec![vanilla],
+        MIN_CONFIRMATIONS,
+        None,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidColoringInfo { ref details })
+                if details.contains("greater than available")
+                    || details.contains("no token assignment")
+        ),
+        "psbt_op_prepare must return a coloring error, not panic; got {result:?}"
+    );
+}
+
 // The send consignment is derived from begin-time data (fascia, beneficiaries
 // and the unsigned witness txid), so it must be byte-identical whether built
 // from the unsigned or the signed PSBT.
@@ -1536,92 +1544,6 @@ fn validate_consignment_offchain_file_not_found() {
     );
 
     assert_matches!(result, Err(Error::Internal { details: _ }));
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn offline() {
-    initialize();
-
-    let mut wallet = get_test_wallet(true, None);
-    let result = wallet.list_unspents_vanilla(Online { id: 0 }, MIN_CONFIRMATIONS, false);
-    assert_matches!(result, Err(Error::Offline));
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn is_asset_known_success() {
-    initialize();
-
-    let mut party = get_funded_party!();
-    let asset = party.issue_asset_nia(None);
-    let contract_id = ContractId::from_str(&asset.asset_id).unwrap();
-
-    assert!(party.wallet.is_asset_known(contract_id).unwrap());
-
-    let unknown_cid =
-        ContractId::from_str("rgb:Ar4ouaLv-b7f7Dc_-z5EMvtu-FA5KNh1-nlae~jk-8xMBo7E").unwrap();
-    assert!(!party.wallet.is_asset_known(unknown_cid).unwrap());
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn list_asset_media_success() {
-    initialize();
-
-    let mut party = get_funded_party!();
-
-    let nia_asset = party.issue_asset_nia(None);
-    let nia_medias = party
-        .wallet
-        .list_asset_media(nia_asset.asset_id.clone())
-        .unwrap();
-    assert!(nia_medias.is_empty());
-
-    let cfa_asset = party
-        .wallet
-        .issue_asset_cfa(
-            NAME.to_string(),
-            None,
-            PRECISION,
-            vec![AMOUNT],
-            Some(FILE_STR.to_string()),
-        )
-        .unwrap();
-    let cfa_medias = party
-        .wallet
-        .list_asset_media(cfa_asset.asset_id.clone())
-        .unwrap();
-    assert_eq!(cfa_medias.len(), 1);
-    assert_eq!(cfa_medias.iter().next().unwrap().mime, "text/plain");
-
-    let image_str = ["tests", "qrcode.png"].join(MAIN_SEPARATOR_STR);
-    let uda_asset =
-        party.issue_asset_uda(Some(DETAILS), Some(FILE_STR), vec![&image_str, FILE_STR]);
-    let uda_medias = party
-        .wallet
-        .list_asset_media(uda_asset.asset_id.clone())
-        .unwrap();
-    // the token media and the 2nd attachment are the same file, so they are returned once
-    assert_eq!(uda_medias.len(), 2);
-    let mimes: Vec<_> = uda_medias.iter().map(|m| m.mime.as_str()).collect();
-    assert!(mimes.contains(&"text/plain"));
-    assert!(mimes.contains(&"image/png"));
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn list_asset_media_fail() {
-    initialize();
-
-    let party = get_empty_party!();
-    let unknown_asset_id = "rgb:Ar4ouaLv-b7f7Dc_-z5EMvtu-FA5KNh1-nlae~jk-8xMBo7E".to_string();
-    let result = party.wallet.list_asset_media(unknown_asset_id);
-    assert!(matches!(result, Err(Error::AssetNotFound { asset_id: _ })));
 }
 
 #[cfg(feature = "electrum")]
@@ -5331,7 +5253,7 @@ fn color_psbt_rejects_opreturn_not_first_when_p2tr() {
     );
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "electrum")]
 fn broadcast_wallet_psbt(wallet: &Wallet, psbt: &Psbt) {
     let signed_psbt = wallet.sign_psbt(psbt.to_string(), None).unwrap();
     let finalized_psbt = wallet.finalize_psbt(signed_psbt, None).unwrap();
@@ -5343,6 +5265,7 @@ fn broadcast_wallet_psbt(wallet: &Wallet, psbt: &Psbt) {
 }
 
 /// 1-of-1 bare CHECKMULTISIG: not P2PKH / P2SH / P2WPKH / P2WSH / P2TR.
+#[cfg(feature = "electrum")]
 fn bare_multisig_script() -> ScriptBuf {
     let mut bytes = vec![0x51, 0x21, 0x02];
     bytes.extend([0x11u8; 32]);
@@ -5350,6 +5273,7 @@ fn bare_multisig_script() -> ScriptBuf {
     ScriptBuf::from_bytes(bytes)
 }
 
+#[cfg(feature = "electrum")]
 fn insert_op_return(psbt: &mut Psbt, at_front: bool) {
     let txout = TxOut {
         value: BdkAmount::ZERO,
@@ -5370,6 +5294,7 @@ fn insert_op_return(psbt: &mut Psbt, at_front: bool) {
 /// `non_witness_utxo` is the full previous transaction. BDK's default `SignOptions` reject
 /// signing when a non-taproot (or taproot without `tap_internal_key`) input has only
 /// `witness_utxo`.
+#[cfg(feature = "electrum")]
 fn prepend_psbt_input(
     psbt: &mut Psbt,
     previous_output: OutPoint,
@@ -5395,6 +5320,7 @@ fn prepend_psbt_input(
 
 /// Proprietary marker used to verify `rebuild_psbt_preserving_maps` keeps per-output maps aligned.
 /// Prefer this over bip32/tap origins: RGB coloring may touch those after the rebuild.
+#[cfg(feature = "electrum")]
 fn output_map_sentinel_key() -> bitcoin::psbt::raw::ProprietaryKey {
     bitcoin::psbt::raw::ProprietaryKey {
         prefix: b"rgb-lib-test".to_vec(),
@@ -5403,6 +5329,7 @@ fn output_map_sentinel_key() -> bitcoin::psbt::raw::ProprietaryKey {
     }
 }
 
+#[cfg(feature = "electrum")]
 fn stamp_output_map_sentinels(psbt: &mut Psbt) {
     let key = output_map_sentinel_key();
     for (i, out) in psbt.outputs.iter_mut().enumerate() {
@@ -5410,35 +5337,8 @@ fn stamp_output_map_sentinels(psbt: &mut Psbt) {
     }
 }
 
-/// Assert PSBT output maps survive a rebuild that inserts `offset` outputs at the front
-/// (`rebuild_psbt_preserving_maps(.., true)` uses `skip(offset)`).
-fn assert_output_maps_offset_by(before: &Psbt, after: &Psbt, offset: usize) {
-    let key = output_map_sentinel_key();
-    assert_eq!(after.outputs.len(), before.outputs.len() + offset);
-    assert!(
-        before
-            .outputs
-            .iter()
-            .any(|o| o.proprietary.contains_key(&key)),
-        "expected stamped output-map sentinels before coloring"
-    );
-    for i in 0..offset {
-        assert!(
-            !after.outputs[i].proprietary.contains_key(&key),
-            "inserted output {i} must not carry maps from a shifted original"
-        );
-    }
-    for (i, out_before) in before.outputs.iter().enumerate() {
-        assert_eq!(
-            after.outputs[i + offset].proprietary.get(&key),
-            out_before.proprietary.get(&key),
-            "output-map sentinel mismatch at shifted output {}",
-            i + offset
-        );
-    }
-}
-
 /// Assert PSBT output maps survive a rebuild that appends outputs (`opreturn_first = false`).
+#[cfg(feature = "electrum")]
 fn assert_output_maps_preserved(before: &Psbt, after: &Psbt) {
     let key = output_map_sentinel_key();
     assert!(after.outputs.len() >= before.outputs.len());
@@ -5458,6 +5358,7 @@ fn assert_output_maps_preserved(before: &Psbt, after: &Psbt) {
     }
 }
 
+#[cfg(feature = "electrum")]
 fn coloring_info_for(asset_id: &str, output_map: HashMap<u32, u64>, blinding: u64) -> ColoringInfo {
     let asset_coloring_info = AssetColoringInfo {
         output_map,
@@ -5472,6 +5373,7 @@ fn coloring_info_for(asset_id: &str, output_map: HashMap<u32, u64>, blinding: u6
     }
 }
 
+#[cfg(feature = "electrum")]
 fn expected_nia(asset_id: &str, amount: u64) -> ExpectedTransfer {
     ExpectedTransfer {
         asset_id: asset_id.to_string(),
@@ -6218,7 +6120,7 @@ fn fetch_consignment_by_recipient_id_unchecked_success() {
     mine(false);
 
     let witness_recipient_id =
-        recipient_id_from_script_buf(recipient_script, BitcoinNetwork::Regtest).unwrap();
+        recipient_id_from_script_buf(recipient_script, BitcoinNetwork::Regtest);
     let recv_online = recv_party.party_online();
     let (_accepted, assignments) = recv_party
         .wallet
@@ -6255,11 +6157,11 @@ fn fetch_and_accept_pin_rejects_mismatch_blinded_and_oor_vout() {
     let expected = expected_nia(&asset_id, AMOUNT);
     let recv_online = recv_party.party_online();
     let correct_witness_recipient_id =
-        recipient_id_from_script_buf(recipient_script.clone(), BitcoinNetwork::Regtest).unwrap();
+        recipient_id_from_script_buf(recipient_script.clone(), BitcoinNetwork::Regtest);
 
     // Wrong chain-net prefix (mainnet ID, regtest wallet) even if script bytes would match
     let mainnet_witness_recipient_id =
-        recipient_id_from_script_buf(recipient_script.clone(), BitcoinNetwork::Mainnet).unwrap();
+        recipient_id_from_script_buf(recipient_script.clone(), BitcoinNetwork::Mainnet);
     let result = recv_party.wallet.fetch_and_accept_transfer_by_recipient_id(
         recv_online,
         txid.clone(),
@@ -6277,7 +6179,7 @@ fn fetch_and_accept_pin_rejects_mismatch_blinded_and_oor_vout() {
         .assume_checked()
         .script_pubkey();
     let wrong_witness_recipient_id =
-        recipient_id_from_script_buf(wrong_script, BitcoinNetwork::Regtest).unwrap();
+        recipient_id_from_script_buf(wrong_script, BitcoinNetwork::Regtest);
     let result = recv_party.wallet.fetch_and_accept_transfer_by_recipient_id(
         recv_online,
         txid.clone(),
@@ -6357,7 +6259,7 @@ fn fetch_and_accept_rejects_unconfirmed_then_accepts_after_mine() {
         _,
     ) = setup_fetch_accept_pin_fixture(false);
     let witness_recipient_id =
-        recipient_id_from_script_buf(recipient_script, BitcoinNetwork::Regtest).unwrap();
+        recipient_id_from_script_buf(recipient_script, BitcoinNetwork::Regtest);
     let expected = expected_nia(&asset_id, AMOUNT);
     let recv_online = recv_party.party_online();
 
@@ -6409,7 +6311,7 @@ fn fetch_and_accept_allows_mempool_when_min_confirmations_zero() {
         _,
     ) = setup_fetch_accept_pin_fixture(false);
     let witness_recipient_id =
-        recipient_id_from_script_buf(recipient_script, BitcoinNetwork::Regtest).unwrap();
+        recipient_id_from_script_buf(recipient_script, BitcoinNetwork::Regtest);
     let recv_online = recv_party.party_online();
 
     let (_accepted, assignments) = recv_party

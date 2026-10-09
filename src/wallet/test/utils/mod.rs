@@ -5,5 +5,5 @@ pub(super) mod api;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(super) mod chain;
 pub(crate) mod helpers;
-#[cfg(feature = "vss")]
+#[cfg(all(feature = "vss", feature = "electrum"))]
 pub(super) mod vss;

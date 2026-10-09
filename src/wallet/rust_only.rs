@@ -1,18 +1,22 @@
-//! Rust-only functionality.
+//! Extra wallet helpers for special flows (color PSBT, post consignment, indexer checks).
 //!
-//! This module defines additional utility methods that are not exposed via FFI.
+//! Includes submarine / HTLC helpers (`color_psbt_for_outpoints*`, `psbt_op_prepare` /
+//! `psbt_op_apply` / `psbt_op_abort` / `psbt_op_reconcile`, `fetch_and_accept_transfer_by_recipient_id`,
+//! `contract_assignments_for_outpoints`) that operate on escrow outpoints without treating
+//! them as wallet UTXOs.
+//!
+//! UniFFI exports [`Wallet::psbt_op_prepare`], [`Wallet::psbt_op_apply`], [`Wallet::psbt_op_abort`],
+//! [`Wallet::psbt_op_reconcile`], [`Wallet::fetch_and_accept_transfer_by_recipient_id`], and
+//! [`Wallet::contract_assignments_for_outpoints`].
+//! Low-level `color_psbt_*` / `consume_transfer_fascia` and unchecked fetch/accept stay rust-only.
 
 use super::*;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-use crate::utils::{recipient_id_from_script_buf, script_buf_from_recipient_id};
 use bdk_wallet::bitcoin::Transaction;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
 use rgbstd::Operation as _;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use serde::{Deserialize, Serialize};
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-use std::io::Write;
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 const PSBT_OPS_DIR: &str = "psbt_ops";
@@ -39,10 +43,7 @@ fn persist_stash_consumed_marker(path: &Path) -> Result<(), Error> {
 }
 
 #[cfg(all(unix, any(feature = "electrum", feature = "esplora")))]
-fn fsync_parent_dir(path: &Path) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)?.sync_all()?;
-    }
+fn fsync_parent_dir(_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
@@ -144,11 +145,16 @@ pub struct ImportAssetContractResult {
 pub type AssetBeneficiariesMap = BTreeMap<ContractId, Vec<BuilderSeal<GraphSeal>>>;
 
 /// Result of [`Wallet::color_psbt_and_prepare_consume`] / [`Wallet::color_psbt_for_outpoints_and_prepare_consume`].
+///
+/// Consignments are ready to post, but the RGB stash is **not** updated until
+/// [`Wallet::consume_transfer_fascia`] (after broadcast). While
+/// [`ColorPrepareResult::batch_transfer_idx`] is [`TransferStatus::Initiated`],
+/// [`Wallet::fail_transfers`] can roll the DB reservation back if the tx never lands.
 #[derive(Debug)]
 pub struct ColorPrepareResult {
-    /// Per-asset consignments built from the fascia (before stash consume).
+    /// Per-asset consignments before stash consumption.
     pub transfers: Vec<RgbTransfer>,
-    /// Fallible batch transfer created for recovery via `fail_transfers`.
+    /// Recoverable batch transfer.
     pub batch_transfer_idx: i32,
 }
 
@@ -214,6 +220,9 @@ pub struct PsbtOperation {
 }
 
 /// Caller intent for HTLC / special accept paths.
+///
+/// Acceptance rejects consignments that do not match these fields, including an empty
+/// assignment result for the witness seal.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedTransfer {
@@ -304,6 +313,23 @@ fn psbt_has_input_signatures(psbt: &Psbt) -> bool {
     })
 }
 
+/// Pin a witness UTXO to `witness_recipient_id` by checking that `output[vout]`'s
+/// script matches the recipient ID, and that the witness meets `min_confirmations`.
+///
+/// Errors (actionable for HTLC callers):
+/// - [`Error::InvalidRecipientID`]: blinded ID (no script to pin)
+/// - [`Error::InvalidRecipientNetwork`]: recipient ID network ≠ wallet chain
+/// - [`Error::WitnessOutputMismatch`]: wrong script / bad vout / Ignored|Archived
+/// - [`Error::InsufficientConfirmations`]: Tentative or too few confs (retry/wait)
+///
+/// Confirmation policy:
+/// - `0`: allow a mempool-only / [`WitnessOrd::Tentative`] witness. Intentional for
+///   HTLC claim/refund paths that must race on first sight of the witness; the
+///   caller accepts reorg/RBF exposure.
+/// - `>= 1`: require [`WitnessOrd::Mined`] and at least that many confirmations,
+///   derived as `tip_height - mined_height + 1` (same tip query as the indexer
+///   height API). Avoids a second `get_tx_confirmations` round trip that can
+///   disagree with `resolve_witness` across a block boundary.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 fn pin_witness_output_to_recipient_id(
     resolver: &AnyResolver,
@@ -735,8 +761,20 @@ impl Wallet {
 
     /// Color a PSBT.
     ///
-    /// With P2TR, OP_RETURN is at vout 0 and `output_map` keys are pre-OP_RETURN indices. Signed
-    /// inputs are rejected.
+    /// # `output_map` index convention (differs from [`Self::color_psbt_for_outpoints`])
+    ///
+    /// Keys are PSBT output indices. When any output is P2TR (RGB `OpretFirst`), OP_RETURN is
+    /// placed at vout 0 (inserted if missing) and keys are treated as **pre-OP_RETURN** indices:
+    /// they are shifted by +1 internally. That applies even if OP_RETURN was already present at
+    /// vout 0. With P2TR, a pre-existing OP_RETURN at index > 0 is rejected (would silently
+    /// mis-seal under the +1 rule). With no P2TR, OP_RETURN is appended and keys are final.
+    ///
+    /// Sibling API: [`Self::color_psbt_for_outpoints`] always takes **final** vouts and never
+    /// shifts. Passing the wrong base places a seal on the wrong output with **no error**.
+    ///
+    /// Coloring must happen **before** any input is signed. Partial signatures (including
+    /// `SIGHASH_SINGLE|ANYONECANPAY` on HTLC paths) are rejected because embedding the RGB
+    /// commitment rewrites the OP_RETURN output and invalidates existing sighashes.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
@@ -1017,53 +1055,14 @@ impl Wallet {
     /// under the wallet transfer dir and a [`TransferStatus::Initiated`] batch is written so
     /// [`crate::wallet::Wallet::fail_transfers`] can roll back if the tx is never broadcast.
     /// Call [`Self::consume_transfer_fascia`] with [`ColorPrepareResult::batch_transfer_idx`]
-    /// **after** broadcast (the indexer must see the tx) to apply the fascia to the RGB stash.
+    /// **after** broadcast to apply the fascia to the RGB stash.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
-    pub fn color_psbt_and_prepare_consume(
-        &self,
-        psbt: &mut Psbt,
-        coloring_info: ColoringInfo,
-        min_confirmations: u8,
-        expiration_timestamp: Option<u64>,
-    ) -> Result<ColorPrepareResult, Error> {
-        info!(self.logger(), "Coloring PSBT and preparing consume...");
-        let prev_outputs = psbt
-            .unsigned_tx
-            .input
-            .iter()
-            .map(|txin| txin.previous_output)
-            .collect::<HashSet<OutPoint>>();
-        let mut runtime = self.rgb_runtime()?;
-        // checked before `prepare_psbt_for_coloring`, which would otherwise insert an OP_RETURN
-        // into the caller's PSBT on the way to failing
-        self.reject_uncolored_input_contracts(&runtime, &prev_outputs, &coloring_info)?;
-        let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
-        let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(
-            &runtime,
-            psbt,
-            coloring_info.clone(),
-            prev_outputs.clone(),
-            true,
-            shift_output_map_for_opreturn_first,
-        )?;
-        let result = self.prepare_color_and_transfer_runtime(
-            &mut runtime,
-            psbt,
-            fascia,
-            asset_beneficiaries,
-            &prev_outputs,
-            &coloring_info,
-            shift_output_map_for_opreturn_first,
-            min_confirmations,
-            expiration_timestamp,
-        )?;
-        info!(self.logger(), "Color PSBT prepare-consume completed");
-        Ok(result)
-    }
-
+    /// Shared setup for [`Self::color_psbt_for_outpoints`] and
+    /// [`Self::color_psbt_for_outpoints_and_prepare_consume`]: empty/subset checks, validate allocations,
+    /// prepare PSBT. Returns `(runtime, override_set)`.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn prepare_color_psbt_for_outpoints(
         &self,
@@ -1148,34 +1147,6 @@ impl Wallet {
         result
     }
 
-    /// Refuse to spend inputs carrying allocations for contracts absent from `coloring_info`.
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
-    fn reject_uncolored_input_contracts(
-        &self,
-        runtime: &RgbRuntime,
-        inputs: &HashSet<OutPoint>,
-        coloring_info: &ColoringInfo,
-    ) -> Result<(), Error> {
-        let colored_contracts: BTreeSet<ContractId> =
-            coloring_info.asset_info_map.keys().copied().collect();
-        let assigning = runtime.contracts_assigning(inputs.iter().copied())?;
-        let uncolored: Vec<ContractId> =
-            assigning.difference(&colored_contracts).copied().collect();
-        if !uncolored.is_empty() {
-            let contracts = uncolored
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(Error::InvalidColoringInfo {
-                details: format!(
-                    "PSBT inputs carry RGB allocations for contracts not listed in coloring_info: {contracts}"
-                ),
-            });
-        }
-        Ok(())
-    }
-
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn validate_color_psbt_for_outpoints_inputs(
         &self,
@@ -1225,65 +1196,14 @@ impl Wallet {
     ///
     /// Same recovery model as [`Self::color_psbt_and_prepare_consume`]: stash is updated only by
     /// [`Self::consume_transfer_fascia`] after broadcast; use `fail_transfers` if the tx is dropped.
-    /// `min_confirmations` and `expiration_timestamp` have the same meaning as there.
     ///
     /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
-    pub fn color_psbt_for_outpoints_and_prepare_consume(
-        &self,
-        psbt: &mut Psbt,
-        coloring_info: ColoringInfo,
-        input_outpoints: Vec<OutPoint>,
-        min_confirmations: u8,
-        expiration_timestamp: Option<u64>,
-    ) -> Result<ColorPrepareResult, Error> {
-        info!(self.logger(), "Coloring PSBT and preparing consume...");
-        let (mut runtime, override_set) =
-            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
-        let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(
-            &runtime,
-            psbt,
-            coloring_info.clone(),
-            override_set.clone(),
-            true,
-            false,
-        )?;
-        let result = self.prepare_color_and_transfer_runtime(
-            &mut runtime,
-            psbt,
-            fascia,
-            asset_beneficiaries,
-            &override_set,
-            &coloring_info,
-            false,
-            min_confirmations,
-            expiration_timestamp,
-        )?;
-        info!(self.logger(), "Color PSBT prepare-consume completed");
-        Ok(result)
-    }
-
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
-    fn mark_psbt_inputs_spent(&self, txn: &DbTxn, psbt: &Psbt) -> Result<(), Error> {
-        for input in &psbt.unsigned_tx.input {
-            let outpoint = Outpoint {
-                txid: input.previous_output.txid.to_string(),
-                vout: input.previous_output.vout,
-            };
-            if let Some(db_txo) = txn.get_txo(&outpoint)? {
-                let mut db_txo: DbTxoActMod = db_txo.into();
-                db_txo.spent = ActiveValue::Set(true);
-                txn.update_txo(db_txo)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Apply a fascia previously prepared by [`Self::color_psbt_and_prepare_consume`] (or the outpoints
     /// variant) into the RGB stash after the Bitcoin tx has been broadcast.
     ///
-    /// <div class="warning">This method is meant for special usage and is normally not needed, use
-    /// it only if you know what you're doing</div>
+    /// Updates the batch to [`TransferStatus::WaitingConfirmations`]. The batch must still be
+    /// [`TransferStatus::Initiated`].
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub fn consume_transfer_fascia(
         &mut self,
@@ -1684,6 +1604,16 @@ impl Wallet {
     /// payloads under `psbt_ops/{operation_id}/`, and persist SQL accounting for colored contracts.
     /// `expiration_timestamp` defaults to [`PSBT_OP_DEFAULT_EXPIRATION_SECS`] from now.
     ///
+    /// `output_map` keys are **final** PSBT vouts (same as [`Self::color_psbt_for_outpoints`]).
+    /// Foreign escrow outpoints are listed in `escrow.json` (write-only audit log for integrators;
+    /// the library never reads it back) and are **not** inserted as wallet TXOs / Input colorings.
+    /// Wallet-owned destinations in `output_map` still get Change/Send rows so
+    /// `get_asset_balance` / `list_unspents` stay consistent after claim.
+    /// RGB stash is unchanged until [`Self::psbt_op_apply`].
+    ///
+    /// Other files under the op dir (`colored.psbt`, `consignments/*.rgb`) are also write-only
+    /// artifacts for the caller; only `fascia` and `meta.json` are read by later HTLC methods.
+    ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -1867,6 +1797,10 @@ impl Wallet {
 
     /// Apply a prepared HTLC operation's fascia into the RGB stash after broadcast.
     ///
+    /// Order: validate linked batch (if any) → `consume_fascia` → SQL status → `meta.json`.
+    /// Reordering cannot make stock+SQL crash-atomic; a durable journal is a follow-up. This
+    /// order at least fails closed before mutating the stash when the batch is not `Initiated`.
+    ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -1993,6 +1927,8 @@ impl Wallet {
     ///
     /// After a broadcast attempt rollback is refused until the batch transfer expires; past that
     /// the indexer decides, as for [`TransferStatus::WaitingBroadcast`].
+    ///
+    /// Rolls back a linked Initiated batch via `fail_transfers` when present.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
@@ -2315,331 +2251,21 @@ impl Wallet {
         Ok(meta.status)
     }
 
+    /// Build consignments, persist an [`TransferStatus::Initiated`] batch + fascia on disk.
+    /// Does **not** call `consume_fascia` (send-path ordering: recover via `fail_transfers` until
+    /// [`Self::consume_transfer_fascia`] after broadcast).
     #[cfg(any(feature = "electrum", feature = "esplora"))]
-    fn prepare_color_and_transfer_runtime(
-        &self,
-        runtime: &mut RgbRuntime,
-        psbt: &Psbt,
-        fascia: Fascia,
-        asset_beneficiaries: AssetBeneficiariesMap,
-        prev_outputs: &HashSet<OutPoint>,
-        coloring_info: &ColoringInfo,
-        shift_output_map_for_opreturn_first: bool,
-        min_confirmations: u8,
-        expiration_timestamp: Option<u64>,
-    ) -> Result<ColorPrepareResult, Error> {
-        let witness_txid = psbt.get_txid();
-        let mut transfers = vec![];
-        let mut spent: HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>> = HashMap::new();
-
-        for (contract_id, beneficiaries) in &asset_beneficiaries {
-            let mut by_outpoint: HashMap<OutPoint, Vec<Assignment>> = HashMap::new();
-            for (explicit_seal, opout_state_map) in
-                runtime.contract_assignments_for(*contract_id, prev_outputs.iter().copied())?
-            {
-                let outpoint = explicit_seal.to_outpoint();
-                for (opout, state) in opout_state_map {
-                    by_outpoint
-                        .entry(outpoint)
-                        .or_default()
-                        .push(Assignment::from_opout_and_state(opout, &state));
-                }
-            }
-            spent.insert(*contract_id, by_outpoint);
-
-            let mut beneficiaries_witness = vec![];
-            let mut beneficiaries_blinded = vec![];
-            for builder_seal in beneficiaries {
-                match builder_seal {
-                    BuilderSeal::Revealed(seal) => {
-                        let explicit_seal = ExplicitSeal::with(witness_txid, seal.vout);
-                        beneficiaries_witness.push(explicit_seal);
-                    }
-                    BuilderSeal::Concealed(secret_seal) => {
-                        beneficiaries_blinded.push(*secret_seal);
-                    }
-                };
-            }
-            transfers.push(runtime.transfer_from_fascia(
-                *contract_id,
-                beneficiaries_witness,
-                beneficiaries_blinded,
-                &fascia,
-            )?);
-        }
-
-        let txid = psbt.unsigned_tx.compute_txid().to_string();
-        let batch_transfer_idx = self.persist_color_prepare_batch(
-            psbt,
-            &txid,
-            &spent,
-            &fascia,
-            coloring_info,
-            shift_output_map_for_opreturn_first,
-            min_confirmations,
-            expiration_timestamp,
-            true,
-            runtime,
-        )?;
-        self.trigger_auto_backup();
-        Ok(ColorPrepareResult {
-            transfers,
-            batch_transfer_idx,
-        })
-    }
-
     #[cfg(any(feature = "electrum", feature = "esplora"))]
-    fn persist_color_prepare_batch(
-        &self,
-        psbt: &Psbt,
-        txid: &str,
-        spent: &HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>>,
-        fascia: &Fascia,
-        coloring_info: &ColoringInfo,
-        shift_output_map_for_opreturn_first: bool,
-        min_confirmations: u8,
-        expiration_timestamp: Option<u64>,
-        allow_consume_transfer_fascia: bool,
-        runtime: &RgbRuntime,
-    ) -> Result<i32, Error> {
-        let transfer_dir = self.get_transfer_dir(txid);
-        fs::create_dir_all(&transfer_dir)?;
-        let fascia_path = transfer_dir.join(FASCIA_FILE);
-        let serialized_fascia = serde_json::to_string(fascia).map_err(InternalError::from)?;
-        fs::write(fascia_path, serialized_fascia)?;
-        fs::write(transfer_dir.join(UNSIGNED_PSBT_FILE), psbt.to_string())?;
-        if allow_consume_transfer_fascia {
-            fs::write(transfer_dir.join(COLOR_PREPARE_FILE), b"")?;
-        }
-
-        let created_at = now().unix_timestamp();
-        let bitcoin_network = self.bitcoin_network();
-        let txn = self.database().begin_transaction()?;
-        let incoming_witness_scripts = Self::incoming_witness_receive_script_hexes(&txn)?;
-        if let Some(existing) =
-            txn.get_batch_transfers_by_txid(txid)?
-                .into_iter()
-                .find(|batch_transfer| {
-                    !batch_transfer.incoming
-                        && matches!(
-                            batch_transfer.status,
-                            TransferStatus::Initiated
-                                | TransferStatus::WaitingConfirmations
-                                | TransferStatus::Settled
-                        )
-                })
-        {
-            return Err(Error::BatchTransferAlreadyExists {
-                txid: txid.to_string(),
-                idx: existing.idx,
-            });
-        }
-        let batch_transfer = DbBatchTransferActMod {
-            txid: ActiveValue::Set(Some(txid.to_string())),
-            status: ActiveValue::Set(TransferStatus::Initiated),
-            expiration: ActiveValue::Set(expiration_timestamp.map(|t| t as i64)),
-            created_at: ActiveValue::Set(created_at),
-            min_confirmations: ActiveValue::Set(min_confirmations),
-            incoming: ActiveValue::Set(false),
-            ..Default::default()
-        };
-        let batch_transfer_idx = txn.set_batch_transfer(batch_transfer)?;
-
-        for (contract_id, by_outpoint) in spent {
-            let asset_id = contract_id.to_string();
-            let asset_schema = AssetSchema::get_from_contract_id(*contract_id, runtime)?;
-            let asset_transfer = DbAssetTransferActMod {
-                user_driven: ActiveValue::Set(true),
-                batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
-                asset_id: ActiveValue::Set(Some(asset_id)),
-                ..Default::default()
-            };
-            let asset_transfer_idx = txn.set_asset_transfer(asset_transfer)?;
-
-            for (outpoint, assignments) in by_outpoint {
-                let outpoint: Outpoint = (*outpoint).into();
-                let Some(txo) = txn.get_txo(&outpoint)? else {
-                    continue;
-                };
-                let txo_idx = txo.idx;
-
-                for assignment in assignments {
-                    let db_coloring = DbColoringActMod {
-                        txo_idx: ActiveValue::Set(txo_idx),
-                        asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-                        r#type: ActiveValue::Set(ColoringType::Input),
-                        assignment: ActiveValue::Set(assignment.clone()),
-                        ..Default::default()
-                    };
-                    txn.set_coloring(db_coloring)?;
-                }
-            }
-
-            let mut external_destinations: Vec<(u32, u64, String)> = Vec::new();
-            let mut change_destinations: Vec<(u32, u64, String)> = Vec::new();
-            if let Some(asset_coloring) = coloring_info.asset_info_map.get(contract_id) {
-                for (mut vout, amount) in BTreeMap::from_iter(asset_coloring.output_map.clone()) {
-                    if amount == 0 {
-                        continue;
-                    }
-                    if shift_output_map_for_opreturn_first {
-                        vout += 1;
-                    }
-                    if vout as usize >= psbt.unsigned_tx.output.len() {
-                        return Err(Error::InvalidColoringInfo {
-                            details: s!(
-                                "invalid vout in output_map, does not exist in the given PSBT"
-                            ),
-                        });
-                    }
-                    let txout = &psbt.unsigned_tx.output[vout as usize];
-                    if txout.script_pubkey.is_op_return() {
-                        return Err(Error::InvalidColoringInfo {
-                            details: format!(
-                                "output_map vout {vout} points to the OP_RETURN output"
-                            ),
-                        });
-                    }
-                    let recipient_id = recipient_id_from_script_buf(
-                        txout.script_pubkey.clone(),
-                        bitcoin_network,
-                    )
-                    .map_err(|_| Error::InvalidColoringInfo {
-                        details: format!(
-                            "output_map vout {vout} script is not a standard address payload"
-                        ),
-                    })?;
-                    let output_assignment =
-                        Self::assignment_for_coloring_output(asset_schema, amount);
-                    let owned_by_witness_receive =
-                        incoming_witness_scripts.contains(&txout.script_pubkey.to_hex_string());
-                    // Skip Change when an open witness_receive already owns this script.
-                    if self.bdk_wallet().is_mine(txout.script_pubkey.clone())
-                        && !owned_by_witness_receive
-                    {
-                        let outpoint = Outpoint {
-                            txid: txid.to_string(),
-                            vout,
-                        };
-                        let txo_idx = match txn.get_txo(&outpoint)? {
-                            Some(txo) => txo.idx,
-                            None => {
-                                let db_utxo = DbTxoActMod {
-                                    txid: ActiveValue::Set(txid.to_string()),
-                                    vout: ActiveValue::Set(vout),
-                                    btc_amount: ActiveValue::Set(txout.value.to_sat().to_string()),
-                                    spent: ActiveValue::Set(false),
-                                    exists: ActiveValue::Set(false),
-                                    pending_witness: ActiveValue::Set(false),
-                                    ..Default::default()
-                                };
-                                txn.set_txo(db_utxo)?
-                            }
-                        };
-                        let db_coloring = DbColoringActMod {
-                            txo_idx: ActiveValue::Set(txo_idx),
-                            asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-                            r#type: ActiveValue::Set(ColoringType::Change),
-                            assignment: ActiveValue::Set(output_assignment.clone()),
-                            ..Default::default()
-                        };
-                        txn.set_coloring(db_coloring)?;
-                        change_destinations.push((vout, amount, recipient_id));
-                    } else {
-                        external_destinations.push((vout, amount, recipient_id));
-                    }
-                }
-            }
-
-            let transfer_destinations = if !external_destinations.is_empty() {
-                external_destinations
-            } else {
-                change_destinations
-            };
-
-            if transfer_destinations.is_empty() {
-                let first_assignment = by_outpoint.values().flatten().next().cloned();
-                txn.set_transfer(DbTransferActMod {
-                    asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-                    requested_assignment: ActiveValue::Set(first_assignment),
-                    recipient_id: ActiveValue::Set(Some(format!("color:{txid}"))),
-                    recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness {
-                        vout: None,
-                        recipient_nonce: vec![],
-                    })),
-                    ..Default::default()
-                })?;
-            } else {
-                for (vout, amount, recipient_id) in transfer_destinations {
-                    let requested = Self::assignment_for_coloring_output(asset_schema, amount);
-                    txn.set_transfer(DbTransferActMod {
-                        asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-                        requested_assignment: ActiveValue::Set(Some(requested)),
-                        recipient_id: ActiveValue::Set(Some(recipient_id)),
-                        recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness {
-                            vout: Some(vout),
-                            recipient_nonce: vec![],
-                        })),
-                        ..Default::default()
-                    })?;
-                }
-            }
-        }
-
-        self.update_backup_info(&txn, false)?;
-        txn.commit()?;
-        Ok(batch_transfer_idx)
-    }
-
+    /// Map a coloring `output_map` amount to the SQL [`Assignment`] for this schema.
+    ///
+    /// `output_map` only carries fungible amounts / UDA presence (1). Explicit inflation-right
+    /// destinations are not expressible via this map; those remain a follow-up for a richer API.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn assignment_for_coloring_output(asset_schema: AssetSchema, amount: u64) -> Assignment {
         match asset_schema {
             AssetSchema::Uda => Assignment::NonFungible,
             AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa => Assignment::Fungible(amount),
         }
-    }
-
-    /// Scripts reserved by an open `witness_receive` (pending-script row or in-flight incoming
-    /// witness invoice). Color-prepare must not project Change onto these outputs.
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
-    fn incoming_witness_receive_script_hexes(txn: &DbTxn) -> Result<HashSet<String>, Error> {
-        let mut scripts: HashSet<String> = txn
-            .iter_pending_witness_scripts()?
-            .into_iter()
-            .map(|row| row.script)
-            .collect();
-
-        let batch_transfers = txn.iter_batch_transfers()?;
-        let asset_transfers = txn.iter_asset_transfers()?;
-        let transfers = txn.iter_transfers()?;
-        let in_flight_incoming: HashSet<i32> = batch_transfers
-            .iter()
-            .filter(|bt| bt.incoming && !bt.status.settled() && !bt.status.failed())
-            .map(|bt| bt.idx)
-            .collect();
-        let in_flight_asset: HashSet<i32> = asset_transfers
-            .iter()
-            .filter(|at| in_flight_incoming.contains(&at.batch_transfer_idx))
-            .map(|at| at.idx)
-            .collect();
-        for transfer in &transfers {
-            if !in_flight_asset.contains(&transfer.asset_transfer_idx) {
-                continue;
-            }
-            if !matches!(
-                transfer.recipient_type,
-                Some(RecipientTypeFull::Witness { .. })
-            ) {
-                continue;
-            }
-            let Some(ref recipient_id) = transfer.recipient_id else {
-                continue;
-            };
-            if let Ok(Some(script)) = script_buf_from_recipient_id(recipient_id.clone()) {
-                scripts.insert(script.to_hex_string());
-            }
-        }
-        Ok(scripts)
     }
 
     /// Inspect arbitrary outpoints for assignments of a given contract.
@@ -2724,6 +2350,19 @@ impl Wallet {
 
     /// Fetch a consignment by proxy key, pin the witness output to `witness_recipient_id`, and
     /// accept the transfer.
+    ///
+    /// `proxy_recipient_id` is the proxy lookup key (often the witness TXID). `witness_recipient_id`
+    /// must be a witness recipient ID (`bc:wvout:...`) whose script is checked against
+    /// `output[vout]` on the witness transaction before acceptance. Blinded recipient IDs cannot
+    /// be pinned here; use the Rust-only [`Self::fetch_consignment_by_recipient_id_unchecked`] /
+    /// [`Self::accept_transfer_from_consignment_unchecked`] pair with your own pin check.
+    ///
+    /// `expected` binds acceptance to the caller's intended contract, schema, assignment type, and
+    /// amount; mismatches and empty assignment results are rejected.
+    ///
+    /// `min_confirmations` controls whether an unconfirmed (mempool / Tentative) witness is
+    /// accepted: `0` allows it (reorg-exposed, useful for HTLC races); `>= 1` requires a mined
+    /// witness with at least that many confirmations (`tip - mined_height + 1`).
     ///
     /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -2841,41 +2480,16 @@ impl Wallet {
         self.accept_transfer_with_consignment(consignment, witness_id, vout, blinding, None)
     }
 
-    /// Accept an RGB transfer using a TXID to retrieve its consignment from the proxy.
-    ///
-    /// <div class="warning">This method is meant for special usage and is normally not needed, use
-    /// it only if you know what you're doing</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
-    pub fn accept_transfer(
-        &mut self,
-        online: Online,
-        txid: String,
-        vout: u32,
-        consignment_endpoint: &str,
-        blinding: u64,
-    ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
-        info!(self.logger(), "Accepting transfer...");
-        self.check_online(online)?;
-        let witness_id = RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;
-        let proxy_url = TransportEndpoint::new(consignment_endpoint.to_string())?.endpoint;
-
-        let consignment_res = self.get_consignment(&proxy_url, txid.clone())?;
-        let consignment_bytes = general_purpose::STANDARD
-            .decode(consignment_res.consignment)
-            .map_err(InternalError::from)?;
-        let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
-
-        let (consignment, assignments, _media_digests) =
-            self.accept_transfer_with_consignment(consignment, witness_id, vout, blinding, None)?;
-        Ok((consignment, assignments))
-    }
-
     /// Accept an RGB transfer from a pre-fetched consignment.
     ///
     /// **Unchecked:** `txid` and `vout` define the witness anchor used for validation but are
     /// not re-checked against a recipient ID or the blockchain. Prefer
     /// [`Self::fetch_and_accept_transfer_by_recipient_id`]. If composing manually, pin first
     /// (see [`Self::fetch_consignment_by_recipient_id_unchecked`]).
+    ///
+    /// `expected` must match the consignment contract, schema, and the single assignment revealed
+    /// for `(txid, vout, blinding)`; empty or mismatched assignments are rejected before the
+    /// transfer is accepted into the stash.
     ///
     /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -3200,7 +2814,7 @@ impl Wallet {
         info!(self.logger(), "Listing unspents vanilla...");
         let txn = self.database().begin_transaction()?;
         self.sync_if_requested(&txn, Some(online), skip_sync, KeychainKind::Internal)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
 
         let unspents = self.internal_unspents();
 
@@ -3309,7 +2923,7 @@ impl Wallet {
         )?;
 
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
 
         info!(self.logger(), "Send (end) db update only completed");
@@ -3318,6 +2932,533 @@ impl Wallet {
             batch_transfer_idx,
             entropy: info_contents.entropy,
         })
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl Wallet {
+    /// Color a PSBT and persist recovery data before broadcast and stash consumption.
+    pub fn color_psbt_and_prepare_consume(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<ColorPrepareResult, Error> {
+        info!(self.logger(), "Coloring PSBT and preparing consume...");
+        let prev_outputs = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|txin| txin.previous_output)
+            .collect::<HashSet<OutPoint>>();
+        let mut runtime = self.rgb_runtime()?;
+        // checked before `prepare_psbt_for_coloring`, which would otherwise insert an OP_RETURN
+        // into the caller's PSBT on the way to failing
+        self.reject_uncolored_input_contracts(&runtime, &prev_outputs, &coloring_info)?;
+        let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
+        let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(
+            &runtime,
+            psbt,
+            coloring_info.clone(),
+            prev_outputs.clone(),
+            true,
+            shift_output_map_for_opreturn_first,
+        )?;
+        let result = self.prepare_color_and_transfer_runtime(
+            &mut runtime,
+            psbt,
+            fascia,
+            asset_beneficiaries,
+            &prev_outputs,
+            &coloring_info,
+            shift_output_map_for_opreturn_first,
+            min_confirmations,
+            expiration_timestamp,
+        )?;
+        info!(self.logger(), "Color PSBT prepare-consume completed");
+        Ok(result)
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl Wallet {
+    fn reject_uncolored_input_contracts(
+        &self,
+        runtime: &RgbRuntime,
+        inputs: &HashSet<OutPoint>,
+        coloring_info: &ColoringInfo,
+    ) -> Result<(), Error> {
+        let colored_contracts: BTreeSet<ContractId> =
+            coloring_info.asset_info_map.keys().copied().collect();
+        let assigning = runtime.contracts_assigning(inputs.iter().copied())?;
+        let uncolored: Vec<ContractId> =
+            assigning.difference(&colored_contracts).copied().collect();
+        if !uncolored.is_empty() {
+            let contracts = uncolored
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::InvalidColoringInfo {
+                details: format!(
+                    "PSBT inputs carry RGB allocations for contracts not listed in coloring_info: {contracts}"
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl Wallet {
+    /// Color selected input outpoints and persist recovery data before stash consumption.
+    pub fn color_psbt_for_outpoints_and_prepare_consume(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        input_outpoints: Vec<OutPoint>,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<ColorPrepareResult, Error> {
+        info!(self.logger(), "Coloring PSBT and preparing consume...");
+        let (mut runtime, override_set) =
+            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
+        let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(
+            &runtime,
+            psbt,
+            coloring_info.clone(),
+            override_set.clone(),
+            true,
+            false,
+        )?;
+        let result = self.prepare_color_and_transfer_runtime(
+            &mut runtime,
+            psbt,
+            fascia,
+            asset_beneficiaries,
+            &override_set,
+            &coloring_info,
+            false,
+            min_confirmations,
+            expiration_timestamp,
+        )?;
+        info!(self.logger(), "Color PSBT prepare-consume completed");
+        Ok(result)
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl Wallet {
+    fn mark_psbt_inputs_spent(&self, txn: &DbTxn, psbt: &Psbt) -> Result<(), Error> {
+        for input in &psbt.unsigned_tx.input {
+            let outpoint = Outpoint {
+                txid: input.previous_output.txid.to_string(),
+                vout: input.previous_output.vout,
+            };
+            if let Some(db_txo) = txn.get_txo(&outpoint)? {
+                let mut db_txo: DbTxoActMod = db_txo.into();
+                db_txo.spent = ActiveValue::Set(true);
+                txn.update_txo(db_txo)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl Wallet {
+    fn prepare_color_and_transfer_runtime(
+        &self,
+        runtime: &mut RgbRuntime,
+        psbt: &Psbt,
+        fascia: Fascia,
+        asset_beneficiaries: AssetBeneficiariesMap,
+        prev_outputs: &HashSet<OutPoint>,
+        coloring_info: &ColoringInfo,
+        shift_output_map_for_opreturn_first: bool,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<ColorPrepareResult, Error> {
+        let witness_txid = psbt.get_txid();
+        let mut transfers = vec![];
+        let mut spent: HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>> = HashMap::new();
+
+        for (contract_id, beneficiaries) in &asset_beneficiaries {
+            let mut by_outpoint: HashMap<OutPoint, Vec<Assignment>> = HashMap::new();
+            for (explicit_seal, opout_state_map) in
+                runtime.contract_assignments_for(*contract_id, prev_outputs.iter().copied())?
+            {
+                let outpoint = explicit_seal.to_outpoint();
+                for (opout, state) in opout_state_map {
+                    by_outpoint
+                        .entry(outpoint)
+                        .or_default()
+                        .push(Assignment::from_opout_and_state(opout, &state));
+                }
+            }
+            spent.insert(*contract_id, by_outpoint);
+
+            let mut beneficiaries_witness = vec![];
+            let mut beneficiaries_blinded = vec![];
+            for builder_seal in beneficiaries {
+                match builder_seal {
+                    BuilderSeal::Revealed(seal) => {
+                        let explicit_seal = ExplicitSeal::with(witness_txid, seal.vout);
+                        beneficiaries_witness.push(explicit_seal);
+                    }
+                    BuilderSeal::Concealed(secret_seal) => {
+                        beneficiaries_blinded.push(*secret_seal);
+                    }
+                };
+            }
+            transfers.push(runtime.transfer_from_fascia(
+                *contract_id,
+                beneficiaries_witness,
+                beneficiaries_blinded,
+                &fascia,
+            )?);
+        }
+
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let batch_transfer_idx = self.persist_color_prepare_batch(
+            psbt,
+            &txid,
+            &spent,
+            &fascia,
+            coloring_info,
+            shift_output_map_for_opreturn_first,
+            min_confirmations,
+            expiration_timestamp,
+            true,
+            runtime,
+        )?;
+        self.trigger_auto_backup();
+        Ok(ColorPrepareResult {
+            transfers,
+            batch_transfer_idx,
+        })
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl Wallet {
+    fn persist_color_prepare_batch(
+        &self,
+        psbt: &Psbt,
+        txid: &str,
+        spent: &HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>>,
+        fascia: &Fascia,
+        coloring_info: &ColoringInfo,
+        shift_output_map_for_opreturn_first: bool,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+        allow_consume_transfer_fascia: bool,
+        runtime: &RgbRuntime,
+    ) -> Result<i32, Error> {
+        let transfer_dir = self.get_transfer_dir(txid);
+        fs::create_dir_all(&transfer_dir)?;
+        let fascia_path = transfer_dir.join(FASCIA_FILE);
+        let serialized_fascia = serde_json::to_string(fascia).map_err(InternalError::from)?;
+        fs::write(fascia_path, serialized_fascia)?;
+        fs::write(transfer_dir.join(UNSIGNED_PSBT_FILE), psbt.to_string())?;
+        if allow_consume_transfer_fascia {
+            fs::write(transfer_dir.join(COLOR_PREPARE_FILE), b"")?;
+        }
+
+        let created_at = now().unix_timestamp();
+        let bitcoin_network = self.bitcoin_network();
+        let txn = self.database().begin_transaction()?;
+        let incoming_witness_scripts = Self::incoming_witness_receive_script_hexes(&txn)?;
+        if let Some(existing) =
+            txn.get_batch_transfers_by_txid(txid)?
+                .into_iter()
+                .find(|batch_transfer| {
+                    !batch_transfer.incoming
+                        && matches!(
+                            batch_transfer.status,
+                            TransferStatus::Initiated
+                                | TransferStatus::WaitingConfirmations
+                                | TransferStatus::Settled
+                        )
+                })
+        {
+            return Err(Error::BatchTransferAlreadyExists {
+                txid: txid.to_string(),
+                idx: existing.idx,
+            });
+        }
+        let batch_transfer = DbBatchTransferActMod {
+            txid: ActiveValue::Set(Some(txid.to_string())),
+            status: ActiveValue::Set(TransferStatus::Initiated),
+            expiration: ActiveValue::Set(expiration_timestamp.map(|t| t as i64)),
+            created_at: ActiveValue::Set(created_at),
+            min_confirmations: ActiveValue::Set(min_confirmations),
+            incoming: ActiveValue::Set(false),
+            ..Default::default()
+        };
+        let batch_transfer_idx = txn.set_batch_transfer(batch_transfer)?;
+
+        for (contract_id, by_outpoint) in spent {
+            let asset_id = contract_id.to_string();
+            let asset_schema = AssetSchema::get_from_contract_id(*contract_id, runtime)?;
+            let asset_transfer = DbAssetTransferActMod {
+                user_driven: ActiveValue::Set(true),
+                batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
+                asset_id: ActiveValue::Set(Some(asset_id)),
+                ..Default::default()
+            };
+            let asset_transfer_idx = txn.set_asset_transfer(asset_transfer)?;
+
+            for (outpoint, assignments) in by_outpoint {
+                let outpoint: Outpoint = (*outpoint).into();
+                let Some(txo) = txn.get_txo(&outpoint)? else {
+                    continue;
+                };
+                let txo_idx = txo.idx;
+
+                for assignment in assignments {
+                    let db_coloring = DbColoringActMod {
+                        txo_idx: ActiveValue::Set(txo_idx),
+                        asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                        r#type: ActiveValue::Set(ColoringType::Input),
+                        assignment: ActiveValue::Set(assignment.clone()),
+                        ..Default::default()
+                    };
+                    txn.set_coloring(db_coloring)?;
+                }
+            }
+
+            let mut external_destinations: Vec<(u32, u64, String)> = Vec::new();
+            let mut change_destinations: Vec<(u32, u64, String)> = Vec::new();
+            if let Some(asset_coloring) = coloring_info.asset_info_map.get(contract_id) {
+                for (mut vout, amount) in BTreeMap::from_iter(asset_coloring.output_map.clone()) {
+                    if amount == 0 {
+                        continue;
+                    }
+                    if shift_output_map_for_opreturn_first {
+                        vout += 1;
+                    }
+                    if vout as usize >= psbt.unsigned_tx.output.len() {
+                        return Err(Error::InvalidColoringInfo {
+                            details: s!(
+                                "invalid vout in output_map, does not exist in the given PSBT"
+                            ),
+                        });
+                    }
+                    let txout = &psbt.unsigned_tx.output[vout as usize];
+                    if txout.script_pubkey.is_op_return() {
+                        return Err(Error::InvalidColoringInfo {
+                            details: format!(
+                                "output_map vout {vout} points to the OP_RETURN output"
+                            ),
+                        });
+                    }
+                    let address_payload = AddressPayload::from_script(&txout.script_pubkey)
+                        .map_err(|_| Error::InvalidColoringInfo {
+                            details: format!(
+                                "output_map vout {vout} script is not a standard address payload"
+                            ),
+                        })?;
+                    let beneficiary =
+                        Beneficiary::WitnessVout(Pay2Vout::new(address_payload), None);
+                    let recipient_id =
+                        XChainNet::with(bitcoin_network.into(), beneficiary).to_string();
+                    let output_assignment =
+                        Self::assignment_for_coloring_output(asset_schema, amount);
+                    let owned_by_witness_receive =
+                        incoming_witness_scripts.contains(&txout.script_pubkey.to_hex_string());
+                    // Skip Change when an open witness_receive already owns this script.
+                    if self.bdk_wallet().is_mine(txout.script_pubkey.clone())
+                        && !owned_by_witness_receive
+                    {
+                        let outpoint = Outpoint {
+                            txid: txid.to_string(),
+                            vout,
+                        };
+                        let txo_idx = match txn.get_txo(&outpoint)? {
+                            Some(txo) => txo.idx,
+                            None => {
+                                let db_utxo = DbTxoActMod {
+                                    txid: ActiveValue::Set(txid.to_string()),
+                                    vout: ActiveValue::Set(vout),
+                                    btc_amount: ActiveValue::Set(txout.value.to_sat().to_string()),
+                                    spent: ActiveValue::Set(false),
+                                    exists: ActiveValue::Set(false),
+                                    pending_witness: ActiveValue::Set(false),
+                                    ..Default::default()
+                                };
+                                txn.set_txo(db_utxo)?
+                            }
+                        };
+                        let db_coloring = DbColoringActMod {
+                            txo_idx: ActiveValue::Set(txo_idx),
+                            asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                            r#type: ActiveValue::Set(ColoringType::Change),
+                            assignment: ActiveValue::Set(output_assignment.clone()),
+                            ..Default::default()
+                        };
+                        txn.set_coloring(db_coloring)?;
+                        change_destinations.push((vout, amount, recipient_id));
+                    } else {
+                        external_destinations.push((vout, amount, recipient_id));
+                    }
+                }
+            }
+
+            let transfer_destinations = if !external_destinations.is_empty() {
+                external_destinations
+            } else {
+                change_destinations
+            };
+
+            if transfer_destinations.is_empty() {
+                let first_assignment = by_outpoint.values().flatten().next().cloned();
+                txn.set_transfer(DbTransferActMod {
+                    asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                    requested_assignment: ActiveValue::Set(first_assignment),
+                    recipient_id: ActiveValue::Set(Some(format!("color:{txid}"))),
+                    recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness {
+                        vout: None,
+                        recipient_nonce: vec![],
+                    })),
+                    ..Default::default()
+                })?;
+            } else {
+                for (vout, amount, recipient_id) in transfer_destinations {
+                    let requested = Self::assignment_for_coloring_output(asset_schema, amount);
+                    txn.set_transfer(DbTransferActMod {
+                        asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                        requested_assignment: ActiveValue::Set(Some(requested)),
+                        recipient_id: ActiveValue::Set(Some(recipient_id)),
+                        recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness {
+                            vout: Some(vout),
+                            recipient_nonce: vec![],
+                        })),
+                        ..Default::default()
+                    })?;
+                }
+            }
+        }
+
+        self.update_backup_info(&txn, false)?;
+        txn.commit()?;
+        Ok(batch_transfer_idx)
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl Wallet {
+    fn incoming_witness_receive_script_hexes(txn: &DbTxn) -> Result<HashSet<String>, Error> {
+        let mut scripts: HashSet<String> = txn
+            .iter_pending_witness_scripts()?
+            .into_iter()
+            .map(|row| row.script)
+            .collect();
+
+        let batch_transfers = txn.iter_batch_transfers()?;
+        let asset_transfers = txn.iter_asset_transfers()?;
+        let transfers = txn.iter_transfers()?;
+        let in_flight_incoming: HashSet<i32> = batch_transfers
+            .iter()
+            .filter(|bt| bt.incoming && !bt.status.settled() && !bt.status.failed())
+            .map(|bt| bt.idx)
+            .collect();
+        let in_flight_asset: HashSet<i32> = asset_transfers
+            .iter()
+            .filter(|at| in_flight_incoming.contains(&at.batch_transfer_idx))
+            .map(|at| at.idx)
+            .collect();
+        for transfer in &transfers {
+            if !in_flight_asset.contains(&transfer.asset_transfer_idx) {
+                continue;
+            }
+            if !matches!(
+                transfer.recipient_type,
+                Some(RecipientTypeFull::Witness { .. })
+            ) {
+                continue;
+            }
+            let Some(ref recipient_id) = transfer.recipient_id else {
+                continue;
+            };
+            if let Ok(Some(script)) = script_buf_from_recipient_id(recipient_id.clone()) {
+                scripts.insert(script.to_hex_string());
+            }
+        }
+        Ok(scripts)
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl Wallet {
+    /// Fetch and accept a witness transfer through a proxy.
+    pub fn accept_transfer(
+        &mut self,
+        online: Online,
+        txid: String,
+        vout: u32,
+        consignment_endpoint: &str,
+        blinding: u64,
+    ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
+        info!(self.logger(), "Accepting transfer...");
+        self.check_online(online)?;
+        let witness_id = RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;
+        let proxy_url = TransportEndpoint::new(consignment_endpoint.to_string())?.endpoint;
+
+        let consignment_res = self.get_consignment(&proxy_url, txid.clone())?;
+        let consignment_bytes = general_purpose::STANDARD
+            .decode(consignment_res.consignment)
+            .map_err(InternalError::from)?;
+        let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
+
+        let (consignment, assignments, _media_digests) =
+            self.accept_transfer_with_consignment(consignment, witness_id, vout, blinding, None)?;
+        Ok((consignment, assignments))
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl Wallet {
+    /// Color a PSBT and consume its fascia using the upstream workflow.
+    pub fn color_psbt_and_consume(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+    ) -> Result<Vec<RgbTransfer>, Error> {
+        info!(self.logger(), "Coloring PSBT and consuming...");
+        let (fascia, asset_beneficiaries) = self.color_psbt(psbt, coloring_info.clone())?;
+
+        let witness_txid = psbt.get_txid();
+
+        let mut runtime = self.rgb_runtime()?;
+        runtime.consume_fascia(fascia, None)?;
+
+        let mut transfers = vec![];
+        for (contract_id, beneficiaries) in asset_beneficiaries {
+            let mut beneficiaries_witness = vec![];
+            let mut beneficiaries_blinded = vec![];
+            for builder_seal in beneficiaries {
+                match builder_seal {
+                    BuilderSeal::Revealed(seal) => {
+                        let explicit_seal = ExplicitSeal::with(witness_txid, seal.vout);
+                        beneficiaries_witness.push(explicit_seal);
+                    }
+                    BuilderSeal::Concealed(secret_seal) => {
+                        beneficiaries_blinded.push(secret_seal);
+                    }
+                };
+            }
+            transfers.push(runtime.transfer(
+                contract_id,
+                beneficiaries_witness,
+                beneficiaries_blinded,
+                Some(witness_txid),
+            )?);
+        }
+
+        info!(self.logger(), "Color PSBT and consume completed");
+        Ok(transfers)
     }
 }
 

@@ -1,9 +1,10 @@
+mod bdk;
 pub(crate) mod entities;
 
 use super::*;
+#[cfg(feature = "vss")]
+use sea_orm::ConnectionTrait;
 
-#[cfg(feature = "mpc")]
-use crate::database::entities::mpc_address;
 use crate::database::entities::{
     asset, coloring, media, prelude::*, reuse_address_index, transfer_transport_endpoint,
     transport_endpoint, txo, wallet_transaction,
@@ -234,6 +235,50 @@ pub struct RgbLibDatabase {
 }
 
 impl RgbLibDatabase {
+    /// Snapshot committed SQLite state, including BDK changesets, using SQLite's backup mechanism.
+    #[cfg(feature = "vss")]
+    pub(crate) fn snapshot_into(&self, destination: &Path) -> Result<(), Error> {
+        block_on(
+            self.connection
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "VACUUM INTO ?",
+                    [destination.to_string_lossy().into_owned().into()],
+                )),
+        )?;
+        Ok(())
+    }
+
+    /// Mark the staged database as a complete backup without changing the live wallet.
+    #[cfg(feature = "vss")]
+    pub(crate) fn finalize_vss_snapshot(destination: &Path, timestamp: i128) -> Result<(), Error> {
+        let mut options =
+            sea_orm::ConnectOptions::new(format!("sqlite://{}?mode=rw", destination.display()));
+        options.max_connections(1).sqlx_logging(false);
+        let connection = block_on(sea_orm::Database::connect(options))?;
+        let snapshot = Self::new(connection);
+        snapshot.mark_vss_snapshot_backed_up(timestamp)?;
+        block_on(snapshot.connection.close())?;
+        Ok(())
+    }
+
+    #[cfg(feature = "vss")]
+    pub(crate) fn mark_vss_snapshot_backed_up(&self, timestamp: i128) -> Result<(), Error> {
+        let txn = self.begin_transaction()?;
+        if let Some(info) = txn.get_backup_info()?
+            && timestamp
+                > info
+                    .last_backup_timestamp
+                    .parse::<i128>()
+                    .map_err(InternalError::from)?
+        {
+            let mut info: DbBackupInfoActMod = info.into();
+            info.last_backup_timestamp = ActiveValue::Set(timestamp.to_string());
+            txn.update_backup_info(&mut info)?;
+        }
+        txn.commit()
+    }
+
     pub(crate) fn new(connection: DatabaseConnection) -> Self {
         Self { connection }
     }
@@ -241,12 +286,16 @@ impl RgbLibDatabase {
     pub(crate) fn begin_transaction(&self) -> Result<DbTxn, Error> {
         Ok(DbTxn {
             txn: Some(block_on(self.connection.begin())?),
+            on_commit: Mutex::new(Vec::new()),
         })
     }
 }
 
 pub struct DbTxn {
     txn: Option<DatabaseTransaction>,
+    /// Callbacks run only if the transaction commits, to discard the crash-recovery copies of
+    /// data the commit has just made durable.
+    on_commit: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Drop for DbTxn {
@@ -264,9 +313,29 @@ impl DbTxn {
         self.txn.as_ref().expect("txn already consumed")
     }
 
+    /// Register a callback to run once this transaction has been durably committed.
+    ///
+    /// If the transaction is rolled back instead, the callback is dropped without running.
+    pub(crate) fn on_commit(&self, f: impl FnOnce() + Send + 'static) {
+        self.on_commit
+            .lock()
+            .expect("on_commit mutex is never poisoned")
+            .push(Box::new(f));
+    }
+
     pub(crate) fn commit(mut self) -> Result<(), Error> {
         let txn = self.txn.take().expect("txn already consumed");
-        Ok(block_on(txn.commit())?)
+        block_on(txn.commit())?;
+        let callbacks = std::mem::take(
+            &mut *self
+                .on_commit
+                .lock()
+                .expect("on_commit mutex is never poisoned"),
+        );
+        for callback in callbacks {
+            callback();
+        }
+        Ok(())
     }
 
     pub(crate) fn set_asset(&self, asset: DbAssetActMod) -> Result<i32, Error> {
@@ -1054,63 +1123,6 @@ impl DbTxn {
                 })
             })
             .collect()
-    }
-
-    #[cfg(feature = "mpc")]
-    pub(crate) fn set_mpc_address(&self, addr: mpc_address::ActiveModel) -> Result<i32, Error> {
-        let res = block_on(MpcAddress::insert(addr).exec(self.inner()))?;
-        Ok(res.last_insert_id)
-    }
-
-    #[cfg(feature = "mpc")]
-    pub(crate) fn get_mpc_addresses_by_keychain(
-        &self,
-        keychain: u8,
-    ) -> Result<Vec<mpc_address::Model>, Error> {
-        Ok(block_on(
-            mpc_address::Entity::find()
-                .filter(mpc_address::Column::Keychain.eq(keychain))
-                .all(self.inner()),
-        )?)
-    }
-
-    #[cfg(feature = "mpc")]
-    pub(crate) fn get_mpc_address_by_script(
-        &self,
-        script_hex: &str,
-    ) -> Result<mpc_address::Model, Error> {
-        block_on(
-            mpc_address::Entity::find()
-                .filter(mpc_address::Column::ScriptPubkey.eq(script_hex))
-                .one(self.inner()),
-        )?
-        .ok_or(Error::Internal {
-            details: format!("MPC address not found for script {script_hex}"),
-        })
-    }
-
-    #[cfg(feature = "mpc")]
-    pub(crate) fn get_last_mpc_address(
-        &self,
-        keychain: u8,
-    ) -> Result<Option<mpc_address::Model>, Error> {
-        Ok(block_on(
-            mpc_address::Entity::find()
-                .filter(mpc_address::Column::Keychain.eq(keychain))
-                .order_by_desc(mpc_address::Column::DerivationIndex)
-                .one(self.inner()),
-        )?)
-    }
-
-    #[cfg(feature = "mpc")]
-    pub(crate) fn get_next_mpc_derivation_index(&self, keychain: u8) -> Result<u32, Error> {
-        let max_idx = block_on(
-            mpc_address::Entity::find()
-                .filter(mpc_address::Column::Keychain.eq(keychain))
-                .order_by_desc(mpc_address::Column::DerivationIndex)
-                .one(self.inner()),
-        )?;
-        Ok(max_idx.map(|a| a.derivation_index + 1).unwrap_or(0))
     }
 }
 

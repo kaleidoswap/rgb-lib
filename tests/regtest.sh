@@ -42,7 +42,7 @@ if [ -z "${params}" ]; then
     _help
 fi
 
-TMP_DIR="${CWD}/tmp"
+TMP_DIR="${CWD}/tmp_srv"
 LISTS_DIR="${CWD}/lists"
 HUB_DIR="${CWD}/hub"
 COMPOSE_FPATH="${CWD}/compose.yaml"
@@ -157,7 +157,7 @@ prepare_tests_environment() {
     TESTS=1
 
     COMPOSE="$COMPOSE --profile tests --profile vss"
-    EXPOSED_PORTS+=(3001 3002 50002 50003 50004 50005 8094 8081 8140 8141)
+    EXPOSED_PORTS+=(3001 3002 50002 50003 50004 50005 8094 8140 8141 8081)
 
     PROXY_MOD_PROTO="proxy-mod-proto"
     PROXY_MOD_API="proxy-mod-api"

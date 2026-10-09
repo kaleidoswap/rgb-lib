@@ -21,7 +21,6 @@ base64 = { version = "0.22.1", default-features = false, features = [
     "std",
 ] }
 bdk_wallet = { version = "=3.1.0", default-features = false, features = [
-    "file_store",
     "keys-bip39",
     "std",
 ] }
@@ -34,7 +33,7 @@ bdk_esplora = { version = "0.22.2", optional = true, default-features = false, f
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = [
     "alloc",
 ] }
-tokio = { version = "1", default-features = false, features = ["rt"] }
+tokio = { version = "1", default-features = false }
 hex = { version = "0.4.3", default-features = false }
 rand = { version = "0.10.1", default-features = false, features = [
     "thread_rng",
@@ -82,8 +81,6 @@ vss-client = { package = "vss-client-ng", git = "https://github.com/lightningdev
     "sigs-auth",
 ] }
 hkdf = { version = "0.12", default-features = false, optional = true }
-p256 = { version = "0.13", features = ["ecdsa"], optional = true }
-ed25519-dalek = { version = "2", features = ["pkcs8", "pem"], optional = true }
 sha2 = { version = "0.10", default-features = false, optional = true }
 
 # RGB-related deps
@@ -113,6 +110,7 @@ mockito = { version = "1", default-features = false }
 once_cell = { version = "1.21", default-features = false }
 regex = { version = "1.13", default-features = false }
 serial_test = { version = "3.5", default-features = false }
+
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # OS-specific reqwest features
@@ -125,8 +123,11 @@ version = "0.13"
 features = ["rustls"]
 
 [features]
-default = ["electrum"]
-all = ["electrum", "esplora", "vss"]
+default = ["electrum", "bdk_file_store_migration"]
+all = ["electrum", "esplora", "bdk_file_store_migration", "vss"]
+# import the BDK data of wallets created before the changeset moved into the rgb-lib DB; only
+# needed to upgrade such wallets, so it can be turned off to drop the bdk_file_store dependency
+bdk_file_store_migration = ["bdk_wallet/file_store"]
 electrum = [
     "bdk_electrum",
     "reqwest",
@@ -137,9 +138,7 @@ esplora = [
     "reqwest",
     "rgb-ops/esplora_blocking",
 ]
-vss = ["vss-client", "hkdf", "dep:sha2"]
-mpc = []
-dfns = ["mpc", "dep:p256", "dep:ed25519-dalek", "dep:sha2"]
+vss = ["vss-client", "hkdf", "dep:sha2", "tokio/rt"]
 camel_case = ["default"]
 
 [[example]]
@@ -149,14 +148,6 @@ required-features = ["vss"]
 [[example]]
 name = "vss_unencrypted_example"
 required-features = ["vss"]
-
-[[example]]
-name = "dfns_e2e"
-required-features = ["dfns", "electrum"]
-
-[[example]]
-name = "bdk_peer"
-required-features = ["electrum"]
 
 [profile.release]
 # make overflow bugs fail loudly instead of producing wrong amounts

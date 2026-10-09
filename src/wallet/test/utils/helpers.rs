@@ -21,6 +21,98 @@ macro_rules! assert_matches {
     }};
 }
 
+/// A data dir of its own for a test that doesn't call `initialize()`.
+///
+/// `initialize()` runs `regtest.sh prepare_tests_environment`, which wipes the shared
+/// `tests/tmp_srv` data dir before starting the services. Tests run in parallel, so a test that
+/// skips `initialize()` (because it needs no services) and keeps its wallet in `tests/tmp_srv`
+/// can have it deleted from under it by a sibling's `initialize()`. Such tests keep their data in
+/// a directory of their own under `tests/tmp_nosrv` instead, named after the test plus a random
+/// suffix. Like the `tests/tmp_srv` ones, these directories outlive the test to allow post-test
+/// inspection; the ones from previous runs are wiped when the first test needing one starts.
+pub(crate) struct PrivateDataDir(PathBuf);
+
+impl PrivateDataDir {
+    pub(crate) fn new() -> Self {
+        static WIPE_STALE_DATA: std::sync::Once = std::sync::Once::new();
+        let root: PathBuf = NOSRV_DATA_DIR_PARTS.iter().collect();
+        WIPE_STALE_DATA.call_once(|| {
+            if root.exists() {
+                fs::remove_dir_all(&root).unwrap();
+            }
+            fs::create_dir_all(&root).unwrap();
+        });
+        // cargo names each test's thread after the test itself
+        let test_name = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .replace("::", "_");
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("{test_name}."))
+            .tempdir_in(&root)
+            .unwrap();
+        Self(dir.keep())
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Path of the given entry inside this data dir.
+    pub(crate) fn sub_path<P: AsRef<Path>>(&self, name: P) -> PathBuf {
+        self.path().join(name)
+    }
+
+    pub(crate) fn string(&self) -> String {
+        self.path().to_string_lossy().to_string()
+    }
+
+    pub(crate) fn wallet_data(&self) -> WalletData {
+        get_test_wallet_data(&self.string())
+    }
+
+    pub(crate) fn wallet(
+        &self,
+        private_keys: bool,
+        max_allocations_per_utxo: Option<u32>,
+    ) -> Wallet {
+        self.wallet_with_net(
+            private_keys,
+            max_allocations_per_utxo,
+            BitcoinNetwork::Regtest,
+        )
+    }
+
+    pub(crate) fn wallet_with_net(
+        &self,
+        private_keys: bool,
+        max_allocations_per_utxo: Option<u32>,
+        bitcoin_network: BitcoinNetwork,
+    ) -> Wallet {
+        get_test_wallet_with_net_in(
+            &self.string(),
+            private_keys,
+            max_allocations_per_utxo,
+            bitcoin_network,
+        )
+    }
+
+    pub(crate) fn wallet_raw(
+        &self,
+        wallet_keys: &SinglesigKeys,
+        max_allocations_per_utxo: Option<u32>,
+        bitcoin_network: BitcoinNetwork,
+    ) -> Wallet {
+        get_test_wallet_raw_in(
+            &self.string(),
+            wallet_keys,
+            max_allocations_per_utxo,
+            bitcoin_network,
+        )
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn join_with_sep(parts: &[&str]) -> String {
     parts.join(MAIN_SEPARATOR_STR)
 }
@@ -33,14 +125,17 @@ pub(crate) fn get_current_time() -> u128 {
         .as_millis()
 }
 
+#[cfg(feature = "electrum")]
 pub(crate) fn get_restore_dir_string() -> String {
     join_with_sep(&RESTORE_DIR_PARTS)
 }
 
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn get_test_data_dir_string() -> String {
     join_with_sep(&TEST_DATA_DIR_PARTS)
 }
 
+#[cfg(feature = "electrum")]
 pub(crate) fn get_restore_dir_path<P: AsRef<Path>>(last: Option<P>) -> PathBuf {
     let mut path = PathBuf::from(get_restore_dir_string());
     if let Some(l) = last {
@@ -49,10 +144,12 @@ pub(crate) fn get_restore_dir_path<P: AsRef<Path>>(last: Option<P>) -> PathBuf {
     path
 }
 
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn get_test_data_dir_path() -> PathBuf {
     PathBuf::from(get_test_data_dir_string())
 }
 
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn create_test_data_dir() -> PathBuf {
     let test_data_dir = get_test_data_dir_path();
     if !test_data_dir.exists() {
@@ -63,12 +160,12 @@ pub(crate) fn create_test_data_dir() -> PathBuf {
 
 pub(crate) fn get_test_wallet_data(data_dir: &str) -> WalletData {
     WalletData {
+        reuse_addresses: false,
         data_dir: data_dir.to_string(),
         bitcoin_network: BitcoinNetwork::Regtest,
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
         supported_schemas: AssetSchema::VALUES.to_vec(),
-        reuse_addresses: false,
     }
 }
 
@@ -79,7 +176,23 @@ pub(crate) fn get_test_wallet_with_keys(keys: &Keys) -> Wallet {
 }
 
 // return a wallet for testing
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn get_test_wallet_with_net(
+    private_keys: bool,
+    max_allocations_per_utxo: Option<u32>,
+    bitcoin_network: BitcoinNetwork,
+) -> Wallet {
+    create_test_data_dir();
+    get_test_wallet_with_net_in(
+        &get_test_data_dir_string(),
+        private_keys,
+        max_allocations_per_utxo,
+        bitcoin_network,
+    )
+}
+
+fn get_test_wallet_with_net_in(
+    data_dir: &str,
     private_keys: bool,
     max_allocations_per_utxo: Option<u32>,
     bitcoin_network: BitcoinNetwork,
@@ -90,25 +203,44 @@ pub(crate) fn get_test_wallet_with_net(
     } else {
         SinglesigKeys::from_keys_no_mnemonic(&keys, None)
     };
-    get_test_wallet_raw(&wallet_keys, max_allocations_per_utxo, bitcoin_network)
+    get_test_wallet_raw_in(
+        data_dir,
+        &wallet_keys,
+        max_allocations_per_utxo,
+        bitcoin_network,
+    )
 }
 
 // return a wallet for testing
+#[cfg(feature = "electrum")]
 pub(crate) fn get_test_wallet_raw(
     wallet_keys: &SinglesigKeys,
     max_allocations_per_utxo: Option<u32>,
     bitcoin_network: BitcoinNetwork,
 ) -> Wallet {
     create_test_data_dir();
+    get_test_wallet_raw_in(
+        &get_test_data_dir_string(),
+        wallet_keys,
+        max_allocations_per_utxo,
+        bitcoin_network,
+    )
+}
 
+fn get_test_wallet_raw_in(
+    data_dir: &str,
+    wallet_keys: &SinglesigKeys,
+    max_allocations_per_utxo: Option<u32>,
+    bitcoin_network: BitcoinNetwork,
+) -> Wallet {
     let wallet = Wallet::new(
         WalletData {
-            data_dir: get_test_data_dir_string(),
+            reuse_addresses: false,
+            data_dir: data_dir.to_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: max_allocations_per_utxo.unwrap_or(MAX_ALLOCATIONS_PER_UTXO),
             supported_schemas: AssetSchema::VALUES.to_vec(),
-            reuse_addresses: false,
         },
         wallet_keys.clone(),
     )
@@ -117,6 +249,7 @@ pub(crate) fn get_test_wallet_raw(
     wallet
 }
 
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 // return a regtest wallet for testing
 pub(crate) fn get_test_wallet(private_keys: bool, max_allocations_per_utxo: Option<u32>) -> Wallet {
     get_test_wallet_with_net(
@@ -160,25 +293,6 @@ pub(crate) fn get_funded_noutxo_wallet(
     (wallet, online)
 }
 
-// Used by the VSS test modules (gated behind the `vss` feature); unused under plain electrum/esplora.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-#[allow(dead_code)]
-pub(crate) fn get_funded_wallet(
-    private_keys: bool,
-    indexer_url: Option<String>,
-) -> (Wallet, Online) {
-    let (mut wallet, online) = get_funded_noutxo_wallet(private_keys, indexer_url);
-    wallet
-        .create_utxos(online, false, None, None, FEE_RATE, false)
-        .unwrap();
-    (wallet, online)
-}
-
-#[allow(dead_code)]
-pub(crate) fn test_get_wallet_dir(wallet: &Wallet) -> std::path::PathBuf {
-    wallet.get_wallet_dir()
-}
-
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn get_funded_party(private_keys: bool, indexer_url: Option<String>) -> SinglesigParty {
     let (wallet, online) = get_funded_noutxo_wallet(private_keys, indexer_url);
@@ -199,20 +313,6 @@ pub(crate) fn get_funded_noutxo_party(
     indexer_url: Option<String>,
 ) -> SinglesigParty {
     let (wallet, online) = get_funded_noutxo_wallet(private_keys, indexer_url);
-    party!(wallet, online)
-}
-
-/// Drop and recreate a party's wallet from its persisted data + keys, then bring it back online.
-/// Used by offline-receiver tests to simulate a wallet restart.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-pub(crate) fn restart_party(party: SinglesigParty) -> SinglesigParty {
-    let wallet_data = party.wallet.get_wallet_data();
-    let keys = party.wallet.get_keys();
-    drop(party);
-    let mut wallet = Wallet::new(wallet_data, keys).expect("wallet recreate failed");
-    let online = wallet
-        .go_online(test_go_online_options(None))
-        .expect("go_online after recreate failed");
     party!(wallet, online)
 }
 
@@ -345,4 +445,37 @@ pub(crate) fn default_rcv_expiration() -> u64 {
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn default_send_expiration() -> u64 {
     (now().unix_timestamp() + DURATION_SEND_TRANSFER as i64) as u64
+}
+
+// Used by the VSS test modules (gated behind the `vss` feature); unused under plain electrum/esplora.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[allow(dead_code)]
+pub(crate) fn get_funded_wallet(
+    private_keys: bool,
+    indexer_url: Option<String>,
+) -> (Wallet, Online) {
+    let (mut wallet, online) = get_funded_noutxo_wallet(private_keys, indexer_url);
+    wallet
+        .create_utxos(online, false, None, None, FEE_RATE, false)
+        .unwrap();
+    (wallet, online)
+}
+
+#[allow(dead_code)]
+pub(crate) fn test_get_wallet_dir(wallet: &Wallet) -> std::path::PathBuf {
+    wallet.get_wallet_dir()
+}
+
+/// Drop and recreate a party's wallet from its persisted data + keys, then bring it back online.
+/// Used by offline-receiver tests to simulate a wallet restart.
+#[cfg(feature = "electrum")]
+pub(crate) fn restart_party(party: SinglesigParty) -> SinglesigParty {
+    let wallet_data = party.wallet.get_wallet_data();
+    let keys = party.wallet.get_keys();
+    drop(party);
+    let mut wallet = Wallet::new(wallet_data, keys).expect("wallet recreate failed");
+    let online = wallet
+        .go_online(test_go_online_options(None))
+        .expect("go_online after recreate failed");
+    party!(wallet, online)
 }

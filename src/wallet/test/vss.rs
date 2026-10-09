@@ -118,27 +118,8 @@ async fn plaintext_backup() {
 
     let client = VssBackupClient::new(config).unwrap();
 
-    let original_data = create_test_zip("b1a2d3c4", b"This is plaintext data - no encryption!");
-
-    let _version = client.upload_backup(original_data).await.unwrap();
-
-    let downloaded = client.download_backup().await.unwrap();
-
-    // Verify the downloaded zip has sanitized paths (wallet/ instead of fingerprint)
-    let reader = std::io::Cursor::new(&downloaded);
-    let mut archive = zip::ZipArchive::new(reader).unwrap();
-    let has_wallet_dir = (0..archive.len()).any(|i| {
-        archive
-            .by_index(i)
-            .map(|f| f.name().starts_with("wallet/"))
-            .unwrap_or(false)
-    });
-    assert!(
-        has_wallet_dir,
-        "Downloaded plaintext backup missing sanitized 'wallet/' directory"
-    );
-
-    client.delete_backup().await.unwrap();
+    let result = client.upload_backup(vec![]).await;
+    assert!(matches!(result, Err(Error::VssEncryptionRequired)));
 }
 
 #[cfg(feature = "electrum")]
@@ -152,8 +133,7 @@ async fn version_tracking() {
         VSS_SERVER_URL.to_string(),
         format!("{store_id}_version"),
         signing_key,
-    )
-    .with_encryption(false);
+    );
 
     let client = VssBackupClient::new(config).unwrap();
 
@@ -189,8 +169,7 @@ async fn delete_backup() {
         VSS_SERVER_URL.to_string(),
         format!("{store_id}_delete"),
         signing_key,
-    )
-    .with_encryption(false);
+    );
 
     let client = VssBackupClient::new(config).unwrap();
 
@@ -267,10 +246,13 @@ async fn unencrypted_wrong_signing_key() {
     let client_upload = VssBackupClient::new(config_upload).unwrap();
 
     let original_data = create_test_zip("f0e1d2c3", b"Plaintext secret data");
-    client_upload
-        .upload_backup(original_data.clone())
-        .await
-        .unwrap();
+    super::utils::vss::seed_legacy_plaintext_backup(
+        VSS_SERVER_URL,
+        &format!("{store_id}_unwrongkey"),
+        signing_key,
+        original_data,
+    )
+    .await;
 
     // With sigs auth, a different signing key is rejected by the server
     // even without encryption — server-side auth protects the data.
@@ -396,7 +378,13 @@ async fn unencrypted_wallet_backup_restore() {
 
     let backup_data = create_mock_wallet_zip(&wallet_dir);
 
-    let _version = client.upload_backup(backup_data).await.unwrap();
+    super::utils::vss::seed_legacy_plaintext_backup(
+        VSS_SERVER_URL,
+        &format!("{store_id}_unwallet"),
+        signing_key,
+        backup_data,
+    )
+    .await;
 
     // Restore to a different directory
     let restore_dir = tempfile::tempdir().unwrap();
@@ -443,8 +431,7 @@ async fn backup_info() {
         VSS_SERVER_URL.to_string(),
         format!("{store_id}_info"),
         signing_key,
-    )
-    .with_encryption(false);
+    );
 
     let client = VssBackupClient::new(config).unwrap();
 
@@ -604,57 +591,11 @@ async fn unencrypted_auto_backup() {
         .with_auto_backup(true)
         .with_encryption(false);
 
-    wallet.configure_vss_backup(config.clone()).unwrap();
-
-    // Verify no backup exists yet
-    let check_client = VssBackupClient::new(config).unwrap();
-    let version_before = check_client.get_backup_version().await.unwrap();
-    assert!(
-        version_before.is_none(),
-        "Backup already exists before state change"
-    );
-
-    // Trigger a state-changing operation
-    let _address = wallet.get_address().unwrap();
-
-    // Wait for the async auto-backup to complete
-    let mut backup_found = false;
-    for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        match check_client.get_backup_version().await {
-            Ok(Some(_)) => {
-                backup_found = true;
-                break;
-            }
-            _ => continue,
-        }
-    }
-    assert!(
-        backup_found,
-        "Unencrypted auto-backup did not complete within 10 seconds"
-    );
-
-    // Verify the backup can be downloaded
-    let downloaded = check_client.download_backup().await.unwrap();
-    assert!(!downloaded.is_empty(), "Downloaded backup is empty");
-
-    // Verify the downloaded data is a valid zip with sanitized paths (no fingerprint)
-    let reader = std::io::Cursor::new(&downloaded);
-    let mut archive = zip::ZipArchive::new(reader).unwrap();
-    let has_wallet_dir = (0..archive.len()).any(|i| {
-        archive
-            .by_index(i)
-            .map(|f| f.name().starts_with("wallet/"))
-            .unwrap_or(false)
-    });
-    assert!(
-        has_wallet_dir,
-        "Unencrypted auto-backup should use sanitized 'wallet/' directory"
-    );
-
-    // Cleanup
-    check_client.delete_backup().await.unwrap();
-    wallet.disable_vss_auto_backup();
+    assert!(matches!(
+        wallet.configure_vss_backup(config),
+        Err(Error::VssEncryptionRequired)
+    ));
+    assert!(wallet.vss_client().is_none());
 }
 
 #[cfg(feature = "electrum")]

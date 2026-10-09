@@ -5,17 +5,17 @@ use crate::keys::restore_keys;
 #[test]
 #[parallel]
 fn success() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Signet, WitnessVersion::Taproot);
     let wallet_data = WalletData {
+        reuse_addresses: false,
         data_dir: test_data_dir_str.clone(),
         bitcoin_network: BitcoinNetwork::Signet,
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 1,
         supported_schemas: vec![AssetSchema::Nia, AssetSchema::Cfa],
-        reuse_addresses: false,
     };
     let wallet_keys = SinglesigKeys::from_keys(&keys, Some(2));
     let wallet = Wallet::new(wallet_data.clone(), wallet_keys.clone()).unwrap();
@@ -56,8 +56,8 @@ fn success() {
 #[test]
 #[parallel]
 fn watch_only_success() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::SegWitV0);
     let wallet = Wallet::new(
@@ -81,17 +81,17 @@ fn watch_only_success() {
 #[test]
 #[parallel]
 fn new_updates_manifest_success() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet_data = WalletData {
+        reuse_addresses: false,
         data_dir: test_data_dir_str.clone(),
         bitcoin_network: BitcoinNetwork::Regtest,
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 1,
         supported_schemas: vec![AssetSchema::Nia],
-        reuse_addresses: false,
     };
     let wallet = Wallet::new(wallet_data.clone(), SinglesigKeys::from_keys(&keys, None)).unwrap();
     drop(wallet);
@@ -108,6 +108,7 @@ fn new_updates_manifest_success() {
     // new is the way to change the settings that aren't fixed at creation, so it rewrites the
     // manifest and later loads pick the new values up
     let updated_wallet_data = WalletData {
+        reuse_addresses: false,
         max_allocations_per_utxo: 3,
         supported_schemas: vec![AssetSchema::Nia, AssetSchema::Cfa],
         ..wallet_data
@@ -134,8 +135,8 @@ fn new_updates_manifest_success() {
 #[test]
 #[parallel]
 fn watch_only_toggle_success() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet = Wallet::new(
@@ -182,8 +183,8 @@ fn watch_only_toggle_success() {
 #[test]
 #[parallel]
 fn new_immutable_settings_fail() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet_data = get_test_wallet_data(&test_data_dir_str);
@@ -213,6 +214,7 @@ fn new_immutable_settings_fail() {
     // else would stop the same directory being reused for a different chain. the network keeps
     // the error BDK's genesis check has always raised for this
     let other_network_wallet_data = WalletData {
+        reuse_addresses: false,
         bitcoin_network: BitcoinNetwork::Testnet,
         ..wallet_data.clone()
     };
@@ -258,8 +260,8 @@ fn new_immutable_settings_fail() {
 #[test]
 #[parallel]
 fn new_immutable_settings_watch_only_fail() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet = Wallet::new(
@@ -283,8 +285,8 @@ fn new_immutable_settings_watch_only_fail() {
 #[test]
 #[parallel]
 fn new_mutable_settings_success() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet = Wallet::new(
@@ -320,26 +322,9 @@ fn new_mutable_settings_success() {
 
 #[test]
 #[parallel]
-fn reuse_addresses_roundtrip_success() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
-
-    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
-    let mut wallet_data = get_test_wallet_data(&test_data_dir_str);
-    wallet_data.reuse_addresses = true;
-    let wallet = Wallet::new(wallet_data, SinglesigKeys::from_keys(&keys, None)).unwrap();
-    drop(wallet);
-
-    // the manifest records reuse_addresses, so load doesn't silently fall back to false
-    let loaded = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None).unwrap();
-    assert!(loaded.get_wallet_data().reuse_addresses);
-}
-
-#[test]
-#[parallel]
 fn restored_backup_success() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet = Wallet::new(
@@ -349,15 +334,13 @@ fn restored_backup_success() {
     .unwrap();
     let descriptors = wallet.get_descriptors();
 
-    let backup_file_path = get_test_data_dir_path().join("test_load_backup.rgb-lib_backup");
+    let backup_file_path = test_data_dir.sub_path("test_load_backup.rgb-lib_backup");
     let backup_file = backup_file_path.to_str().unwrap();
-    let _ = fs::remove_file(backup_file);
     wallet.backup(backup_file, PASSWORD).unwrap();
     drop(wallet);
 
-    let target_dir_path = get_restore_dir_path(Some("load"));
+    let target_dir_path = test_data_dir.sub_path("restored");
     let target_dir = target_dir_path.to_str().unwrap();
-    let _ = fs::remove_dir_all(target_dir);
     restore_backup(backup_file, PASSWORD, target_dir).unwrap();
 
     // the manifest lives in the wallet directory, so it rides along in the backup and the wallet
@@ -379,8 +362,8 @@ fn inexistent_data_dir_fail() {
 #[test]
 #[parallel]
 fn inexistent_manifest_fail() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet = Wallet::new(
@@ -411,8 +394,8 @@ fn inexistent_manifest_fail() {
 #[test]
 #[parallel]
 fn unsupported_manifest_version_fail() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet = Wallet::new(
@@ -439,9 +422,87 @@ fn unsupported_manifest_version_fail() {
 
 #[test]
 #[parallel]
+fn wrong_mnemonic_fail() {
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
+
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet = Wallet::new(
+        get_test_wallet_data(&test_data_dir_str),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+    drop(wallet);
+
+    // a mnemonic that doesn't derive the manifest's xpubs is caught before it can be used
+    let other_keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let err = Wallet::load(
+        &test_data_dir_str,
+        &keys.master_fingerprint,
+        Some(other_keys.mnemonic),
+    )
+    .err()
+    .unwrap();
+    assert_matches!(err, Error::InvalidBitcoinKeys);
+}
+
+#[test]
+#[parallel]
+fn manifest_fingerprint_mismatch_fail() {
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
+
+    let keys_1 = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_1 = Wallet::new(
+        get_test_wallet_data(&test_data_dir_str),
+        SinglesigKeys::from_keys(&keys_1, None),
+    )
+    .unwrap();
+    let manifest_1 = wallet_1.get_wallet_dir().join(WALLET_MANIFEST_FILE);
+
+    let keys_2 = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_2 = Wallet::new(
+        get_test_wallet_data(&test_data_dir_str),
+        SinglesigKeys::from_keys(&keys_2, None),
+    )
+    .unwrap();
+    let manifest_2 = wallet_2.get_wallet_dir().join(WALLET_MANIFEST_FILE);
+
+    drop(wallet_1);
+    drop(wallet_2);
+
+    // a manifest that doesn't belong to the directory holding it would otherwise have `new` set up
+    // a second, unrelated wallet at the fingerprint the manifest names
+    fs::copy(manifest_1, &manifest_2).unwrap();
+
+    let err = Wallet::load(&test_data_dir_str, &keys_2.master_fingerprint, None)
+        .err()
+        .unwrap();
+    assert_matches!(err, Error::FingerprintMismatch);
+}
+
+#[test]
+#[parallel]
+fn reuse_addresses_roundtrip_success() {
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
+
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let mut wallet_data = get_test_wallet_data(&test_data_dir_str);
+    wallet_data.reuse_addresses = true;
+    let wallet = Wallet::new(wallet_data, SinglesigKeys::from_keys(&keys, None)).unwrap();
+    drop(wallet);
+
+    // the manifest records reuse_addresses, so load doesn't silently fall back to false
+    let loaded = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None).unwrap();
+    assert!(loaded.get_wallet_data().reuse_addresses);
+}
+
+#[test]
+#[parallel]
 fn corrupt_manifest_fail() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet = Wallet::new(
@@ -471,8 +532,8 @@ fn corrupt_manifest_fail() {
 #[test]
 #[parallel]
 fn manifest_rewrite_skipped_when_unchanged() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet = Wallet::new(
@@ -499,62 +560,29 @@ fn manifest_rewrite_skipped_when_unchanged() {
 }
 
 #[test]
-#[parallel]
-fn wrong_mnemonic_fail() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
-
+fn legacy_wallet_with_retired_signer_migration_loads() {
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+    let dir = PrivateDataDir::new();
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet = Wallet::new(
-        get_test_wallet_data(&test_data_dir_str),
+        get_test_wallet_data(&dir.string()),
         SinglesigKeys::from_keys(&keys, None),
     )
     .unwrap();
+    let path = wallet.get_wallet_dir().join(RGB_LIB_DB_NAME);
     drop(wallet);
-
-    // a mnemonic that doesn't derive the manifest's xpubs is caught before it can be used
-    let other_keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
-    let err = Wallet::load(
-        &test_data_dir_str,
-        &keys.master_fingerprint,
-        Some(other_keys.mnemonic),
-    )
-    .err()
+    let connection = block_on(Database::connect(format!(
+        "sqlite:{}?mode=rw",
+        path.display()
+    )))
     .unwrap();
-    assert_matches!(err, Error::InvalidBitcoinKeys);
-}
-
-#[test]
-#[parallel]
-fn manifest_fingerprint_mismatch_fail() {
-    let test_data_dir = create_test_data_dir();
-    let test_data_dir_str = test_data_dir.to_string_lossy().to_string();
-
-    let keys_1 = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
-    let wallet_1 = Wallet::new(
-        get_test_wallet_data(&test_data_dir_str),
-        SinglesigKeys::from_keys(&keys_1, None),
-    )
-    .unwrap();
-    let manifest_1 = wallet_1.get_wallet_dir().join(WALLET_MANIFEST_FILE);
-
-    let keys_2 = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
-    let wallet_2 = Wallet::new(
-        get_test_wallet_data(&test_data_dir_str),
-        SinglesigKeys::from_keys(&keys_2, None),
-    )
-    .unwrap();
-    let manifest_2 = wallet_2.get_wallet_dir().join(WALLET_MANIFEST_FILE);
-
-    drop(wallet_1);
-    drop(wallet_2);
-
-    // a manifest that doesn't belong to the directory holding it would otherwise have `new` set up
-    // a second, unrelated wallet at the fingerprint the manifest names
-    fs::copy(manifest_1, &manifest_2).unwrap();
-
-    let err = Wallet::load(&test_data_dir_str, &keys_2.master_fingerprint, None)
-        .err()
-        .unwrap();
-    assert_matches!(err, Error::FingerprintMismatch);
+    block_on(connection.execute_raw(Statement::from_string(DatabaseBackend::Sqlite,
+        "INSERT INTO seaql_migrations (version, applied_at) VALUES ('m20260401_000001_create_mpc_address_table', 1)"))).unwrap();
+    block_on(connection.close()).unwrap();
+    let loaded =
+        Wallet::load(&dir.string(), &keys.master_fingerprint, Some(keys.mnemonic)).unwrap();
+    assert_eq!(
+        loaded.get_keys().master_fingerprint,
+        keys.master_fingerprint
+    );
 }
