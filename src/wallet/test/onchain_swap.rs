@@ -120,6 +120,61 @@ fn maker_taker_rgb_for_btc_balances() {
 
 #[test]
 #[parallel]
+fn swap_refuses_counterparty_inputs_that_belong_to_this_wallet() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SOWN",
+        "Swap Own Inputs",
+        SWAP_RGB_AMOUNT,
+    );
+
+    let offer = maker
+        .create_swap_offer(
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            btc(SWAP_BTC_PRICE),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+
+    // a taker that declares a coin of the maker's as its own input: the maker would sign it
+    let maker_address = maker.get_address().unwrap();
+    let maker_script = maker.get_script_pubkey(&maker_address).unwrap();
+    let mut smuggled_request = request.clone();
+    smuggled_request.taker_inputs[0].script_pubkey_hex = maker_script.to_hex_string();
+    let err = maker
+        .accept_swap_request(maker_online, smuggled_request, 0, false, vec![])
+        .unwrap_err();
+    assert!(err.to_string().contains("belongs to this wallet"), "{err}");
+
+    // and a maker that declares one of the taker's coins as its own input
+    let proposal = maker
+        .accept_swap_request(maker_online, request.clone(), 0, false, vec![])
+        .unwrap();
+    let mut smuggled_proposal = proposal.clone();
+    smuggled_proposal.maker_inputs[0] = request.taker_inputs[0].clone();
+    let err = taker
+        .complete_swap_proposal(taker_online, smuggled_proposal, 0, false)
+        .unwrap_err();
+    assert!(err.to_string().contains("belongs to this wallet"), "{err}");
+    taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap();
+}
+
+#[test]
+#[parallel]
 fn refresh_after_swap_settles_transfers_without_panicking() {
     initialize();
 

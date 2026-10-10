@@ -4,9 +4,9 @@
 
 use super::offline::{
     SWAP_OUTGOING_FILE, SwapOutgoingState, swap_build_input, swap_consignment_dir,
-    swap_consignment_path, swap_history_recipient_id, swap_input_to_outpoint, swap_invalid,
-    swap_parse_script, swap_proxy_transport_endpoint, swap_rgb_leg_coloring_info, swap_save_state,
-    swap_selected_inputs_total,
+    swap_consignment_path, swap_ensure_only_own_inputs_signed, swap_history_recipient_id,
+    swap_input_to_outpoint, swap_invalid, swap_parse_script, swap_proxy_transport_endpoint,
+    swap_rgb_leg_coloring_info, swap_save_state, swap_selected_inputs_total,
 };
 use super::*;
 use rgbstd::Operation as _;
@@ -5370,12 +5370,46 @@ pub(crate) fn swap_validate_received_swap_leg(
     )
 }
 
-pub(crate) fn swap_sign_psbt(wallet: &Wallet, psbt: &mut Psbt) -> Result<(), Error> {
+/// The counterparty's declared inputs must not be coins of this wallet: this wallet signs every
+/// input it can, so a smuggled coin would be spent for the counterparty's benefit.
+pub(crate) fn swap_ensure_inputs_foreign(
+    wallet: &Wallet,
+    counterparty_inputs: &[OnchainSwapInput],
+    own_inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    for input in counterparty_inputs {
+        let outpoint = swap_input_to_outpoint(input);
+        if own_inputs
+            .iter()
+            .any(|own| swap_input_to_outpoint(own) == outpoint)
+            || wallet.bdk_wallet().get_utxo(outpoint).is_some()
+            || wallet
+                .bdk_wallet()
+                .is_mine(swap_parse_script(&input.script_pubkey_hex)?)
+        {
+            return Err(swap_invalid(format!(
+                "swap input {} belongs to this wallet",
+                input.outpoint
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Sign the inputs this wallet declared, refusing a PSBT that would make it sign anything else.
+pub(crate) fn swap_sign_psbt(
+    wallet: &Wallet,
+    psbt: &mut Psbt,
+    own_inputs: &[OnchainSwapInput],
+    counterparty_inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    swap_ensure_inputs_foreign(wallet, counterparty_inputs, own_inputs)?;
     let sign_options = SignOptions {
         trust_witness_utxo: true,
         ..Default::default()
     };
-    wallet.sign_psbt_impl(psbt, Some(sign_options))
+    wallet.sign_psbt_impl(psbt, Some(sign_options))?;
+    swap_ensure_only_own_inputs_signed(psbt, own_inputs)
 }
 
 /// Finalize a swap PSBT that must be fully signed (the maker signs last).
