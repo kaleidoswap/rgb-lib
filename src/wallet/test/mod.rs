@@ -456,6 +456,8 @@ mod get_wallet_dir;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 mod go_online;
 #[cfg(feature = "electrum")]
+mod htlc_swap_tree;
+#[cfg(feature = "electrum")]
 mod inflate;
 #[cfg(feature = "electrum")]
 mod issue_asset_cfa;
