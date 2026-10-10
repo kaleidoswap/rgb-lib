@@ -15,10 +15,10 @@ use super::offline::{
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use super::online::{
     SwapRgbSend, swap_accept_transfer_from_file, swap_color_rgb_leg, swap_emit_asset_history,
-    swap_ensure_inputs_confirmed, swap_fetch_consignment_to_file, swap_finalize_psbt,
-    swap_finalize_psbt_required, swap_import_asset_history, swap_prepare_rgb_leg,
-    swap_select_inputs, swap_sign_psbt, swap_stage_rgb_leg, swap_validate_fascia_received_leg,
-    swap_validate_received_swap_leg,
+    swap_ensure_inputs_confirmed, swap_ensure_inputs_foreign, swap_fetch_consignment_to_file,
+    swap_finalize_psbt, swap_finalize_psbt_required, swap_import_asset_history,
+    swap_prepare_rgb_leg, swap_select_inputs, swap_sign_psbt, swap_stage_rgb_leg,
+    swap_validate_fascia_received_leg, swap_validate_received_swap_leg,
 };
 use super::*;
 
@@ -1658,6 +1658,7 @@ impl Wallet {
         }
         // Correctness: verify the taker's inputs are sufficiently confirmed before the maker
         // commits resources to building the PSBT.
+        swap_ensure_inputs_foreign(self, &request.taker_inputs, &[])?;
         swap_ensure_inputs_confirmed(self, &request.taker_inputs, min_confirmations)?;
         swap_require_rgb_destination(
             &offer.maker_gives,
@@ -1901,7 +1902,12 @@ impl Wallet {
         self.sync_if_requested(&txn, Some(online), skip_sync, KeychainKind::External)?;
         swap_ensure_inputs_confirmed(self, &proposal.maker_inputs, min_confirmations)?;
         swap_ensure_inputs_confirmed(self, &proposal.request.taker_inputs, min_confirmations)?;
-        swap_sign_psbt(self, &mut psbt)?;
+        swap_sign_psbt(
+            self,
+            &mut psbt,
+            &proposal.request.taker_inputs,
+            &proposal.maker_inputs,
+        )?;
         let finalized_psbt = swap_finalize_psbt(self, &psbt)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         let completion = OnchainSwapCompletion {
@@ -1971,7 +1977,12 @@ impl Wallet {
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
                 swap_ensure_inputs_confirmed(self, &completion.proposal.maker_inputs, 0)?;
                 swap_ensure_inputs_confirmed(self, &completion.proposal.request.taker_inputs, 0)?;
-                swap_sign_psbt(self, &mut psbt)?;
+                swap_sign_psbt(
+                    self,
+                    &mut psbt,
+                    &completion.proposal.maker_inputs,
+                    &completion.proposal.request.taker_inputs,
+                )?;
                 let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
                     psbt: psbt.to_string(),
@@ -2008,7 +2019,12 @@ impl Wallet {
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
                 swap_ensure_inputs_confirmed(self, &completion.proposal.maker_inputs, 0)?;
                 swap_ensure_inputs_confirmed(self, &completion.proposal.request.taker_inputs, 0)?;
-                swap_sign_psbt(self, &mut psbt)?;
+                swap_sign_psbt(
+                    self,
+                    &mut psbt,
+                    &completion.proposal.maker_inputs,
+                    &completion.proposal.request.taker_inputs,
+                )?;
                 let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
                     psbt: psbt.to_string(),
@@ -2094,7 +2110,12 @@ impl Wallet {
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
                 swap_ensure_inputs_confirmed(self, &completion.proposal.maker_inputs, 0)?;
                 swap_ensure_inputs_confirmed(self, &completion.proposal.request.taker_inputs, 0)?;
-                swap_sign_psbt(self, &mut psbt)?;
+                swap_sign_psbt(
+                    self,
+                    &mut psbt,
+                    &completion.proposal.maker_inputs,
+                    &completion.proposal.request.taker_inputs,
+                )?;
                 let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
                     psbt: psbt.to_string(),
