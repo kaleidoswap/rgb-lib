@@ -5378,6 +5378,11 @@ pub(crate) fn swap_sign_psbt(wallet: &Wallet, psbt: &mut Psbt) -> Result<(), Err
     wallet.sign_psbt_impl(psbt, Some(sign_options))
 }
 
+/// Finalize a swap PSBT that must be fully signed (the maker signs last).
+pub(crate) fn swap_finalize_psbt_required(wallet: &Wallet, psbt: &Psbt) -> Result<String, Error> {
+    swap_finalize_psbt(wallet, psbt)?.ok_or_else(|| swap_invalid("swap PSBT is not fully signed"))
+}
+
 pub(crate) fn swap_finalize_psbt(wallet: &Wallet, psbt: &Psbt) -> Result<Option<String>, Error> {
     wallet
         .finalize_psbt(psbt.to_string(), Some(SignOptions::default()))
