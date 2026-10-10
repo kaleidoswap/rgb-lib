@@ -5408,8 +5408,9 @@ pub(crate) fn swap_sign_psbt(
         trust_witness_utxo: true,
         ..Default::default()
     };
+    let before = psbt.clone();
     wallet.sign_psbt_impl(psbt, Some(sign_options))?;
-    swap_ensure_only_own_inputs_signed(psbt, own_inputs)
+    swap_ensure_only_own_inputs_signed(&before, psbt, own_inputs)
 }
 
 /// Finalize a swap PSBT that must be fully signed (the maker signs last).
