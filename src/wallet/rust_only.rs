@@ -107,6 +107,26 @@ const PSBT_OP_ID_LEN: usize = 32;
 /// Expiration applied by `psbt_op_prepare` when the caller gives none.
 pub const PSBT_OP_DEFAULT_EXPIRATION_SECS: u64 = 24 * 60 * 60;
 
+/// When a prepared PSBT operation may be failed by the expiry sweep.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsbtOpExpiry {
+    /// [`PSBT_OP_DEFAULT_EXPIRATION_SECS`] from now.
+    Default,
+    /// At this unix timestamp.
+    At(u64),
+    /// Never: the caller broadcasts the transaction itself and applies or aborts the operation
+    /// explicitly, so an operation whose transaction the indexer hasn't seen yet is never failed.
+    Never,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl From<Option<u64>> for PsbtOpExpiry {
+    fn from(expiration_timestamp: Option<u64>) -> Self {
+        expiration_timestamp.map_or(Self::Default, Self::At)
+    }
+}
+
 #[cfg(all(test, any(feature = "electrum", feature = "esplora")))]
 thread_local! {
     pub(crate) static MOCK_FAIL_AFTER_STASH_CONSUME: std::cell::RefCell<bool> =
@@ -1870,7 +1890,8 @@ impl Wallet {
 
     /// Color an HTLC (or other external) PSBT for explicit input outpoints, write file-backed
     /// payloads under `psbt_ops/{operation_id}/`, and persist SQL accounting for colored contracts.
-    /// `expiration_timestamp` defaults to [`PSBT_OP_DEFAULT_EXPIRATION_SECS`] from now.
+    /// `expiration_timestamp` defaults to [`PSBT_OP_DEFAULT_EXPIRATION_SECS`] from now; see
+    /// [`Self::psbt_op_prepare_with_expiry`] to disable expiry.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
@@ -1883,11 +1904,36 @@ impl Wallet {
         min_confirmations: u8,
         expiration_timestamp: Option<u64>,
     ) -> Result<PsbtOpPrepareResult, Error> {
+        self.psbt_op_prepare_with_expiry(
+            psbt,
+            coloring_info,
+            input_outpoints,
+            min_confirmations,
+            expiration_timestamp.into(),
+        )
+    }
+
+    /// [`Self::psbt_op_prepare`] with an explicit [`PsbtOpExpiry`].
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn psbt_op_prepare_with_expiry(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        input_outpoints: Vec<OutPoint>,
+        min_confirmations: u8,
+        expiry: PsbtOpExpiry,
+    ) -> Result<PsbtOpPrepareResult, Error> {
         info!(self.logger(), "Preparing HTLC color operation...");
-        let expiration_timestamp =
-            Some(expiration_timestamp.unwrap_or_else(|| {
-                now().unix_timestamp() as u64 + PSBT_OP_DEFAULT_EXPIRATION_SECS
-            }));
+        let expiration_timestamp = match expiry {
+            PsbtOpExpiry::Default => {
+                Some(now().unix_timestamp() as u64 + PSBT_OP_DEFAULT_EXPIRATION_SECS)
+            }
+            PsbtOpExpiry::At(timestamp) => Some(timestamp),
+            PsbtOpExpiry::Never => None,
+        };
         let (runtime, override_set) =
             self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
         let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(

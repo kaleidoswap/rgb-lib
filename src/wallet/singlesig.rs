@@ -1528,7 +1528,8 @@ impl Wallet {
     /// Accept a maker offer as the taker and return the taker's request message.
     ///
     /// The taker validates the offer, selects their inputs, and derives the receive destination.
-    /// The returned [`OnchainSwapRequest`] must be forwarded to the maker.
+    /// Inputs in `exclude_outpoints` are never selected. The returned [`OnchainSwapRequest`] must
+    /// be forwarded to the maker.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub fn accept_swap_offer(
         &mut self,
@@ -1536,6 +1537,7 @@ impl Wallet {
         offer: OnchainSwapOffer,
         min_confirmations: u8,
         skip_sync: bool,
+        exclude_outpoints: Vec<Outpoint>,
     ) -> Result<OnchainSwapRequest, Error> {
         info!(self.logger(), "Accepting on-chain swap offer...");
         self.check_online(online)?;
@@ -1559,6 +1561,7 @@ impl Wallet {
                 .ok_or_else(|| swap_invalid("swap amounts overflow"))?,
             min_confirmations,
             skip_sync,
+            &exclude_outpoints,
         )?;
         let (
             taker_btc_address,
@@ -1625,9 +1628,11 @@ impl Wallet {
 
     /// Accept a taker request as the maker and return the maker's PSBT proposal.
     ///
-    /// The maker validates the request, selects their inputs, builds the collaborative PSBT,
-    /// colors any RGB leg they are sending, and partially signs the PSBT.
-    /// The returned [`OnchainSwapProposal`] must be forwarded to the taker.
+    /// The maker validates the request, selects their inputs, builds the collaborative PSBT and
+    /// colors any RGB leg they are sending, without signing: the maker signs last, in
+    /// [`process_swap_completion`](Wallet::process_swap_completion). Inputs in
+    /// `exclude_outpoints` are never selected, so a caller running concurrent swaps can keep its
+    /// own reservations. The returned [`OnchainSwapProposal`] must be forwarded to the taker.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub fn accept_swap_request(
         &mut self,
@@ -1635,6 +1640,7 @@ impl Wallet {
         request: OnchainSwapRequest,
         min_confirmations: u8,
         skip_sync: bool,
+        exclude_outpoints: Vec<Outpoint>,
     ) -> Result<OnchainSwapProposal, Error> {
         info!(self.logger(), "Accepting on-chain swap request...");
         self.check_online(online)?;
@@ -1670,6 +1676,7 @@ impl Wallet {
             swap_side_rgb_output_cost(&offer.maker_receives, offer.rgb_output_sat),
             min_confirmations,
             skip_sync,
+            &exclude_outpoints,
         )?;
         let maker_change_keychain = if matches!(offer.maker_gives.kind, OnchainSwapLegKind::Rgb) {
             KeychainKind::External
@@ -2136,6 +2143,19 @@ impl Wallet {
             SWAP_BROADCAST_FILE,
             &txid,
         )?;
+        // a broadcast leg must never be failed by the expiry sweep while the indexer hasn't seen
+        // the transaction yet: that would release inputs the transaction spends. Committed before
+        // broadcasting, since a failed broadcast attempt may still have reached the network; a
+        // rejected swap stays cancellable, cancel_swap doesn't depend on the expiration.
+        if let Some((_, batch_transfer)) = self.swap_outgoing_batch(&offer.swap_id)?
+            && batch_transfer.expiration.is_some()
+        {
+            let txn = self.database().begin_transaction()?;
+            let mut updated: DbBatchTransferActMod = batch_transfer.into();
+            updated.expiration = ActiveValue::Set(None);
+            txn.update_batch_transfer(&mut updated)?;
+            txn.commit()?;
+        }
         let txn = self.database().begin_transaction()?;
         let tx = match self.broadcast_psbt(&txn, &psbt) {
             Ok(tx) => tx,
@@ -2255,6 +2275,72 @@ impl Wallet {
         }
         info!(self.logger(), "Cancel expired swaps completed");
         Ok(swap_ids)
+    }
+
+    /// List the on-chain swaps this wallet has local state for, including cancelled ones, so a
+    /// caller can reconcile them against its own records after a restart.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn list_swaps(&self) -> Result<Vec<OnchainSwapSummary>, Error> {
+        let transfers_dir = swap_consignment_dir(self.wallet_dir(), "")
+            .parent()
+            .expect("swap dir has a parent")
+            .to_path_buf();
+        if !transfers_dir.is_dir() {
+            return Ok(vec![]);
+        }
+        fn load<T: serde::de::DeserializeOwned>(dir: &Path, file: &str) -> Option<T> {
+            serde_json::from_str(&fs::read_to_string(dir.join(file)).ok()?).ok()
+        }
+        let cancelled_suffix = format!(".{SWAP_CANCELLED_EXTENSION}");
+        let mut swaps = vec![];
+        for entry in fs::read_dir(&transfers_dir)? {
+            let entry = entry?;
+            let dir = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix("swap-") else {
+                continue;
+            };
+            let (swap_id, cancelled) = match rest.strip_suffix(&cancelled_suffix) {
+                Some(id) => (id, true),
+                None => (rest, false),
+            };
+            if !dir.is_dir() || !swap_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+                continue;
+            }
+            let (role, offer) = if let Some(offer) = load::<OnchainSwapOffer>(&dir, SWAP_OFFER_FILE)
+            {
+                (OnchainSwapRole::Maker, offer)
+            } else if let Some(request) = load::<OnchainSwapRequest>(&dir, SWAP_REQUEST_FILE) {
+                (OnchainSwapRole::Taker, request.offer)
+            } else {
+                continue;
+            };
+            let proposal_txid =
+                load::<OnchainSwapProposal>(&dir, SWAP_PROPOSAL_FILE).map(|p| p.txid);
+            let broadcast_txid = load::<String>(&dir, SWAP_BROADCAST_FILE);
+            let stage = if cancelled {
+                OnchainSwapStage::Cancelled
+            } else if dir.join(SWAP_ACCEPTED_FILE).exists() {
+                OnchainSwapStage::Accepted
+            } else if broadcast_txid.is_some() {
+                OnchainSwapStage::Broadcast
+            } else if proposal_txid.is_some() {
+                OnchainSwapStage::Proposed
+            } else if role == OnchainSwapRole::Maker {
+                OnchainSwapStage::Offered
+            } else {
+                OnchainSwapStage::Requested
+            };
+            swaps.push(OnchainSwapSummary {
+                swap_id: swap_id.to_string(),
+                role,
+                stage,
+                expiration_timestamp: offer.expiration_timestamp,
+                txid: broadcast_txid.or(proposal_txid),
+            });
+        }
+        swaps.sort_by(|a, b| a.swap_id.cmp(&b.swap_id));
+        Ok(swaps)
     }
 
     /// Make the broadcast swap TX known to BDK: parties that did not broadcast it would not

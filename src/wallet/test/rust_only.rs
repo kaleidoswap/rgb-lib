@@ -2243,6 +2243,55 @@ fn color_psbt_and_prepare_consume_bulk_fail_transfers_spares_broadcast_expired_b
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
+fn psbt_op_prepare_with_expiry_never_sets_no_expiration() {
+    initialize();
+
+    let amt_sat = 500;
+    let mut party_send = get_funded_noutxo_party!();
+    let mut recv_party = get_empty_party!();
+    party_send.create_utxos(false, Some(1), None, FEE_RATE, None);
+    party_send.send_btc(&recv_party.get_address(), 99_998_200);
+    let asset = party_send.issue_asset_nia(Some(&[AMOUNT]));
+
+    let address = BdkAddress::from_str(&recv_party.get_address()).unwrap();
+    let mut tx_builder = party_send.wallet.bdk_wallet_mut().build_tx();
+    tx_builder
+        .add_recipient(
+            address.assume_checked().script_pubkey(),
+            BdkAmount::from_sat(amt_sat),
+        )
+        .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
+    let mut psbt = tx_builder.finish().unwrap();
+    let input = psbt.unsigned_tx.input[0].previous_output;
+    insert_op_return(&mut psbt, true);
+    let vout = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .position(|o| o.value.to_sat() == amt_sat)
+        .unwrap() as u32;
+    let coloring_info = coloring_info_for(&asset.asset_id, HashMap::from([(vout, AMOUNT)]), 777);
+
+    party_send
+        .wallet
+        .psbt_op_prepare_with_expiry(
+            &mut psbt,
+            coloring_info,
+            vec![input],
+            MIN_CONFIRMATIONS,
+            crate::wallet::rust_only::PsbtOpExpiry::Never,
+        )
+        .unwrap();
+    let witness_txid = psbt.unsigned_tx.compute_txid().to_string();
+    assert_eq!(
+        party_send.db_batch_transfers_filtered(&witness_txid)[0].expiration,
+        None
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
 fn psbt_op_prepare_writes_op_dir_for_wallet_owned_input() {
     initialize();
 

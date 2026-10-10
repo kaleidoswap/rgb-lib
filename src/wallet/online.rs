@@ -5609,13 +5609,17 @@ pub(crate) fn swap_select_btc_inputs(
     online: Online,
     needed_sat: u64,
     min_confirmations: u8,
+    excluded: &HashSet<(&str, u32)>,
 ) -> Result<Vec<OnchainSwapInput>, Error> {
     // The caller (swap_select_inputs) already synced via sync_if_requested; we use
     // internal_unspents() directly to avoid opening a second DB connection while the
     // caller's transaction is still live (pool size = 1).
     let mut selected = vec![];
     let mut total = 0u64;
-    for output in wallet.internal_unspents().filter(|o| !o.is_spent) {
+    for output in wallet.internal_unspents().filter(|o| {
+        let txid = o.outpoint.txid.to_string();
+        !o.is_spent && !excluded.contains(&(txid.as_str(), o.outpoint.vout))
+    }) {
         if min_confirmations > 0 {
             let confs = wallet
                 .indexer()
@@ -5651,9 +5655,14 @@ pub(crate) fn swap_select_inputs(
     extra_sat: u64,
     min_confirmations: u8,
     skip_sync: bool,
+    exclude_outpoints: &[Outpoint],
 ) -> Result<Vec<OnchainSwapInput>, Error> {
     wallet.sync_if_requested(txn, Some(online), skip_sync, KeychainKind::Internal)?;
     wallet.sync_if_requested(txn, Some(online), skip_sync, KeychainKind::External)?;
+    let excluded = exclude_outpoints
+        .iter()
+        .map(|o| (o.txid.as_str(), o.vout))
+        .collect::<HashSet<_>>();
     match gives.kind {
         OnchainSwapLegKind::Btc => swap_select_btc_inputs(
             wallet,
@@ -5663,6 +5672,7 @@ pub(crate) fn swap_select_inputs(
                 .checked_add(extra_sat)
                 .ok_or_else(|| swap_invalid("swap amounts overflow"))?,
             min_confirmations,
+            &excluded,
         ),
         OnchainSwapLegKind::Rgb => {
             let asset_id = gives.asset_id.clone().expect("RGB leg has asset ID");
@@ -5672,7 +5682,8 @@ pub(crate) fn swap_select_inputs(
                 non_fungible: false,
                 inflation: 0,
             };
-            let (_, _, input_unspents, _) = wallet.get_transfer_begin_data(txn, 1)?;
+            let (_, _, mut input_unspents, _) = wallet.get_transfer_begin_data(txn, 1)?;
+            input_unspents.retain(|u| !excluded.contains(&(u.utxo.txid.as_str(), u.utxo.vout)));
             let selected = wallet.select_rgb_inputs(asset_id, &assignments, input_unspents)?;
             let selected_outpoints = selected
                 .input_outpoints
