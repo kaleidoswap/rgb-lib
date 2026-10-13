@@ -1,9 +1,9 @@
 use super::*;
 
 use crate::wallet::test::utils::vss::{
-    VSS_KEY_CHUNK_PREFIX, VSS_KEY_DATA, VSS_KEY_FINGERPRINT, VSS_KEY_MANIFEST, VSS_KEY_METADATA,
-    VssBackupDeleteGuard, build_raw_vss_client, generate_signing_key_and_store_id, get_vss_key,
-    snapshot_wallet_state, tokio_runtime, vss_key_exists, vss_server_url,
+    VSS_KEY_MANIFEST, VssBackupDeleteGuard, build_raw_vss_client,
+    generate_signing_key_and_store_id, get_vss_key, snapshot_wallet_state, tokio_runtime,
+    vss_key_exists, vss_server_url,
 };
 
 use crate::wallet::vss::{
@@ -121,29 +121,29 @@ fn scenario_1_encrypted_backup_restore_matches_state_and_wallet_operational() {
     assert!(manifest.encrypted, "expected encrypted backup");
 
     assert!(
-        rt.block_on(vss_key_exists(&raw, &store_id, VSS_KEY_FINGERPRINT))
+        rt.block_on(vss_key_exists(&raw, &store_id, &manifest.fingerprint_key()))
             .expect("fingerprint key check"),
         "expected fingerprint key"
     );
     let metadata_exists = rt
-        .block_on(vss_key_exists(&raw, &store_id, VSS_KEY_METADATA))
+        .block_on(vss_key_exists(&raw, &store_id, &manifest.metadata_key()))
         .expect("metadata key check");
     assert!(metadata_exists, "expected encryption metadata key");
     let metadata_bytes = rt
-        .block_on(get_vss_key(&raw, &store_id, VSS_KEY_METADATA))
+        .block_on(get_vss_key(&raw, &store_id, &manifest.metadata_key()))
         .expect("get metadata");
     let _metadata: VssEncryptionMetadata =
         serde_json::from_slice(&metadata_bytes).expect("metadata json");
 
     if manifest.chunk_count == 1 {
         assert!(
-            rt.block_on(vss_key_exists(&raw, &store_id, VSS_KEY_DATA))
+            rt.block_on(vss_key_exists(&raw, &store_id, &manifest.chunk_key(0)))
                 .expect("data key check"),
             "expected backup/data for single-chunk backup"
         );
     } else {
         for i in 0..manifest.chunk_count {
-            let key = format!("{VSS_KEY_CHUNK_PREFIX}{i}");
+            let key = manifest.chunk_key(i);
             assert!(
                 rt.block_on(vss_key_exists(&raw, &store_id, &key))
                     .expect("chunk key check"),

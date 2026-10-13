@@ -33,21 +33,27 @@ namespace rgb_lib {
 
 [Error, Remote]
 interface RgbLibError {
+  VssAuth(string details);
+  VssBackupNotFound();
+  VssError(string details);
+  VssVersionConflict(string details);
+  VssEncryptionRequired();
+  BatchTransferAlreadyExists(string txid, i32 idx);
+  UnsafeTransferHistory(string details);
   AddressReuseDisabled();
   AllocationsAlreadyAvailable();
   AssetNotFound(string asset_id);
-  BatchTransferAlreadyExists(string txid, i32 idx);
   BatchTransferNotFound(i32 idx);
   BitcoinNetworkMismatch();
   CannotAbortPendingVanillaTx();
-  CannotProvideOutOfBandAck(string details);
   CannotChangeOnline();
   CannotCombinePsbts();
-  CannotProvideOutOfBandConsignment(string details);
   CannotDeleteBatchTransfer();
   CannotEstimateFees();
   CannotFailBatchTransfer();
   CannotFinalizePsbt();
+  CannotProvideOutOfBandAck(string details);
+  CannotProvideOutOfBandConsignment(string details);
   CannotUseIfaOnMainnet();
   Database(string details);
   EmptyFile(string file_path);
@@ -108,19 +114,18 @@ interface RgbLibError {
   InvalidWitnessVersion(string witness_version);
   MaxFeeExceeded(string txid);
   MinFeeNotMet(string txid);
-  MpcProvider(string details);
-  MultisigHubService(string details);
   MultisigCannotMarkOperationProcessed(string details);
   MultisigCannotRespondToOperation(string details);
+  MultisigHubService(string details);
   MultisigOperationInProgress();
   MultisigOperationNotFound(i32 operation_idx);
   MultisigTransferStatusMismatch();
   MultisigUnexpectedData(string details);
   MultisigUserNotCosigner();
   Network(string details);
+  NoBurnAmount();
   NoConsignment();
   NoCosignersSupplied();
-  NoBurnAmount();
   NoInflationAmounts();
   NoIssuanceAmounts();
   NoKeysSupplied();
@@ -145,7 +150,6 @@ interface RgbLibError {
   UnknownRgbSchema(string schema_id);
   UnknownTransfer(string txid);
   UnexpectedTransfer(string details);
-  UnsafeTransferHistory(string details);
   UnsupportedBackupVersion(string version);
   UnsupportedBurn(AssetSchema asset_schema);
   UnsupportedInflation(AssetSchema asset_schema);
@@ -153,10 +157,6 @@ interface RgbLibError {
   UnsupportedSchema(AssetSchema asset_schema);
   UnsupportedTransportType();
   UnsupportedWalletManifestVersion(string version);
-  VssAuth(string details);
-  VssBackupNotFound();
-  VssError(string details);
-  VssVersionConflict(string details);
   WalletDirAlreadyExists(string path);
   WalletSettingMismatch(string setting, string expected, string provided);
   WatchOnly();
@@ -1215,6 +1215,12 @@ interface Wallet {
   void sync(Online online, SyncOptions options);
 
   [Throws=RgbLibError]
+  sequence<PendingVanillaTx> list_pending_vanilla_txs();
+
+  [Throws=RgbLibError]
+  void abort_pending_vanilla_tx(string txid);
+
+  [Throws=RgbLibError]
   void configure_vss_backup(VssBackupConfig config);
 
   void disable_vss_auto_backup();
@@ -1224,12 +1230,6 @@ interface Wallet {
 
   [Throws=RgbLibError]
   VssBackupInfo vss_backup_info(VssBackupClient client);
-
-  [Throws=RgbLibError]
-  sequence<PendingVanillaTx> list_pending_vanilla_txs();
-
-  [Throws=RgbLibError]
-  void abort_pending_vanilla_tx(string txid);
 };
 
 interface MultisigWallet {

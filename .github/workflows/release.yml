@@ -200,12 +200,12 @@ jobs:
           for target in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
             echo "Packaging c-ffi for $target"
             mkdir -p "temp-cffi-$target"
-            
+
             find artifacts/cffi-static-$target -type f -exec cp {} "temp-cffi-$target/" \; 2>/dev/null || true
             find artifacts/cffi-shared-$target -type f -exec cp {} "temp-cffi-$target/" \; 2>/dev/null || true
             find artifacts/cffi-header -type f -exec cp {} "temp-cffi-$target/" \; 2>/dev/null || true
             find artifacts/cffi-hpp-$target -type f -exec cp {} "temp-cffi-$target/" \; 2>/dev/null || true
-            
+
             if [ "$(ls -A temp-cffi-$target 2>/dev/null)" ]; then
               cd "temp-cffi-$target"
               zip -r "../release-assets/rgb-lib-cffi-$target.zip" .

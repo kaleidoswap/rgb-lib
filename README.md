@@ -22,10 +22,18 @@ N.B.: this library is still a work in progress and in its testing phase. Also,
 as long as the version is 0.*, API breaking changes should be expected.
 
 ## Important remark
-> :warning: **Warning: never use the same wallet on more than one device!**
+> :warning: **Warning: never instantiate a wallet in multiple places!**
 >
-> Using the same wallet (mnemonic phrase) on multiple devices can lead to RGB
-> asset loss due to improper UTXO management.
+> Using the same wallet (mnemonic phrase) on multiple directories or devices
+> can lead to RGB asset loss due to improper UTXO management.
+>
+> This includes keeping two instances live on a single data directory: an
+> instance loads its BDK state from the database when it is created and does not
+> re-read it afterwards, so the two immediately drift apart. They will hand out
+> the same addresses, causing address reuse, and each will persist state the
+> other is unaware of. A watch-only wallet and its signing counterpart are no
+> exception: keep a single instance performing wallet operations and use the
+> other one only to sign.
 
 This library is intended to exclusively handle all UTXOs for the wallet. Using
 the same mnemonic phrase on any other device, including with this same library,
@@ -34,6 +42,30 @@ can lead to serious issues and ultimately to RGB asset loss.
 Each time the wallet is brought online, a consistency check is carried out to
 make sure the UTXO set has not changed since the last synchronization and an
 error is returned in case discrepancies are detected.
+
+## VSS backups
+
+The optional `vss` feature uploads encrypted backups of the complete wallet state,
+including a consistent SQLite snapshot of RGB and BDK data, public wallet settings,
+and address reuse indices. New uploads require encryption; configuring a wallet
+with `with_encryption(false)` returns `VssEncryptionRequired`. Existing plaintext
+VSS backups can still be downloaded and restored with their original signing key
+and store ID. They may need the original wallet settings and a Bitcoin rescan,
+because the historical sanitized format omitted BDK files and the wallet manifest.
+
+New uploads use version-2 manifests and immutable upload generations. Publishing
+the manifest is atomic, so an interrupted replacement leaves the previous backup
+readable. Restore requires a client supporting this format; version-1 encrypted
+and plaintext backups remain readable. Earlier generations and abandoned uploads
+are retained for readers that already fetched an older manifest. Explicit backup
+deletion removes all generations in the store's `backup/` namespace.
+
+Auto-backup coalesces capture requests while an upload is running, before copying
+or compressing wallet files. Snapshots coordinate RGB persistence and database
+transactions and exclude transient runtime locks. A completed upload marks only
+the operations captured in that snapshot as backed up. The
+signing key derives the encryption key, so it must be recoverable independently
+of the encrypted backup. Keep the mnemonic outside the wallet backup as before.
 
 ## Language bindings
 Bindings for other languages are available. Check the [bindings] directory.

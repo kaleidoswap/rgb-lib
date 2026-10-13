@@ -14,7 +14,7 @@
 //! RGB asset operations.
 //!
 //! ## Database
-//! A SQLite database is used to persist data to disk.
+//! A SQLite database is used to persist data to disk, including the BDK wallet data.
 //!
 //! Database support is designed in order to support multiple database backends. At the moment only
 //! SQLite is supported but adding more should be relatively easy.
@@ -100,8 +100,6 @@ pub(crate) mod api;
 pub(crate) mod database;
 pub(crate) mod error;
 pub mod keys;
-#[cfg(feature = "mpc")]
-pub mod mpc;
 pub mod utils;
 pub mod wallet;
 
@@ -113,9 +111,11 @@ pub use rgbstd::{
         ConsignmentExt, Contract as RgbContract, Fascia, FileContent, PubWitness,
         Transfer as RgbTransfer, WitnessBundle,
     },
+    indexers::AnyResolver,
     persistence::UpdateRes,
     schema::SchemaId,
     txout::CloseMethod,
+    validation::{ValidationConfig, ValidationError},
     vm::WitnessOrd,
 };
 
@@ -124,24 +124,18 @@ pub use crate::{
         AssetSchema, Assignment, TransferStatus, TransportType, WalletTransactionType,
     },
     error::Error,
-    keys::{generate_keys, restore_keys},
     utils::{BitcoinNetwork, block_on},
     wallet::{
         IfaIssuanceType, RecipientType, TransactionType, TransferKind, Wallet,
         backup::restore_backup,
     },
 };
-#[cfg(feature = "mpc")]
-pub use mpc::MpcWalletProvider;
-#[cfg(feature = "dfns")]
-pub use mpc::dfns::{DfnsConfig, DfnsProvider};
 #[cfg(any(feature = "electrum", feature = "esplora"))]
-pub use rgbstd::validation::{ValidationConfig, ValidationError};
-
+use std::collections::BTreeSet;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use std::{
     cmp::{Ordering, max, min},
-    collections::{BTreeSet, hash_map::DefaultHasher},
+    collections::hash_map::DefaultHasher,
     hash::Hasher,
     num::NonZeroU32,
 };
@@ -153,7 +147,7 @@ use std::{
     panic,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
@@ -176,32 +170,35 @@ use bdk_esplora::{
         BlockingClient as EsploraClient, Builder as EsploraBuilder, Error as EsploraError,
     },
 };
-#[cfg(feature = "esplora")]
-use bdk_wallet::bitcoin::Txid;
+#[cfg(feature = "bdk_file_store_migration")]
+use bdk_wallet::file_store::Store;
 use bdk_wallet::{
-    ChangeSet, KeychainKind, LocalOutput, PersistedWallet, SignOptions, Wallet as BdkWallet,
+    ChangeSet, KeychainKind, LocalOutput, SignOptions, Wallet as BdkWallet,
     bitcoin::{
         Address as BdkAddress, Amount as BdkAmount, BlockHash, Network as BdkNetwork, NetworkKind,
-        OutPoint, OutPoint as BdkOutPoint, ScriptBuf, TxOut,
+        OutPoint, OutPoint as BdkOutPoint, ScriptBuf, Transaction as BdkTransaction, TxOut, Txid,
         bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource, Xpriv, Xpub},
+        consensus::{Decodable, Encodable},
         hashes::{Hash as Sha256Hash, sha256},
         psbt::Psbt,
         secp256k1::Secp256k1,
     },
-    chain::{CanonicalizationParams, ChainPosition},
+    chain::{
+        BlockId, CanonicalizationParams, ChainPosition, ConfirmationBlockTime, DescriptorId, Merge,
+    },
     descriptor::Segwitv0,
-    file_store::Store,
     keys::{
         DerivableKey, DescriptorKey,
         DescriptorKey::{Public, Secret},
         ExtendedKey, GeneratableKey,
         bip39::{Language, Mnemonic, WordCount},
     },
+    miniscript::{Descriptor, DescriptorPublicKey},
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use bdk_wallet::{
     Update,
-    bitcoin::{Transaction as BdkTransaction, blockdata::fee_rate::FeeRate, hashes::HashEngine},
+    bitcoin::{blockdata::fee_rate::FeeRate, hashes::HashEngine},
     chain::{
         DescriptorExt,
         spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse},
@@ -256,7 +253,6 @@ use rgbstd::{
     containers::Consignment,
     contract::FilterIncludeAll,
     daggy::Walker,
-    indexers::AnyResolver,
     info::ContractInfo,
     validation::{OpoutsDagData, Validity, Warning},
 };
@@ -271,10 +267,13 @@ use sea_orm::{
     ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection, DatabaseTransaction,
     DbErr, DeriveActiveEnum, EntityTrait, EnumIter, JsonValue, QueryFilter, QueryOrder,
     QueryResult, TransactionTrait, TryGetError, TryGetable, TryIntoModel,
+    sea_query::{Alias, Expr, ExprTrait, Func, OnConflict, SimpleExpr},
 };
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
-use slog::{Drain, Logger, debug, error, info, o, warn};
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use slog::warn;
+use slog::{Drain, Logger, debug, error, info, o};
 use slog_async::AsyncGuard;
 use slog_term::{FullFormat, PlainDecorator};
 use strict_encoding::{DecodeError, DeserializeError, FieldName};
@@ -291,10 +290,6 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 use crate::utils::INDEXER_BATCH_SIZE;
 #[cfg(feature = "esplora")]
 use crate::utils::INDEXER_PARALLEL_REQUESTS;
-#[cfg(test)]
-use crate::wallet::test::{
-    mock_asset_terms, mock_chain_net, mock_contract_details, mock_token_data,
-};
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[cfg(test)]
 use crate::wallet::test::{
@@ -357,13 +352,18 @@ use crate::{
     keys::{Keys, WitnessVersion},
     utils::{
         ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, PURPOSE, RgbRuntime,
-        adjust_canonicalization, beneficiary_from_script_buf, from_str_or_number_mandatory,
-        from_str_or_number_optional, get_account_xpubs, get_coin_type, get_descriptors,
-        get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex, load_rgb_runtime, now,
-        parse_address_str, setup_logger, str_to_xpub,
+        adjust_canonicalization, atomic_tmp_path, atomic_write, atomic_write_with,
+        beneficiary_from_script_buf, from_str_or_number_mandatory, from_str_or_number_optional,
+        get_account_xpubs, get_coin_type, get_descriptors, get_descriptors_from_xpubs, hash_bytes,
+        hash_bytes_hex, load_rgb_runtime, now, parse_address_str, setup_logger, str_to_xpub,
     },
     wallet::{
         Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS, Outpoint, SCHEMA_ID_CFA,
         SCHEMA_ID_IFA, SCHEMA_ID_NIA, SCHEMA_ID_UDA, WalletDescriptors,
     },
+};
+#[cfg(test)]
+use crate::{
+    keys::generate_keys,
+    wallet::test::{mock_asset_terms, mock_chain_net, mock_contract_details, mock_token_data},
 };

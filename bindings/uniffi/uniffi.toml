@@ -1,9 +1,0 @@
-[bindings.kotlin]
-package_name = "com.utexo"
-cdylib_name = "rgblibuniffi"
-
-[bindings.python]
-cdylib_name = "rgblibuniffi"
-
-[bindings.swift]
-cdylib_name = "rgblibuniffi"

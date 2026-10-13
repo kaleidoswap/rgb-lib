@@ -784,6 +784,8 @@ fn success() {
     let amount = 1000;
     let addr = singlesig_wlt.get_address();
     let op_init = wlt_1.send_btc_init(&addr, amount);
+    // the balance check below expects the TX to be unconfirmed
+    let _guard = stop_mining();
     operation_complete::<SendBtcHandler>(
         op_init.operation_idx,
         &mut [&mut wlt_1, &mut wlt_2, &mut wlt_3],
@@ -801,6 +803,13 @@ fn success() {
         (0, 6442, 6442),
         (15366, 15366, 15366),
     );
+    drop(_guard);
+    // confirm the TX, so the final state checks below don't depend on other tests mining
+    let send_btc_txid = Psbt::from_str(&op_init.psbt)
+        .unwrap()
+        .get_txid()
+        .to_string();
+    mine_tx(false, &send_btc_txid);
     let op_init_last_successful = op_init;
 
     println!("\n=== receive failed (wlt_1) ===");
@@ -877,7 +886,7 @@ fn success() {
     );
 
     // final state expectations
-    let btc_final_vanilla = (0, 6442, 6442);
+    let btc_final_vanilla = (6442, 6442, 6442);
     let btc_final_colored = (15366, 15366, 15366);
     let tx_type_final = TransactionType::SendBtc;
     #[rustfmt::skip]

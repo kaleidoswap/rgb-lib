@@ -247,7 +247,7 @@ fn success() {
     // rate that requires additional inputs be added to cover fee costs
     let transport_endpoints = vec![
         format!("rpc://{PROXY_HOST_MOD_PROTO}"),
-        s!("rpc://127.6.6.6:7777/json-rpc"),
+        "rpc://127.6.6.6:7777/json-rpc".to_string(),
         format!("rpc://{PROXY_HOST}"),
     ];
     let receive_data_invalid_unreachable = rcv_party.blind_receive_with_endpoints(
@@ -2719,7 +2719,7 @@ fn fail() {
 
     // transport endpoints: no valid endpoints (down, modified)
     let transport_endpoints = vec![
-        s!("rpc://127.6.6.6:7777/json-rpc"),
+        "rpc://127.6.6.6:7777/json-rpc".to_string(),
         format!("rpc://{PROXY_HOST_MOD_PROTO}"),
     ];
     let recipient_map = HashMap::from([(
@@ -2740,10 +2740,10 @@ fn fail() {
 
     // transport endpoints: too many endpoints
     let transport_endpoints = vec![
-        s!("rgbhttpjsonrpc:127.0.0.1:3000/json-rpc"),
-        s!("rgbhttpjsonrpc:127.0.0.1:3001/json-rpc"),
-        s!("rgbhttpjsonrpc:127.0.0.1:3002/json-rpc"),
-        s!("rgbhttpjsonrpc:127.0.0.1:3003/json-rpc"),
+        "rgbhttpjsonrpc:127.0.0.1:3000/json-rpc".to_string(),
+        "rgbhttpjsonrpc:127.0.0.1:3001/json-rpc".to_string(),
+        "rgbhttpjsonrpc:127.0.0.1:3002/json-rpc".to_string(),
+        "rgbhttpjsonrpc:127.0.0.1:3003/json-rpc".to_string(),
     ];
     let recipient_map = HashMap::from([(
         asset.asset_id.clone(),
@@ -3776,6 +3776,178 @@ fn send_to_oneself_crash_no_dry_run() {
             .count(),
         2
     );
+}
+
+/// Regression test for `send_end` panicking with "exists at this point" when a non-dry-run
+/// `send_begin` produced `extra_allocations`.
+///
+/// A single colorable UTXO holds allocations of two assets; only one of them is sent, so the other
+/// one is moved to change as an extra allocation. With `dry_run = false` the batch is persisted as
+/// Initiated together with a non-user-driven asset transfer for the extra asset, which has no
+/// counterpart in the transfer data `transfers` map. `send_end` must complete anyway.
+#[cfg(feature = "electrum")]
+fn send_extra_allocations_no_dry_run_impl(donation: bool) {
+    let amount: u64 = 66;
+    let supply_cfa = AMOUNT * 2;
+
+    // wallets
+    let mut party = get_funded_noutxo_party!();
+    let mut rcv_party = get_funded_party!();
+    party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // issue two assets, both allocated to the same (only) colorable UTXO
+    let asset = party.issue_asset_nia(None);
+    let asset_extra = party.issue_asset_cfa(Some(&[supply_cfa]), None);
+    let unspents = party.list_unspents(true);
+    let unspents_with_rgb_allocations: Vec<Unspent> = unspents
+        .into_iter()
+        .filter(|u| !u.rgb_allocations.is_empty())
+        .collect();
+    assert_eq!(unspents_with_rgb_allocations.len(), 1);
+    let allocation_asset_ids: Vec<String> = unspents_with_rgb_allocations
+        .first()
+        .unwrap()
+        .rgb_allocations
+        .clone()
+        .into_iter()
+        .map(|a| a.asset_id.unwrap_or_else(|| s!("")))
+        .collect();
+    assert!(allocation_asset_ids.contains(&asset.asset_id));
+    assert!(allocation_asset_ids.contains(&asset_extra.asset_id));
+
+    // one more UTXO to receive the change
+    party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // send only the first asset, with dry_run=false so the batch is persisted as Initiated
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let begin = party
+        .wallet
+        .send_begin(
+            party.online,
+            recipient_map,
+            donation,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            default_send_expiration(),
+            false,
+            None,
+        )
+        .unwrap();
+    let batch_transfer_idx = begin.batch_transfer_idx.unwrap();
+
+    // the Initiated batch holds a user-driven asset transfer for the sent asset and a
+    // non-user-driven one (with no transfers) for the extra asset moved to change
+    let batch_transfers: Vec<_> = party
+        .db_batch_transfers()
+        .into_iter()
+        .filter(|b| b.idx == batch_transfer_idx)
+        .collect();
+    assert_eq!(batch_transfers.len(), 1);
+    let batch_transfer = batch_transfers.first().unwrap();
+    assert_eq!(batch_transfer.status, TransferStatus::Initiated);
+    let txid = batch_transfer.txid.clone().unwrap();
+    let asset_transfers = party.db_asset_transfers_filtered(batch_transfer_idx);
+    assert_eq!(asset_transfers.len(), 2);
+    let asset_transfer = asset_transfers
+        .iter()
+        .find(|a| a.asset_id == Some(asset.asset_id.clone()))
+        .unwrap();
+    let asset_extra_asset_transfer = asset_transfers
+        .iter()
+        .find(|a| a.asset_id == Some(asset_extra.asset_id.clone()))
+        .unwrap();
+    assert!(asset_transfer.user_driven);
+    assert_eq!(party.db_transfers_filtered(asset_transfer.idx).len(), 1);
+    assert!(!asset_extra_asset_transfer.user_driven);
+    assert!(
+        party
+            .db_transfers_filtered(asset_extra_asset_transfer.idx)
+            .is_empty()
+    );
+
+    // sign and complete the send: this used to panic with "exists at this point"
+    let signed_psbt = party.wallet.sign_psbt(begin.psbt, None).unwrap();
+    let res = party.wallet.send_end(party.online, signed_psbt).unwrap();
+    assert_eq!(res.txid, txid);
+    assert_eq!(res.batch_transfer_idx, batch_transfer_idx);
+
+    // the existing batch has been updated (not duplicated) and the transport endpoint of the
+    // send transfer has been marked as used
+    let expected_status = if donation {
+        TransferStatus::WaitingConfirmations
+    } else {
+        TransferStatus::WaitingCounterparty
+    };
+    assert!(party.check_test_transfer_status_sender(&txid, expected_status));
+    let (transfers, asset_transfers, _) = party.get_test_transfers_sender(&txid);
+    assert_eq!(asset_transfers.len(), 2);
+    let transfer = transfers.get(&asset.asset_id).unwrap().first().unwrap();
+    let tte_data = party.db_transfer_transport_endpoints_data(transfer.idx);
+    assert_eq!(tte_data.len(), 1);
+    assert!(tte_data.first().unwrap().0.used);
+
+    // settle the transfer
+    rcv_party.wait_for_refresh(None);
+    if !donation {
+        // the sender waits for the recipient ACK before broadcasting, a donation has already
+        // been broadcast by send_end
+        party.wait_for_refresh(Some(&asset.asset_id));
+    }
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Settled
+        )
+    );
+
+    // the sent asset moved, the extra asset stayed with the sender
+    assert_eq!(
+        party.get_asset_balance(&asset.asset_id).settled,
+        AMOUNT - amount
+    );
+    assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, amount);
+    assert_eq!(
+        party.get_asset_balance(&asset_extra.asset_id).settled,
+        supply_cfa
+    );
+    let unspents = party.list_unspents(true);
+    assert!(unspents.iter().any(|u| {
+        u.rgb_allocations
+            .iter()
+            .any(|a| a.asset_id == Some(asset_extra.asset_id.clone()) && a.settled)
+    }));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn send_extra_allocations_no_dry_run() {
+    initialize();
+
+    send_extra_allocations_no_dry_run_impl(false);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn send_extra_allocations_no_dry_run_donation() {
+    initialize();
+
+    send_extra_allocations_no_dry_run_impl(true);
 }
 
 #[cfg(feature = "electrum")]
@@ -5647,8 +5819,7 @@ fn script_buf_to_from_recipient_id() {
     let script_buf = party.wallet.get_script_pubkey(&address_str).unwrap();
 
     // recipient ID from script buf
-    let recipient_id =
-        recipient_id_from_script_buf(script_buf.clone(), BitcoinNetwork::Regtest).unwrap();
+    let recipient_id = recipient_id_from_script_buf(script_buf.clone(), BitcoinNetwork::Regtest);
 
     // script buf from recipient ID Some
     let script_from_recipient = script_buf_from_recipient_id(recipient_id).unwrap();
@@ -5665,16 +5836,6 @@ fn script_buf_to_from_recipient_id() {
     // script buf from recipient ID None (bad recipient ID)
     let result = script_buf_from_recipient_id(s!(""));
     assert!(matches!(result, Err(Error::InvalidRecipientID)));
-
-    // bare CHECKMULTISIG is not an AddressPayload
-    let mut bare_multisig = vec![0x51, 0x21, 0x02];
-    bare_multisig.extend([0x11u8; 32]);
-    bare_multisig.extend([0x51, 0xae]);
-    let result = recipient_id_from_script_buf(
-        ScriptBuf::from_bytes(bare_multisig),
-        BitcoinNetwork::Regtest,
-    );
-    assert!(matches!(result, Err(Error::InvalidAddress { .. })));
 }
 
 #[cfg(feature = "electrum")]
@@ -7793,868 +7954,6 @@ fn allocations() {
     }
 }
 
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn offline_receiver_blind_restart_waiting_counterparty() {
-    initialize();
-
-    let amount: u64 = 66;
-    let waiting_balance = Balance {
-        settled: 0,
-        future: amount,
-        spendable: 0,
-    };
-    let settled_balance = Balance {
-        settled: amount,
-        future: amount,
-        spendable: amount,
-    };
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-
-    let asset = party.issue_asset_nia(None);
-
-    let mining_guard = stop_mining();
-
-    let receive_data = rcv_party.blind_receive();
-    let recipient_id = receive_data.recipient_id.clone();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(amount),
-            recipient_id: recipient_id.clone(),
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        }],
-    )]);
-    let txid = party.send_retry(&recipient_map);
-    assert!(!txid.is_empty());
-
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-
-    let mut rcv_party = restart_party(rcv_party);
-
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-
-    rcv_party.wait_for_refresh_raw(None, None);
-    assert!(
-        rcv_party
-            .check_test_transfer_status_recipient(&recipient_id, TransferStatus::WaitingBroadcast)
-    );
-    rcv_party.wait_for_asset_balance(&asset.asset_id, &waiting_balance);
-
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
-
-    rcv_party.wait_for_refresh_raw(None, None);
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingConfirmations
-        )
-    );
-
-    drop(mining_guard);
-    mine(false);
-    rcv_party.wait_for_refresh_raw(None, None);
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-
-    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Settled));
-    rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn offline_receiver_witness_restart_waiting_counterparty() {
-    initialize();
-
-    let amount: u64 = 66;
-    let waiting_balance = Balance {
-        settled: 0,
-        future: amount,
-        spendable: 0,
-    };
-    let settled_balance = Balance {
-        settled: amount,
-        future: amount,
-        spendable: amount,
-    };
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_empty_party!();
-
-    let asset = party.issue_asset_nia(None);
-
-    let mining_guard = stop_mining();
-
-    let receive_data = rcv_party.witness_receive();
-    let recipient_id = receive_data.recipient_id.clone();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(amount),
-            recipient_id: recipient_id.clone(),
-            witness_data: Some(WitnessData {
-                amount_sat: 1000,
-                blinding: None,
-            }),
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        }],
-    )]);
-    let txid = party.send_retry(&recipient_map);
-    assert!(!txid.is_empty());
-
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-
-    let pws_before = rcv_party.db_pending_witness_scripts();
-    assert_eq!(pws_before.len(), 1);
-
-    let mut rcv_party = restart_party(rcv_party);
-
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-    let pws_after_restart = rcv_party.db_pending_witness_scripts();
-    assert_eq!(pws_after_restart.len(), 1);
-
-    rcv_party.wait_for_refresh_raw(None, None);
-    assert!(
-        rcv_party
-            .check_test_transfer_status_recipient(&recipient_id, TransferStatus::WaitingBroadcast)
-    );
-
-    let pws_after_rcv_refresh = rcv_party.db_pending_witness_scripts();
-    assert_eq!(pws_after_rcv_refresh.len(), 1);
-
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
-
-    rcv_party.wait_for_refresh_raw(None, None);
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingConfirmations
-        )
-    );
-    rcv_party.wait_for_asset_balance(&asset.asset_id, &waiting_balance);
-
-    rcv_party.sync(SyncOptions {
-        keychain: SyncKeychain::Colored,
-        strategy: SyncStrategy::FastSync,
-    });
-
-    let rcv_txos = rcv_party.db_txos();
-    let rcv_witness_txos: Vec<database::entities::txo::Model> =
-        rcv_txos.into_iter().filter(|t| t.txid == txid).collect();
-    assert_eq!(rcv_witness_txos.len(), 1);
-    let rcv_txo = rcv_witness_txos.first().unwrap();
-    assert!(rcv_txo.exists);
-    assert!(rcv_txo.pending_witness);
-    let rcv_outpoint = Outpoint {
-        txid: txid.clone(),
-        vout: rcv_txo.vout,
-    };
-
-    let pws_after_broadcast = rcv_party.db_pending_witness_scripts();
-    assert!(pws_after_broadcast.is_empty());
-
-    drop(mining_guard);
-    mine(false);
-    rcv_party.wait_for_refresh_raw(None, None);
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-
-    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Settled));
-    rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
-
-    let rcv_txo = rcv_party.db_txo(&rcv_outpoint).unwrap();
-    assert!(!rcv_txo.pending_witness);
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn offline_receiver_witness_restart_donation_true() {
-    initialize();
-
-    let amount: u64 = 66;
-    let waiting_balance = Balance {
-        settled: 0,
-        future: amount,
-        spendable: 0,
-    };
-    let settled_balance = Balance {
-        settled: amount,
-        future: amount,
-        spendable: amount,
-    };
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_empty_party!();
-
-    let asset = party.issue_asset_nia(None);
-
-    let mining_guard = stop_mining();
-
-    let receive_data = rcv_party.witness_receive();
-    let recipient_id = receive_data.recipient_id.clone();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(amount),
-            recipient_id: recipient_id.clone(),
-            witness_data: Some(WitnessData {
-                amount_sat: 1000,
-                blinding: None,
-            }),
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        }],
-    )]);
-    let OperationResult { txid, .. } = party
-        .wallet
-        .send(
-            party.online,
-            recipient_map,
-            true,
-            FEE_RATE,
-            MIN_CONFIRMATIONS,
-            default_send_expiration(),
-            None,
-        )
-        .unwrap();
-    assert!(!txid.is_empty());
-
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-    let pws_before = rcv_party.db_pending_witness_scripts();
-    assert_eq!(pws_before.len(), 1);
-
-    let mut rcv_party = restart_party(rcv_party);
-
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-
-    rcv_party.sync(SyncOptions {
-        keychain: SyncKeychain::Colored,
-        strategy: SyncStrategy::FastSync,
-    });
-
-    let rcv_txos = rcv_party.db_txos();
-    let rcv_witness_txos: Vec<database::entities::txo::Model> =
-        rcv_txos.into_iter().filter(|t| t.txid == txid).collect();
-    assert_eq!(rcv_witness_txos.len(), 1);
-    let rcv_txo = rcv_witness_txos.first().unwrap();
-    assert!(rcv_txo.exists);
-    assert!(rcv_txo.pending_witness);
-    let rcv_outpoint = Outpoint {
-        txid: txid.clone(),
-        vout: rcv_txo.vout,
-    };
-
-    let pws_after_sync = rcv_party.db_pending_witness_scripts();
-    assert!(pws_after_sync.is_empty());
-
-    rcv_party.wait_for_refresh_raw(None, None);
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingConfirmations
-        )
-    );
-    rcv_party.wait_for_asset_balance(&asset.asset_id, &waiting_balance);
-
-    party.refresh_all();
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
-
-    drop(mining_guard);
-    mine(false);
-    rcv_party.wait_for_refresh_raw(None, None);
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-
-    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Settled));
-    rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
-
-    let rcv_txo = rcv_party.db_txo(&rcv_outpoint).unwrap();
-    assert!(rcv_txo.exists);
-    assert!(!rcv_txo.pending_witness);
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn offline_receiver_blind_restart_donation_true() {
-    initialize();
-
-    let amount: u64 = 66;
-    let waiting_balance = Balance {
-        settled: 0,
-        future: amount,
-        spendable: 0,
-    };
-    let settled_balance = Balance {
-        settled: amount,
-        future: amount,
-        spendable: amount,
-    };
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-
-    let asset = party.issue_asset_nia(None);
-
-    let mining_guard = stop_mining();
-
-    let receive_data = rcv_party.blind_receive();
-    let recipient_id = receive_data.recipient_id.clone();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(amount),
-            recipient_id: recipient_id.clone(),
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        }],
-    )]);
-    let OperationResult { txid, .. } = party
-        .wallet
-        .send(
-            party.online,
-            recipient_map,
-            true,
-            FEE_RATE,
-            MIN_CONFIRMATIONS,
-            default_send_expiration(),
-            None,
-        )
-        .unwrap();
-    assert!(!txid.is_empty());
-
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-
-    let mut rcv_party = restart_party(rcv_party);
-
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-
-    rcv_party.wait_for_refresh_raw(None, None);
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingConfirmations
-        )
-    );
-    rcv_party.wait_for_asset_balance(&asset.asset_id, &waiting_balance);
-
-    party.refresh_all();
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
-
-    drop(mining_guard);
-    mine(false);
-    rcv_party.wait_for_refresh_raw(None, None);
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-
-    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Settled));
-    rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn offline_receiver_nack_sender_failed_no_asset_materialized_on_receiver() {
-    initialize();
-
-    let amount: u64 = 66;
-    let zero_balance = Balance {
-        settled: 0,
-        future: 0,
-        spendable: 0,
-    };
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-
-    let asset = party.issue_asset_nia(None);
-
-    let receive_data = rcv_party.blind_receive();
-    let recipient_id = receive_data.recipient_id.clone();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(amount),
-            recipient_id: recipient_id.clone(),
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        }],
-    )]);
-    let txid = party.send_retry(&recipient_map);
-    assert!(!txid.is_empty());
-
-    // This is intentionally a sender-side NACK invariant test.
-    // The receiver never refreshes after the manual NACK, so the asset must not materialize there.
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
-
-    ProxyClient::new(PROXY_URL)
-        .unwrap()
-        .post_ack(&recipient_id, false)
-        .unwrap();
-
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-    match rcv_party.get_asset_balance_result(&asset.asset_id) {
-        Ok(balance) => assert_eq!(balance, zero_balance),
-        Err(Error::AssetNotFound { .. }) => {}
-        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
-    }
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn offline_receiver_nack_receiver_fails_after_sender_failure() {
-    initialize();
-
-    let amount: u64 = 66;
-    let zero_balance = Balance {
-        settled: 0,
-        future: 0,
-        spendable: 0,
-    };
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-
-    let asset = party.issue_asset_nia(None);
-
-    let receive_data = rcv_party.blind_receive();
-    let recipient_id = receive_data.recipient_id.clone();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(amount),
-            recipient_id: recipient_id.clone(),
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        }],
-    )]);
-    let txid = party.send_retry(&recipient_map);
-    assert!(!txid.is_empty());
-
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
-
-    ProxyClient::new(PROXY_URL)
-        .unwrap()
-        .post_ack(&recipient_id, false)
-        .unwrap();
-
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-
-    rcv_party.wait_for_refresh_raw(None, None);
-    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
-    match rcv_party.get_asset_balance_result(&asset.asset_id) {
-        Ok(balance) => assert_eq!(balance, zero_balance),
-        Err(Error::AssetNotFound { .. }) => {}
-        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
-    }
-
-    party.refresh_all();
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
-
-    mine(false);
-    rcv_party.refresh_all();
-    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
-    match rcv_party.get_asset_balance_result(&asset.asset_id) {
-        Ok(balance) => assert_eq!(balance, zero_balance),
-        Err(Error::AssetNotFound { .. }) => {}
-        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
-    }
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn offline_receiver_nack_receiver_fails_before_broadcast() {
-    initialize();
-
-    let amount: u64 = 66;
-    let zero_balance = Balance {
-        settled: 0,
-        future: 0,
-        spendable: 0,
-    };
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-
-    let asset = party.issue_asset_nia(None);
-
-    let receive_data = rcv_party.blind_receive();
-    let recipient_id = receive_data.recipient_id.clone();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(amount),
-            recipient_id: recipient_id.clone(),
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        }],
-    )]);
-    let txid = party.send_retry(&recipient_map);
-    assert!(!txid.is_empty());
-
-    ProxyClient::new(PROXY_URL)
-        .unwrap()
-        .post_ack(&recipient_id, false)
-        .unwrap();
-
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
-
-    rcv_party.wait_for_refresh_raw(None, None);
-    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
-    match rcv_party.get_asset_balance_result(&asset.asset_id) {
-        Ok(balance) => assert_eq!(balance, zero_balance),
-        Err(Error::AssetNotFound { .. }) => {}
-        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
-    }
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn offline_receiver_nack_donation_true_receiver_fails_after_broadcast() {
-    initialize();
-
-    let amount: u64 = 66;
-    let zero_balance = Balance {
-        settled: 0,
-        future: 0,
-        spendable: 0,
-    };
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-
-    let asset = party.issue_asset_nia(None);
-
-    let mining_guard = stop_mining();
-
-    let receive_data = rcv_party.blind_receive();
-    let recipient_id = receive_data.recipient_id.clone();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(amount),
-            recipient_id: recipient_id.clone(),
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        }],
-    )]);
-    let OperationResult { txid, .. } = party
-        .wallet
-        .send(
-            party.online,
-            recipient_map,
-            true,
-            FEE_RATE,
-            MIN_CONFIRMATIONS,
-            default_send_expiration(),
-            None,
-        )
-        .unwrap();
-    assert!(!txid.is_empty());
-
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &recipient_id,
-            TransferStatus::WaitingCounterparty
-        )
-    );
-
-    ProxyClient::new(PROXY_URL)
-        .unwrap()
-        .post_ack(&recipient_id, false)
-        .unwrap();
-
-    party.refresh_all();
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
-
-    rcv_party.wait_for_refresh_raw(None, None);
-    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
-    match rcv_party.get_asset_balance_result(&asset.asset_id) {
-        Ok(balance) => assert_eq!(balance, zero_balance),
-        Err(Error::AssetNotFound { .. }) => {}
-        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
-    }
-
-    drop(mining_guard);
-    mine(false);
-    rcv_party.refresh_all();
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
-    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
-    match rcv_party.get_asset_balance_result(&asset.asset_id) {
-        Ok(balance) => assert_eq!(balance, zero_balance),
-        Err(Error::AssetNotFound { .. }) => {}
-        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
-    }
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn offline_receiver_sequential_receives_slot_integrity_after_restart() {
-    initialize();
-
-    let amount: u64 = 22;
-    let mut party = get_funded_party!();
-    let mut rcv_party = offline_party!(get_test_wallet(true, Some(5)));
-    let online = rcv_party.go_online(true, None);
-    let mut rcv_party = party!(rcv_party.wallet, online);
-
-    fund_wallet(rcv_party.get_address());
-    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, Some(1));
-
-    let asset = party.issue_asset_nia(None);
-
-    let mut settled_total = 0;
-
-    for _ in 0..3 {
-        assert_eq!(rcv_party.get_colorable_unspents_with_sync(false).len(), 1);
-
-        let receive_data = rcv_party.blind_receive();
-        let recipient_map = HashMap::from([(
-            asset.asset_id.clone(),
-            vec![Recipient {
-                assignment: Assignment::Fungible(amount),
-                recipient_id: receive_data.recipient_id.clone(),
-                witness_data: None,
-                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-            }],
-        )]);
-        let txid = party.send_retry(&recipient_map);
-        assert!(!txid.is_empty());
-
-        rcv_party.wait_for_refresh_raw(None, None);
-        party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-
-        let waiting_balance = Balance {
-            settled: settled_total,
-            future: settled_total + amount,
-            spendable: 0,
-        };
-        rcv_party.wait_for_asset_balance(&asset.asset_id, &waiting_balance);
-
-        mine(false);
-        rcv_party.wait_for_refresh_raw(None, None);
-        party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-
-        settled_total += amount;
-        let settled_balance = Balance {
-            settled: settled_total,
-            future: settled_total,
-            spendable: settled_total,
-        };
-        assert!(rcv_party.check_test_transfer_status_recipient(
-            &receive_data.recipient_id,
-            TransferStatus::Settled
-        ));
-        rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
-
-        assert_eq!(rcv_party.get_colorable_unspents_with_sync(false).len(), 1);
-
-        rcv_party = restart_party(rcv_party);
-
-        rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
-        assert_eq!(rcv_party.get_colorable_unspents_with_sync(false).len(), 1);
-    }
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn offline_receiver_mixed_blind_witness_batch_donation_false() {
-    initialize();
-
-    let blind_amount: u64 = 44;
-    let witness_amount: u64 = 22;
-    let blind_waiting_balance = Balance {
-        settled: 0,
-        future: blind_amount,
-        spendable: 0,
-    };
-    let witness_waiting_balance = Balance {
-        settled: 0,
-        future: witness_amount,
-        spendable: 0,
-    };
-    let blind_settled_balance = Balance {
-        settled: blind_amount,
-        future: blind_amount,
-        spendable: blind_amount,
-    };
-    let witness_settled_balance = Balance {
-        settled: witness_amount,
-        future: witness_amount,
-        spendable: witness_amount,
-    };
-
-    let mut party = get_funded_party!();
-    let mut blind_party = get_funded_party!();
-    let mut witness_party = get_empty_party!();
-
-    let asset = party.issue_asset_nia(None);
-
-    let mining_guard = stop_mining();
-
-    let blind_receive_data = blind_party.blind_receive();
-    let witness_receive_data = witness_party.witness_receive();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![
-            Recipient {
-                assignment: Assignment::Fungible(blind_amount),
-                recipient_id: blind_receive_data.recipient_id.clone(),
-                witness_data: None,
-                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-            },
-            Recipient {
-                assignment: Assignment::Fungible(witness_amount),
-                recipient_id: witness_receive_data.recipient_id.clone(),
-                witness_data: Some(WitnessData {
-                    amount_sat: 1000,
-                    blinding: None,
-                }),
-                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-            },
-        ],
-    )]);
-    let txid = party.send_retry(&recipient_map);
-    assert!(!txid.is_empty());
-
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
-    assert!(blind_party.check_test_transfer_status_recipient(
-        &blind_receive_data.recipient_id,
-        TransferStatus::WaitingCounterparty
-    ));
-    assert!(witness_party.check_test_transfer_status_recipient(
-        &witness_receive_data.recipient_id,
-        TransferStatus::WaitingCounterparty
-    ));
-
-    blind_party.wait_for_refresh_raw(None, None);
-    assert!(blind_party.check_test_transfer_status_recipient(
-        &blind_receive_data.recipient_id,
-        TransferStatus::WaitingBroadcast
-    ));
-    blind_party.wait_for_asset_balance(&asset.asset_id, &blind_waiting_balance);
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
-
-    witness_party.wait_for_refresh_raw(None, None);
-    assert!(witness_party.check_test_transfer_status_recipient(
-        &witness_receive_data.recipient_id,
-        TransferStatus::WaitingBroadcast
-    ));
-
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
-
-    blind_party.wait_for_refresh_raw(None, None);
-    assert!(blind_party.check_test_transfer_status_recipient(
-        &blind_receive_data.recipient_id,
-        TransferStatus::WaitingConfirmations
-    ));
-    witness_party.wait_for_refresh_raw(None, None);
-    assert!(witness_party.check_test_transfer_status_recipient(
-        &witness_receive_data.recipient_id,
-        TransferStatus::WaitingConfirmations
-    ));
-    witness_party.wait_for_asset_balance(&asset.asset_id, &witness_waiting_balance);
-
-    drop(mining_guard);
-    mine(false);
-    blind_party.wait_for_refresh_raw(None, None);
-    witness_party.wait_for_refresh_raw(None, None);
-    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
-
-    assert!(blind_party.check_test_transfer_status_recipient(
-        &blind_receive_data.recipient_id,
-        TransferStatus::Settled
-    ));
-    assert!(witness_party.check_test_transfer_status_recipient(
-        &witness_receive_data.recipient_id,
-        TransferStatus::Settled
-    ));
-    blind_party.wait_for_asset_balance(&asset.asset_id, &blind_settled_balance);
-    witness_party.wait_for_asset_balance(&asset.asset_id, &witness_settled_balance);
-}
-
 // End-to-end RGB on P2WPKH: fund + create_utxos + issue NIA + receive + send.
 // Exercises the OpretFirst commitment on a non-taproot output with both
 // blinded and witness recipients.
@@ -9942,6 +9241,915 @@ fn out_of_band_consignment_multiple_receives() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
+fn invalid_proxy_consignment_bytes() {
+    initialize();
+
+    let mut server = mockito::Server::new();
+    let server_url = server.url();
+    let host = server_url.trim_start_matches("http://");
+    let transport_endpoints = vec![format!("rpc://{host}")];
+
+    let consignment_mock = server
+        .mock("POST", "/")
+        .match_header("content-type", "application/json")
+        .match_body(mockito::Matcher::Regex("consignment\\.get".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"jsonrpc":"2.0","id":null,"result":{"consignment":"!!!","txid":"0000000000000000000000000000000000000000000000000000000000000000","vout":null}}"#,
+        )
+        .create();
+
+    let ack_mock = server
+        .mock("POST", "/")
+        .match_header("content-type", "application/json")
+        .match_body(mockito::Matcher::Regex("ack\\.post".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"jsonrpc":"2.0","id":null,"result":true}"#)
+        .create();
+
+    let mut rcv_party = get_funded_party!();
+    let receive_data = rcv_party.blind_receive_with_endpoints(None, transport_endpoints);
+
+    rcv_party.wait_for_refresh(None);
+
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Failed
+        )
+    );
+
+    consignment_mock.assert();
+    ack_mock.assert();
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn offline_receiver_blind_restart_waiting_counterparty() {
+    initialize();
+
+    let amount: u64 = 66;
+    let waiting_balance = Balance {
+        settled: 0,
+        future: amount,
+        spendable: 0,
+    };
+    let settled_balance = Balance {
+        settled: amount,
+        future: amount,
+        spendable: amount,
+    };
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let mining_guard = stop_mining();
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_id = receive_data.recipient_id.clone();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+
+    let mut rcv_party = restart_party(rcv_party);
+
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+
+    rcv_party.wait_for_refresh_raw(None, None);
+    assert!(
+        rcv_party
+            .check_test_transfer_status_recipient(&recipient_id, TransferStatus::WaitingBroadcast)
+    );
+    rcv_party.wait_for_asset_balance(&asset.asset_id, &waiting_balance);
+
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+
+    rcv_party.wait_for_refresh_raw(None, None);
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingConfirmations
+        )
+    );
+
+    drop(mining_guard);
+    mine(false);
+    rcv_party.wait_for_refresh_raw(None, None);
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+
+    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Settled));
+    rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn offline_receiver_witness_restart_waiting_counterparty() {
+    initialize();
+
+    let amount: u64 = 66;
+    let waiting_balance = Balance {
+        settled: 0,
+        future: amount,
+        spendable: 0,
+    };
+    let settled_balance = Balance {
+        settled: amount,
+        future: amount,
+        spendable: amount,
+    };
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_empty_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let mining_guard = stop_mining();
+
+    let receive_data = rcv_party.witness_receive();
+    let recipient_id = receive_data.recipient_id.clone();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: recipient_id.clone(),
+            witness_data: Some(WitnessData {
+                amount_sat: 1000,
+                blinding: None,
+            }),
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+
+    let pws_before = rcv_party.db_pending_witness_scripts();
+    assert_eq!(pws_before.len(), 1);
+
+    let mut rcv_party = restart_party(rcv_party);
+
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+    let pws_after_restart = rcv_party.db_pending_witness_scripts();
+    assert_eq!(pws_after_restart.len(), 1);
+
+    rcv_party.wait_for_refresh_raw(None, None);
+    assert!(
+        rcv_party
+            .check_test_transfer_status_recipient(&recipient_id, TransferStatus::WaitingBroadcast)
+    );
+
+    let pws_after_rcv_refresh = rcv_party.db_pending_witness_scripts();
+    assert_eq!(pws_after_rcv_refresh.len(), 1);
+
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+
+    rcv_party.wait_for_refresh_raw(None, None);
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingConfirmations
+        )
+    );
+    rcv_party.wait_for_asset_balance(&asset.asset_id, &waiting_balance);
+
+    rcv_party.sync(SyncOptions {
+        keychain: SyncKeychain::Colored,
+        strategy: SyncStrategy::FastSync,
+    });
+
+    let rcv_txos = rcv_party.db_txos();
+    let rcv_witness_txos: Vec<database::entities::txo::Model> =
+        rcv_txos.into_iter().filter(|t| t.txid == txid).collect();
+    assert_eq!(rcv_witness_txos.len(), 1);
+    let rcv_txo = rcv_witness_txos.first().unwrap();
+    assert!(rcv_txo.exists);
+    assert!(rcv_txo.pending_witness);
+    let rcv_outpoint = Outpoint {
+        txid: txid.clone(),
+        vout: rcv_txo.vout,
+    };
+
+    let pws_after_broadcast = rcv_party.db_pending_witness_scripts();
+    assert!(pws_after_broadcast.is_empty());
+
+    drop(mining_guard);
+    mine(false);
+    rcv_party.wait_for_refresh_raw(None, None);
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+
+    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Settled));
+    rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
+
+    let rcv_txo = rcv_party.db_txo(&rcv_outpoint).unwrap();
+    assert!(!rcv_txo.pending_witness);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn offline_receiver_witness_restart_donation_true() {
+    initialize();
+
+    let amount: u64 = 66;
+    let waiting_balance = Balance {
+        settled: 0,
+        future: amount,
+        spendable: 0,
+    };
+    let settled_balance = Balance {
+        settled: amount,
+        future: amount,
+        spendable: amount,
+    };
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_empty_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let mining_guard = stop_mining();
+
+    let receive_data = rcv_party.witness_receive();
+    let recipient_id = receive_data.recipient_id.clone();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: recipient_id.clone(),
+            witness_data: Some(WitnessData {
+                amount_sat: 1000,
+                blinding: None,
+            }),
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let OperationResult { txid, .. } = party
+        .wallet
+        .send(
+            party.online,
+            recipient_map,
+            true,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            default_send_expiration(),
+            None,
+        )
+        .unwrap();
+    assert!(!txid.is_empty());
+
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+    let pws_before = rcv_party.db_pending_witness_scripts();
+    assert_eq!(pws_before.len(), 1);
+
+    let mut rcv_party = restart_party(rcv_party);
+
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+
+    rcv_party.sync(SyncOptions {
+        keychain: SyncKeychain::Colored,
+        strategy: SyncStrategy::FastSync,
+    });
+
+    let rcv_txos = rcv_party.db_txos();
+    let rcv_witness_txos: Vec<database::entities::txo::Model> =
+        rcv_txos.into_iter().filter(|t| t.txid == txid).collect();
+    assert_eq!(rcv_witness_txos.len(), 1);
+    let rcv_txo = rcv_witness_txos.first().unwrap();
+    assert!(rcv_txo.exists);
+    assert!(rcv_txo.pending_witness);
+    let rcv_outpoint = Outpoint {
+        txid: txid.clone(),
+        vout: rcv_txo.vout,
+    };
+
+    let pws_after_sync = rcv_party.db_pending_witness_scripts();
+    assert!(pws_after_sync.is_empty());
+
+    rcv_party.wait_for_refresh_raw(None, None);
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingConfirmations
+        )
+    );
+    rcv_party.wait_for_asset_balance(&asset.asset_id, &waiting_balance);
+
+    party.refresh_all();
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+
+    drop(mining_guard);
+    mine(false);
+    rcv_party.wait_for_refresh_raw(None, None);
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+
+    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Settled));
+    rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
+
+    let rcv_txo = rcv_party.db_txo(&rcv_outpoint).unwrap();
+    assert!(rcv_txo.exists);
+    assert!(!rcv_txo.pending_witness);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn offline_receiver_blind_restart_donation_true() {
+    initialize();
+
+    let amount: u64 = 66;
+    let waiting_balance = Balance {
+        settled: 0,
+        future: amount,
+        spendable: 0,
+    };
+    let settled_balance = Balance {
+        settled: amount,
+        future: amount,
+        spendable: amount,
+    };
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let mining_guard = stop_mining();
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_id = receive_data.recipient_id.clone();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let OperationResult { txid, .. } = party
+        .wallet
+        .send(
+            party.online,
+            recipient_map,
+            true,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            default_send_expiration(),
+            None,
+        )
+        .unwrap();
+    assert!(!txid.is_empty());
+
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+
+    let mut rcv_party = restart_party(rcv_party);
+
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+
+    rcv_party.wait_for_refresh_raw(None, None);
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingConfirmations
+        )
+    );
+    rcv_party.wait_for_asset_balance(&asset.asset_id, &waiting_balance);
+
+    party.refresh_all();
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+
+    drop(mining_guard);
+    mine(false);
+    rcv_party.wait_for_refresh_raw(None, None);
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+
+    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Settled));
+    rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn offline_receiver_nack_sender_failed_no_asset_materialized_on_receiver() {
+    initialize();
+
+    let amount: u64 = 66;
+    let zero_balance = Balance {
+        settled: 0,
+        future: 0,
+        spendable: 0,
+    };
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_id = receive_data.recipient_id.clone();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+
+    // This is intentionally a sender-side NACK invariant test.
+    // The receiver never refreshes after the manual NACK, so the asset must not materialize there.
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
+
+    ProxyClient::new(PROXY_URL)
+        .unwrap()
+        .post_ack(&recipient_id, false)
+        .unwrap();
+
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+    match rcv_party.get_asset_balance_result(&asset.asset_id) {
+        Ok(balance) => assert_eq!(balance, zero_balance),
+        Err(Error::AssetNotFound { .. }) => {}
+        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn offline_receiver_nack_receiver_fails_after_sender_failure() {
+    initialize();
+
+    let amount: u64 = 66;
+    let zero_balance = Balance {
+        settled: 0,
+        future: 0,
+        spendable: 0,
+    };
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_id = receive_data.recipient_id.clone();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
+
+    ProxyClient::new(PROXY_URL)
+        .unwrap()
+        .post_ack(&recipient_id, false)
+        .unwrap();
+
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+
+    rcv_party.wait_for_refresh_raw(None, None);
+    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
+    match rcv_party.get_asset_balance_result(&asset.asset_id) {
+        Ok(balance) => assert_eq!(balance, zero_balance),
+        Err(Error::AssetNotFound { .. }) => {}
+        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
+    }
+
+    party.refresh_all();
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
+
+    mine(false);
+    rcv_party.refresh_all();
+    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
+    match rcv_party.get_asset_balance_result(&asset.asset_id) {
+        Ok(balance) => assert_eq!(balance, zero_balance),
+        Err(Error::AssetNotFound { .. }) => {}
+        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn offline_receiver_nack_receiver_fails_before_broadcast() {
+    initialize();
+
+    let amount: u64 = 66;
+    let zero_balance = Balance {
+        settled: 0,
+        future: 0,
+        spendable: 0,
+    };
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_id = receive_data.recipient_id.clone();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+
+    ProxyClient::new(PROXY_URL)
+        .unwrap()
+        .post_ack(&recipient_id, false)
+        .unwrap();
+
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
+
+    rcv_party.wait_for_refresh_raw(None, None);
+    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
+    match rcv_party.get_asset_balance_result(&asset.asset_id) {
+        Ok(balance) => assert_eq!(balance, zero_balance),
+        Err(Error::AssetNotFound { .. }) => {}
+        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn offline_receiver_nack_donation_true_receiver_fails_after_broadcast() {
+    initialize();
+
+    let amount: u64 = 66;
+    let zero_balance = Balance {
+        settled: 0,
+        future: 0,
+        spendable: 0,
+    };
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let mining_guard = stop_mining();
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_id = receive_data.recipient_id.clone();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let OperationResult { txid, .. } = party
+        .wallet
+        .send(
+            party.online,
+            recipient_map,
+            true,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            default_send_expiration(),
+            None,
+        )
+        .unwrap();
+    assert!(!txid.is_empty());
+
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingCounterparty
+        )
+    );
+
+    ProxyClient::new(PROXY_URL)
+        .unwrap()
+        .post_ack(&recipient_id, false)
+        .unwrap();
+
+    party.refresh_all();
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+
+    rcv_party.wait_for_refresh_raw(None, None);
+    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
+    match rcv_party.get_asset_balance_result(&asset.asset_id) {
+        Ok(balance) => assert_eq!(balance, zero_balance),
+        Err(Error::AssetNotFound { .. }) => {}
+        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
+    }
+
+    drop(mining_guard);
+    mine(false);
+    rcv_party.refresh_all();
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
+    match rcv_party.get_asset_balance_result(&asset.asset_id) {
+        Ok(balance) => assert_eq!(balance, zero_balance),
+        Err(Error::AssetNotFound { .. }) => {}
+        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn offline_receiver_sequential_receives_slot_integrity_after_restart() {
+    initialize();
+
+    let amount: u64 = 22;
+    let mut party = get_funded_party!();
+    let mut rcv_party = offline_party!(get_test_wallet(true, Some(5)));
+    let online = rcv_party.go_online(true, None);
+    let mut rcv_party = party!(rcv_party.wallet, online);
+
+    fund_wallet(rcv_party.get_address());
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, Some(1));
+
+    let asset = party.issue_asset_nia(None);
+
+    let mut settled_total = 0;
+
+    for _ in 0..3 {
+        assert_eq!(rcv_party.get_colorable_unspents_with_sync(false).len(), 1);
+
+        let receive_data = rcv_party.blind_receive();
+        let recipient_map = HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data.recipient_id.clone(),
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            }],
+        )]);
+        let txid = party.send_retry(&recipient_map);
+        assert!(!txid.is_empty());
+
+        rcv_party.wait_for_refresh_raw(None, None);
+        party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+
+        let waiting_balance = Balance {
+            settled: settled_total,
+            future: settled_total + amount,
+            spendable: 0,
+        };
+        rcv_party.wait_for_asset_balance(&asset.asset_id, &waiting_balance);
+
+        mine(false);
+        rcv_party.wait_for_refresh_raw(None, None);
+        party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+
+        settled_total += amount;
+        let settled_balance = Balance {
+            settled: settled_total,
+            future: settled_total,
+            spendable: settled_total,
+        };
+        assert!(rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Settled
+        ));
+        rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
+
+        assert_eq!(rcv_party.get_colorable_unspents_with_sync(false).len(), 1);
+
+        rcv_party = restart_party(rcv_party);
+
+        rcv_party.wait_for_asset_balance(&asset.asset_id, &settled_balance);
+        assert_eq!(rcv_party.get_colorable_unspents_with_sync(false).len(), 1);
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn offline_receiver_mixed_blind_witness_batch_donation_false() {
+    initialize();
+
+    let blind_amount: u64 = 44;
+    let witness_amount: u64 = 22;
+    let blind_waiting_balance = Balance {
+        settled: 0,
+        future: blind_amount,
+        spendable: 0,
+    };
+    let witness_waiting_balance = Balance {
+        settled: 0,
+        future: witness_amount,
+        spendable: 0,
+    };
+    let blind_settled_balance = Balance {
+        settled: blind_amount,
+        future: blind_amount,
+        spendable: blind_amount,
+    };
+    let witness_settled_balance = Balance {
+        settled: witness_amount,
+        future: witness_amount,
+        spendable: witness_amount,
+    };
+
+    let mut party = get_funded_party!();
+    let mut blind_party = get_funded_party!();
+    let mut witness_party = get_empty_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let mining_guard = stop_mining();
+
+    let blind_receive_data = blind_party.blind_receive();
+    let witness_receive_data = witness_party.witness_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![
+            Recipient {
+                assignment: Assignment::Fungible(blind_amount),
+                recipient_id: blind_receive_data.recipient_id.clone(),
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            },
+            Recipient {
+                assignment: Assignment::Fungible(witness_amount),
+                recipient_id: witness_receive_data.recipient_id.clone(),
+                witness_data: Some(WitnessData {
+                    amount_sat: 1000,
+                    blinding: None,
+                }),
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            },
+        ],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
+    assert!(blind_party.check_test_transfer_status_recipient(
+        &blind_receive_data.recipient_id,
+        TransferStatus::WaitingCounterparty
+    ));
+    assert!(witness_party.check_test_transfer_status_recipient(
+        &witness_receive_data.recipient_id,
+        TransferStatus::WaitingCounterparty
+    ));
+
+    blind_party.wait_for_refresh_raw(None, None);
+    assert!(blind_party.check_test_transfer_status_recipient(
+        &blind_receive_data.recipient_id,
+        TransferStatus::WaitingBroadcast
+    ));
+    blind_party.wait_for_asset_balance(&asset.asset_id, &blind_waiting_balance);
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
+
+    witness_party.wait_for_refresh_raw(None, None);
+    assert!(witness_party.check_test_transfer_status_recipient(
+        &witness_receive_data.recipient_id,
+        TransferStatus::WaitingBroadcast
+    ));
+
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+
+    blind_party.wait_for_refresh_raw(None, None);
+    assert!(blind_party.check_test_transfer_status_recipient(
+        &blind_receive_data.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+    witness_party.wait_for_refresh_raw(None, None);
+    assert!(witness_party.check_test_transfer_status_recipient(
+        &witness_receive_data.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+    witness_party.wait_for_asset_balance(&asset.asset_id, &witness_waiting_balance);
+
+    drop(mining_guard);
+    mine(false);
+    blind_party.wait_for_refresh_raw(None, None);
+    witness_party.wait_for_refresh_raw(None, None);
+    party.wait_for_refresh_raw(Some(&asset.asset_id), None);
+
+    assert!(blind_party.check_test_transfer_status_recipient(
+        &blind_receive_data.recipient_id,
+        TransferStatus::Settled
+    ));
+    assert!(witness_party.check_test_transfer_status_recipient(
+        &witness_receive_data.recipient_id,
+        TransferStatus::Settled
+    ));
+    blind_party.wait_for_asset_balance(&asset.asset_id, &blind_settled_balance);
+    witness_party.wait_for_asset_balance(&asset.asset_id, &witness_settled_balance);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
 fn out_of_band_witness_reuse() {
     initialize();
 
@@ -10425,51 +10633,4 @@ fn proxy_reuse_sequential_replay() {
         .unwrap();
     assert_eq!(t2.status, TransferStatus::WaitingCounterparty);
     assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, amount);
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn invalid_proxy_consignment_bytes() {
-    initialize();
-
-    let mut server = mockito::Server::new();
-    let server_url = server.url();
-    let host = server_url.trim_start_matches("http://");
-    let transport_endpoints = vec![format!("rpc://{host}")];
-
-    let consignment_mock = server
-        .mock("POST", "/")
-        .match_header("content-type", "application/json")
-        .match_body(mockito::Matcher::Regex("consignment\\.get".to_string()))
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"jsonrpc":"2.0","id":null,"result":{"consignment":"!!!","txid":"0000000000000000000000000000000000000000000000000000000000000000","vout":null}}"#,
-        )
-        .create();
-
-    let ack_mock = server
-        .mock("POST", "/")
-        .match_header("content-type", "application/json")
-        .match_body(mockito::Matcher::Regex("ack\\.post".to_string()))
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(r#"{"jsonrpc":"2.0","id":null,"result":true}"#)
-        .create();
-
-    let mut rcv_party = get_funded_party!();
-    let receive_data = rcv_party.blind_receive_with_endpoints(None, transport_endpoints);
-
-    rcv_party.wait_for_refresh(None);
-
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &receive_data.recipient_id,
-            TransferStatus::Failed
-        )
-    );
-
-    consignment_mock.assert();
-    ack_mock.assert();
 }
