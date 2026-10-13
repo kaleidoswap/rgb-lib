@@ -204,55 +204,7 @@ pub trait WalletBackup: WalletCore {
 
     #[cfg(feature = "vss")]
     fn create_vss_snapshot(&self) -> Result<(Vec<u8>, i128), Error> {
-        let txn = self.database().begin_transaction()?;
-        let timestamp = txn
-            .get_backup_info()?
-            .map(|info| info.last_operation_timestamp)
-            .unwrap_or_else(|| "0".to_string())
-            .parse::<i128>()
-            .map_err(InternalError::from)?;
-        txn.commit()?;
-        let staging = tempfile::tempdir()?;
-        let wallet_dir = self.wallet_dir();
-        let root = staging
-            .path()
-            .join(wallet_dir.file_name().ok_or_else(|| Error::Internal {
-                details: "wallet directory has no name".to_string(),
-            })?);
-        fs::create_dir(&root)?;
-        for entry in walkdir::WalkDir::new(wallet_dir).min_depth(1) {
-            let entry = entry.map_err(|e| Error::Internal {
-                details: e.to_string(),
-            })?;
-            let relative = entry
-                .path()
-                .strip_prefix(wallet_dir)
-                .map_err(|e| Error::Internal {
-                    details: e.to_string(),
-                })?;
-            // Never copy a live SQLite file or its journal/WAL sidecars.
-            if relative.components().count() == 1
-                && matches!(
-                    relative.to_str(),
-                    Some("rgb_lib_db" | "rgb_lib_db-wal" | "rgb_lib_db-shm" | "rgb_lib_db-journal")
-                )
-            {
-                continue;
-            }
-            let target = root.join(relative);
-            if entry.file_type().is_dir() {
-                fs::create_dir_all(target)?;
-            } else if entry.file_type().is_file() {
-                fs::copy(entry.path(), target)?;
-            }
-        }
-        let snapshot_path = root.join(super::core::RGB_LIB_DB_NAME);
-        self.database().snapshot_into(&snapshot_path)?;
-        crate::database::RgbLibDatabase::finalize_vss_snapshot(&snapshot_path, timestamp)?;
-        Ok((
-            super::vss::create_backup_data(&root, self.logger())?,
-            timestamp,
-        ))
+        snapshot_wallet_dir(self.wallet_dir(), self.database(), self.logger())
     }
 
     /// Configure VSS backup for this wallet, enabling automatic backups
@@ -292,15 +244,12 @@ pub trait WalletBackup: WalletCore {
 
     /// Trigger an automatic VSS backup if configured.
     ///
-    /// This is called internally after state-changing operations. It creates
-    /// the backup data synchronously, then spawns an async task for the upload.
+    /// This is called internally after state-changing operations. It queues a
+    /// lightweight request; the worker captures a coherent snapshot when ready.
     /// Errors are logged but not propagated (auto-backup is best-effort).
-    /// If an upload is running, its worker uploads the latest queued snapshot next.
-    ///
-    /// **Note:** The backup data (zip of the wallet directory) is created
-    /// synchronously before the async upload task is spawned. This adds
-    /// latency proportional to wallet directory size to the calling
-    /// operation. The upload itself runs asynchronously and does not block.
+    /// If an upload is running, its worker captures the latest wallet state next.
+    /// Intermediate requests are replaced before copying or compression. Blocking
+    /// mode still waits for capture and upload; asynchronous mode returns promptly.
     #[cfg(feature = "vss")]
     fn trigger_auto_backup(&self) {
         let Some(client) = self.vss_client() else {
@@ -309,22 +258,54 @@ pub trait WalletBackup: WalletCore {
         if !client.auto_backup() {
             return;
         }
-        let (data, timestamp) = match self.create_vss_snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                client.record_auto_backup_result(Some(e.to_string()));
-                error!(self.logger(), "VSS snapshot failed: {e}");
+        // Queue a lightweight request, not a ZIP. Repeated operations while an
+        // upload runs are coalesced before filesystem copying and compression.
+        let timestamp = match self.database().begin_transaction().and_then(|txn| {
+            let timestamp = txn
+                .get_backup_info()?
+                .map(|info| info.last_operation_timestamp)
+                .unwrap_or_else(|| "0".to_string())
+                .parse::<i128>()
+                .map_err(InternalError::from)?;
+            txn.commit()?;
+            Ok(timestamp)
+        }) {
+            Ok(timestamp) => timestamp,
+            Err(error) => {
+                client.record_auto_backup_result(Some(error.to_string()));
                 return;
             }
         };
+        if client.backup_mode() == super::vss::VssBackupMode::Blocking
+            && self
+                .wallet_dir()
+                .join(crate::utils::RGB_RUNTIME_LOCK_FILE)
+                .exists()
+        {
+            client.record_auto_backup_result(Some(
+                "cannot snapshot an active RGB runtime".to_string(),
+            ));
+            return;
+        }
+        let (receiver, completions) = if client.backup_mode() == super::vss::VssBackupMode::Blocking
+        {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            (Some(receiver), vec![sender])
+        } else {
+            (None, vec![])
+        };
         let snapshot = super::vss::PendingAutoBackup {
-            data,
+            wallet_dir: self.wallet_dir().clone(),
+            logger: self.logger().clone(),
             timestamp,
             database: Arc::clone(self.database_arc()),
+            completions,
         };
         let Some(generation) = client.queue_auto_backup(snapshot) else {
+            client.wait_auto_backup(receiver);
             return;
         };
+        let waiting_client = Arc::clone(client);
         let handle = client.handle().clone();
         let mode = client.backup_mode();
         let client = Arc::clone(client);
@@ -337,12 +318,40 @@ pub trait WalletBackup: WalletCore {
         }
         let upload = async move {
             let _guard = UploadGuard(Arc::clone(&client), generation);
+            let mut uploaded_through = None;
             while let Some(snapshot) = client.next_auto_backup(generation) {
-                match client.upload_backup(snapshot.data).await {
+                if uploaded_through.is_some_and(|timestamp| snapshot.timestamp <= timestamp) {
+                    for done in &snapshot.completions {
+                        let _ = done.send(());
+                    }
+                    continue;
+                }
+                let database = Arc::clone(&snapshot.database);
+                let captured = tokio::task::spawn_blocking(move || {
+                    snapshot_wallet_dir(&snapshot.wallet_dir, &database, &snapshot.logger)
+                })
+                .await
+                .map_err(|error| Error::Internal {
+                    details: format!("VSS snapshot worker failed: {error}"),
+                })
+                .and_then(std::convert::identity);
+                let (data, timestamp) = match captured {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        client.record_auto_backup_result(Some(error.to_string()));
+                        error!(logger, "VSS snapshot failed: {error}");
+                        for done in &snapshot.completions {
+                            let _ = done.send(());
+                        }
+                        continue;
+                    }
+                };
+                match client.upload_backup(data).await {
                     Ok(version) => {
-                        let result = snapshot
-                            .database
-                            .mark_vss_snapshot_backed_up(snapshot.timestamp);
+                        let result = snapshot.database.mark_vss_snapshot_backed_up(timestamp);
+                        if result.is_ok() {
+                            uploaded_through = Some(timestamp);
+                        }
                         client.record_auto_backup_result(
                             result.as_ref().err().map(ToString::to_string),
                         );
@@ -353,6 +362,9 @@ pub trait WalletBackup: WalletCore {
                         error!(logger, "VSS auto backup failed: {e}");
                     }
                 }
+                for done in &snapshot.completions {
+                    let _ = done.send(());
+                }
             }
         };
         match mode {
@@ -360,9 +372,10 @@ pub trait WalletBackup: WalletCore {
                 handle.spawn(upload);
             }
             super::vss::VssBackupMode::Blocking => {
-                let _ = std::thread::spawn(move || handle.block_on(upload)).join();
+                std::thread::spawn(move || handle.block_on(upload));
             }
         }
+        waiting_client.wait_auto_backup(receiver);
     }
 
     /// Get VSS backup info
@@ -747,6 +760,79 @@ fn decrypt_file(
     }
 
     Ok(())
+}
+
+#[cfg(feature = "vss")]
+pub(crate) fn snapshot_wallet_dir(
+    wallet_dir: &Path,
+    database: &RgbLibDatabase,
+    logger: &Logger,
+) -> Result<(Vec<u8>, i128), Error> {
+    let state_guard = database.state_guard();
+    // A reentrant caller must finish persisting its runtime before capture.
+    // Other threads cannot hold the runtime while we own the state gate.
+    if wallet_dir
+        .join(crate::utils::RGB_RUNTIME_LOCK_FILE)
+        .exists()
+    {
+        return Err(Error::Internal {
+            details: "cannot snapshot an active RGB runtime".to_string(),
+        });
+    }
+    let txn = database.begin_transaction()?;
+    let timestamp = txn
+        .get_backup_info()?
+        .map(|info| info.last_operation_timestamp)
+        .unwrap_or_else(|| "0".to_string())
+        .parse::<i128>()
+        .map_err(InternalError::from)?;
+    txn.commit()?;
+    let staging = tempfile::tempdir()?;
+    let root = staging
+        .path()
+        .join(wallet_dir.file_name().ok_or_else(|| Error::Internal {
+            details: "wallet directory has no name".to_string(),
+        })?);
+    fs::create_dir(&root)?;
+    for entry in walkdir::WalkDir::new(wallet_dir).min_depth(1) {
+        let entry = entry.map_err(|e| Error::Internal {
+            details: e.to_string(),
+        })?;
+        let relative = entry
+            .path()
+            .strip_prefix(wallet_dir)
+            .map_err(|e| Error::Internal {
+                details: e.to_string(),
+            })?;
+        // Never copy a live SQLite file or its journal/WAL sidecars.
+        if relative.components().count() == 1
+            && matches!(
+                relative.to_str(),
+                Some(
+                    "rgb_lib_db"
+                        | "rgb_lib_db-wal"
+                        | "rgb_lib_db-shm"
+                        | "rgb_lib_db-journal"
+                        | "rgb_runtime.lock"
+                        | "log"
+                )
+            )
+        {
+            continue;
+        }
+        let target = root.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(target)?;
+        } else if entry.file_type().is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    let snapshot_path = root.join(super::core::RGB_LIB_DB_NAME);
+    database.snapshot_into(&snapshot_path)?;
+    crate::database::RgbLibDatabase::finalize_vss_snapshot(&snapshot_path, timestamp)?;
+    // Compression only touches the immutable staging directory.
+    drop(state_guard);
+    Ok((super::vss::create_backup_data(&root, logger)?, timestamp))
 }
 
 #[cfg(test)]

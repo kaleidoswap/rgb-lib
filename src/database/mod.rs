@@ -232,6 +232,8 @@ impl From<LocalOutput> for DbTxoActMod {
 
 pub struct RgbLibDatabase {
     connection: DatabaseConnection,
+    #[cfg(feature = "vss")]
+    state_lock: Arc<parking_lot::ReentrantMutex<()>>,
 }
 
 impl RgbLibDatabase {
@@ -280,13 +282,41 @@ impl RgbLibDatabase {
     }
 
     pub(crate) fn new(connection: DatabaseConnection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            #[cfg(feature = "vss")]
+            state_lock: Arc::new(parking_lot::ReentrantMutex::new(())),
+        }
+    }
+
+    pub(crate) fn new_for_wallet(
+        connection: DatabaseConnection,
+        wallet_dir: &Path,
+    ) -> Result<Self, Error> {
+        let db = Self::new(connection);
+        #[cfg(feature = "vss")]
+        let db = Self {
+            state_lock: crate::utils::wallet_state_lock(wallet_dir)?,
+            ..db
+        };
+        #[cfg(not(feature = "vss"))]
+        let _ = wallet_dir;
+        Ok(db)
+    }
+
+    #[cfg(feature = "vss")]
+    pub(crate) fn state_guard(&self) -> crate::utils::WalletStateGuard {
+        crate::utils::WalletStateGuard::new(self.state_lock.lock_arc())
     }
 
     pub(crate) fn begin_transaction(&self) -> Result<DbTxn, Error> {
+        #[cfg(feature = "vss")]
+        let state_guard = self.state_guard();
         Ok(DbTxn {
             txn: Some(block_on(self.connection.begin())?),
             on_commit: Mutex::new(Vec::new()),
+            #[cfg(feature = "vss")]
+            _state_guard: state_guard,
         })
     }
 }
@@ -296,6 +326,8 @@ pub struct DbTxn {
     /// Callbacks run only if the transaction commits, to discard the crash-recovery copies of
     /// data the commit has just made durable.
     on_commit: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    #[cfg(feature = "vss")]
+    _state_guard: crate::utils::WalletStateGuard,
 }
 
 impl Drop for DbTxn {

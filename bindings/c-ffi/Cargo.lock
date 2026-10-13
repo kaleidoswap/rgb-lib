@@ -3237,6 +3237,7 @@ dependencies = [
  "file-format",
  "hex",
  "hkdf 0.12.4",
+ "parking_lot",
  "rand 0.10.2",
  "reqwest",
  "rgb-invoicing",

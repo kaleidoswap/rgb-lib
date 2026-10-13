@@ -53,8 +53,17 @@ VSS backups can still be downloaded and restored with their original signing key
 and store ID. They may need the original wallet settings and a Bitcoin rescan,
 because the historical sanitized format omitted BDK files and the wallet manifest.
 
-Auto-backup queues the latest snapshot while an upload is running. A completed
-upload marks only the operations captured in that snapshot as backed up. The
+New uploads use version-2 manifests and immutable upload generations. Publishing
+the manifest is atomic, so an interrupted replacement leaves the previous backup
+readable. Restore requires a client supporting this format; version-1 encrypted
+and plaintext backups remain readable. Earlier generations and abandoned uploads
+are retained for readers that already fetched an older manifest. Explicit backup
+deletion removes all generations in the store's `backup/` namespace.
+
+Auto-backup coalesces capture requests while an upload is running, before copying
+or compressing wallet files. Snapshots coordinate RGB persistence and database
+transactions and exclude transient runtime locks. A completed upload marks only
+the operations captured in that snapshot as backed up. The
 signing key derives the encryption key, so it must be recoverable independently
 of the encrypted backup. Keep the mnemonic outside the wallet backup as before.
 

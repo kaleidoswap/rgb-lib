@@ -266,7 +266,7 @@ pub(crate) fn setup_db<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbLibDatabase, 
     let db_cnn = block_on(Database::connect(opt));
     let connection = db_cnn?;
     block_on(Migrator::up(&connection, None))?;
-    Ok(RgbLibDatabase::new(connection))
+    RgbLibDatabase::new_for_wallet(connection, wallet_dir.as_ref())
 }
 
 /// Import the BDK data of a wallet created before the changeset moved into the rgb-lib DB.

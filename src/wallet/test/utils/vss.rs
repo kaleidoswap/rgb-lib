@@ -20,11 +20,8 @@ pub(crate) const DEFAULT_VSS_SERVER_URL: &str = "http://localhost:8081/vss";
 
 // Common VSS object keys used by rgb-lib backups.
 pub(crate) const VSS_KEY_DATA: &str = "backup/data";
-pub(crate) const VSS_KEY_METADATA: &str = "backup/metadata";
 pub(crate) const VSS_KEY_MANIFEST: &str = "backup/manifest";
 pub(crate) const VSS_KEY_FINGERPRINT: &str = "backup/fingerprint";
-pub(crate) const VSS_KEY_CHUNK_PREFIX: &str = "backup/chunk/";
-pub(crate) const VSS_KEY_CHUNK0: &str = "backup/chunk/0";
 
 // -------- Wallet state summaries (restore assertions) --------
 
@@ -458,6 +455,7 @@ pub(crate) async fn seed_legacy_plaintext_backup(
         total_size: data.len(),
         encrypted: false,
         version: 1,
+        generation: None,
     };
     build_raw_vss_client(server_url, signing_key)
         .put_object(&PutObjectRequest {

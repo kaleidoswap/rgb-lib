@@ -2793,6 +2793,7 @@ impl Wallet {
         )?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
+        drop(runtime);
         self.trigger_auto_backup();
 
         info!(self.logger(), "Save new asset completed");
@@ -2977,6 +2978,9 @@ impl Wallet {
             expiration_timestamp,
         )?;
         info!(self.logger(), "Color PSBT prepare-consume completed");
+        runtime.persist()?;
+        drop(runtime);
+        self.trigger_auto_backup();
         Ok(result)
     }
 }
@@ -3044,6 +3048,9 @@ impl Wallet {
             expiration_timestamp,
         )?;
         info!(self.logger(), "Color PSBT prepare-consume completed");
+        runtime.persist()?;
+        drop(runtime);
+        self.trigger_auto_backup();
         Ok(result)
     }
 }
@@ -3133,7 +3140,6 @@ impl Wallet {
             true,
             runtime,
         )?;
-        self.trigger_auto_backup();
         Ok(ColorPrepareResult {
             transfers,
             batch_transfer_idx,
