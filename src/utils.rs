@@ -10,7 +10,52 @@ const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem] = time::
     "[year]-[month]-[day]T[hour repr:24]:[minute]:[second].[subsecond digits:3]+00"
 );
 
-const RGB_RUNTIME_LOCK_FILE: &str = "rgb_runtime.lock";
+pub(crate) const RGB_RUNTIME_LOCK_FILE: &str = "rgb_runtime.lock";
+
+// Database transactions and RGB persistence share this gate in VSS builds. It is
+// reentrant because operations take both resources in either order on one thread.
+#[cfg(feature = "vss")]
+pub(crate) struct WalletStateGuard {
+    _guard:
+        parking_lot::ArcReentrantMutexGuard<parking_lot::RawMutex, parking_lot::RawThreadId, ()>,
+}
+
+#[cfg(feature = "vss")]
+impl WalletStateGuard {
+    pub(crate) fn new(
+        guard: parking_lot::ArcReentrantMutexGuard<
+            parking_lot::RawMutex,
+            parking_lot::RawThreadId,
+            (),
+        >,
+    ) -> Self {
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(feature = "vss")]
+impl std::fmt::Debug for WalletStateGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WalletStateGuard")
+    }
+}
+
+#[cfg(feature = "vss")]
+pub(crate) fn wallet_state_lock(
+    wallet_dir: &Path,
+) -> Result<Arc<parking_lot::ReentrantMutex<()>>, Error> {
+    type Locks = HashMap<PathBuf, std::sync::Weak<parking_lot::ReentrantMutex<()>>>;
+    static LOCKS: LazyLock<Mutex<Locks>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    let path = fs::canonicalize(wallet_dir)?;
+    let mut locks = LOCKS.lock().expect("wallet state lock registry");
+    locks.retain(|_, lock| lock.strong_count() != 0);
+    if let Some(lock) = locks.get(&path).and_then(std::sync::Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(parking_lot::ReentrantMutex::new(()));
+    locks.insert(path, Arc::downgrade(&lock));
+    Ok(lock)
+}
 
 pub(crate) const RGB_RUNTIME_DIR: &str = "rgb";
 pub(crate) const LOG_FILE: &str = "log";
@@ -823,6 +868,8 @@ pub struct RgbRuntime {
     wallet_dir: PathBuf,
     /// Whether dropping the runtime should persist the in-memory stock.
     persist_on_drop: bool,
+    #[cfg(feature = "vss")]
+    _state_guard: WalletStateGuard,
 }
 
 impl RgbRuntime {
@@ -1121,6 +1168,8 @@ fn write_rgb_runtime_lockfile(wallet_dir: &Path) -> Result<(), Error> {
 }
 
 pub(crate) fn load_rgb_runtime<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbRuntime, Error> {
+    #[cfg(feature = "vss")]
+    let state_guard = WalletStateGuard::new(wallet_state_lock(wallet_dir.as_ref())?.lock_arc());
     write_rgb_runtime_lockfile(wallet_dir.as_ref())?;
 
     let rgb_dir = wallet_dir.as_ref().join(RGB_RUNTIME_DIR);
@@ -1146,6 +1195,8 @@ pub(crate) fn load_rgb_runtime<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbRunti
         stock,
         wallet_dir: wallet_dir.as_ref().to_path_buf(),
         persist_on_drop: true,
+        #[cfg(feature = "vss")]
+        _state_guard: state_guard,
     })
 }
 

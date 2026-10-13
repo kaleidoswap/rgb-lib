@@ -2024,6 +2024,9 @@ fn color_psbt_and_prepare_consume_registers_requested_batch_parameters() {
         blinding,
     );
 
+    #[cfg(feature = "vss")]
+    let auto_backup = configure_color_backup_regression(&mut party_send.wallet);
+
     party_send
         .wallet
         .color_psbt_and_prepare_consume(
@@ -2033,6 +2036,9 @@ fn color_psbt_and_prepare_consume_registers_requested_batch_parameters() {
             Some(expiration_timestamp),
         )
         .unwrap();
+
+    #[cfg(feature = "vss")]
+    assert_color_backup_restores(&party_send.wallet, &auto_backup);
 
     let txid = psbt.unsigned_tx.compute_txid().to_string();
     let (_, _, batch_transfer) = party_send.get_test_transfer_sender(&txid);
@@ -5866,6 +5872,9 @@ fn color_psbt_for_outpoints_preserves_metadata_and_prepare_consume() {
     output_map.insert(vout, AMOUNT);
     let coloring_info = coloring_info_for(&asset.asset_id, output_map, blinding);
 
+    #[cfg(feature = "vss")]
+    let auto_backup = configure_color_backup_regression(&mut party_send.wallet);
+
     let ColorPrepareResult { transfers, .. } = party_send
         .wallet
         .color_psbt_for_outpoints_and_prepare_consume(
@@ -5876,6 +5885,9 @@ fn color_psbt_for_outpoints_preserves_metadata_and_prepare_consume() {
             None,
         )
         .unwrap();
+    #[cfg(feature = "vss")]
+    assert_color_backup_restores(&party_send.wallet, &auto_backup);
+
     assert_eq!(psbt.inputs[0].witness_utxo, witness_utxo_before);
     assert_eq!(psbt.inputs[0].tap_internal_key, tap_internal_key_before);
     assert_eq!(transfers.len(), 1);
@@ -6703,4 +6715,71 @@ fn color_psbt_for_outpoints_allows_opreturn_at_end_without_p2tr() {
         .wallet
         .color_psbt_for_outpoints(&mut psbt, coloring_info, vec![input])
         .unwrap();
+}
+
+#[cfg(feature = "vss")]
+fn configure_color_backup_regression(
+    wallet: &mut Wallet,
+) -> (crate::wallet::vss::publication_tests::MockVss, i64) {
+    let server = crate::wallet::vss::publication_tests::MockVss::new();
+    wallet
+        .configure_vss_backup(
+            server
+                .config
+                .clone()
+                .with_auto_backup(true)
+                .with_backup_mode(crate::wallet::vss::VssBackupMode::Blocking),
+        )
+        .unwrap();
+    let version = server
+        .client
+        .handle()
+        .block_on(server.client.get_backup_version())
+        .unwrap()
+        .unwrap();
+    (server, version)
+}
+
+#[cfg(feature = "vss")]
+fn assert_color_backup_restores(
+    wallet: &Wallet,
+    backup: &(crate::wallet::vss::publication_tests::MockVss, i64),
+) {
+    let (server, before) = backup;
+    assert!(
+        wallet
+            .vss_client()
+            .as_ref()
+            .unwrap()
+            .last_auto_backup_error()
+            .is_none()
+    );
+    let version = server
+        .client
+        .handle()
+        .block_on(server.client.get_backup_version())
+        .unwrap()
+        .unwrap();
+    assert!(
+        version > *before,
+        "the coloring operation must publish a new automatic backup"
+    );
+    let bytes = server
+        .client
+        .handle()
+        .block_on(server.client.download_backup())
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .unwrap()
+        .extract(dir.path())
+        .unwrap();
+    let keys = wallet.get_keys();
+    let restored = Wallet::load(
+        dir.path().to_str().unwrap(),
+        &keys.master_fingerprint,
+        keys.mnemonic,
+    )
+    .unwrap();
+    assert!(!restored.get_wallet_dir().join("rgb_runtime.lock").exists());
 }

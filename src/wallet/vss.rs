@@ -23,14 +23,14 @@ use time::OffsetDateTime;
 use vss_client::client::VssClient;
 use vss_client::error::VssError;
 use vss_client::headers::sigs_auth::SigsAuthProvider;
-use vss_client::types::{GetObjectRequest, KeyValue, PutObjectRequest};
+use vss_client::types::{GetObjectRequest, KeyValue, ListKeyVersionsRequest, PutObjectRequest};
 use vss_client::util::retry::{
     ExponentialBackoffRetryPolicy, MaxAttemptsRetryPolicy, MaxTotalDelayRetryPolicy, RetryPolicy,
 };
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
-use crate::error::Error;
+use crate::error::{Error, InternalError};
 use crate::utils::LOG_FILE;
 use crate::utils::setup_logger;
 use crate::wallet::backup::stream_be32_nonce;
@@ -57,6 +57,8 @@ const BACKUP_BUFFER_LEN_DECRYPT: usize = BACKUP_BUFFER_LEN_ENCRYPT + 16;
 const BACKUP_KEY_LENGTH: usize = 32;
 const BACKUP_NONCE_LENGTH: usize = 19;
 const VSS_BACKUP_VERSION: u8 = 1;
+const VSS_MANIFEST_VERSION: u8 = 2;
+const BACKUP_GENERATION_PREFIX: &str = "backup/generations/";
 
 /// Default chunk size for large backups
 /// Kept under the upstream vss-client-ng 10-second HTTP timeout
@@ -193,12 +195,57 @@ pub struct BackupManifest {
     pub encrypted: bool,
     /// Backup version
     pub version: u8,
+    /// Immutable upload generation. Absent in legacy version-1 backups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+}
+
+impl BackupManifest {
+    pub(crate) fn chunk_key(&self, index: usize) -> String {
+        match &self.generation {
+            Some(generation) => format!("{BACKUP_GENERATION_PREFIX}{generation}/chunk/{index}"),
+            None if self.chunk_count == 1 => BACKUP_KEY_DATA.to_string(),
+            None => format!("{BACKUP_KEY_CHUNK_PREFIX}{index}"),
+        }
+    }
+
+    pub(crate) fn metadata_key(&self) -> String {
+        self.generation.as_ref().map_or_else(
+            || BACKUP_KEY_METADATA.to_string(),
+            |generation| format!("{BACKUP_GENERATION_PREFIX}{generation}/metadata"),
+        )
+    }
+
+    pub(crate) fn fingerprint_key(&self) -> String {
+        self.generation.as_ref().map_or_else(
+            || BACKUP_KEY_FINGERPRINT.to_string(),
+            |generation| format!("{BACKUP_GENERATION_PREFIX}{generation}/fingerprint"),
+        )
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        let valid_generation = match (self.version, &self.generation) {
+            (VSS_BACKUP_VERSION, None) => true,
+            (VSS_MANIFEST_VERSION, Some(generation)) => {
+                generation.len() == 64 && generation.bytes().all(|b| b.is_ascii_hexdigit())
+            }
+            _ => false,
+        };
+        if !valid_generation || self.chunk_count == 0 {
+            return Err(Error::Internal {
+                details: "invalid or unsupported VSS backup manifest".to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct PendingAutoBackup {
-    pub(crate) data: Vec<u8>,
+    pub(crate) wallet_dir: PathBuf,
+    pub(crate) logger: Logger,
     pub(crate) timestamp: i128,
     pub(crate) database: Arc<crate::database::RgbLibDatabase>,
+    pub(crate) completions: Vec<std::sync::mpsc::Sender<()>>,
 }
 
 #[derive(Default)]
@@ -262,12 +309,15 @@ impl VssBackupClient {
         })
     }
 
-    /// Queue the latest complete snapshot while a prior upload is running.
-    pub(crate) fn queue_auto_backup(&self, snapshot: PendingAutoBackup) -> Option<u64> {
+    /// Queue the latest capture request while a prior upload is running.
+    pub(crate) fn queue_auto_backup(&self, mut snapshot: PendingAutoBackup) -> Option<u64> {
         let mut state = self
             .auto_backup_state
             .lock()
             .expect("auto backup state lock");
+        if let Some(mut previous) = state.pending.take() {
+            snapshot.completions.append(&mut previous.completions);
+        }
         state.pending = Some(snapshot);
         if state.running {
             return None;
@@ -315,6 +365,14 @@ impl VssBackupClient {
         *self.last_auto_backup_error.lock().unwrap() = error;
     }
 
+    pub(crate) fn wait_auto_backup(&self, receiver: Option<std::sync::mpsc::Receiver<()>>) {
+        if let Some(receiver) = receiver
+            && receiver.recv().is_err()
+        {
+            self.record_auto_backup_result(Some("auto backup task interrupted".to_string()));
+        }
+    }
+
     /// Get a handle to the client's tokio runtime
     pub fn handle(&self) -> &tokio::runtime::Handle {
         self.runtime
@@ -336,210 +394,88 @@ impl VssBackupClient {
         if !self.encryption_enabled {
             return Err(Error::VssEncryptionRequired);
         }
-        // Extract fingerprint from zip data
         let fingerprint = get_fingerprint_from_zip_bytes(&data)?;
-
-        let metadata = VssEncryptionMetadata::new();
-        let upload_data = encrypt_data(&data, &self.signing_key, &metadata, None)?;
-        let encryption_metadata = Some(metadata);
-
-        let total_size = upload_data.len();
-
-        if total_size <= VSS_CHUNK_SIZE {
-            // Single chunk upload
-            self.upload_single(upload_data, encryption_metadata, &fingerprint)
-                .await
-        } else {
-            // Chunked upload for large backups
-            self.upload_chunked(upload_data, encryption_metadata, &fingerprint)
-                .await
-        }
-    }
-
-    /// Upload a single backup (non-chunked)
-    async fn upload_single(
-        &self,
-        data: Vec<u8>,
-        encryption_metadata: Option<VssEncryptionMetadata>,
-        fingerprint: &str,
-    ) -> Result<i64, Error> {
-        // VSS versioning: version field is the expected current version (optimistic locking)
-        // For new keys: version = 0 (no current version)
-        // For updates: version = current_version (server will increment to current_version + 1)
-        let data_version = self
-            .get_current_version(BACKUP_KEY_DATA)
-            .await?
-            .unwrap_or(0);
-
-        let manifest = BackupManifest {
-            chunk_count: 1,
-            total_size: data.len(),
-            encrypted: encryption_metadata.is_some(),
-            version: VSS_BACKUP_VERSION,
-        };
-        let manifest_json = serde_json::to_vec(&manifest).map_err(|e| Error::Internal {
-            details: format!("Failed to serialize manifest: {e}"),
-        })?;
-
+        // Pin the publication version before staging. A slow upload cannot
+        // replace a newer backup committed by another client in the meantime.
         let manifest_version = self
             .get_current_version(BACKUP_KEY_MANIFEST)
             .await?
             .unwrap_or(0);
-
-        let fingerprint_version = self
+        let legacy_metadata_version = self
+            .get_current_version(BACKUP_KEY_METADATA)
+            .await?
+            .unwrap_or(0);
+        let legacy_fingerprint_version = self
             .get_current_version(BACKUP_KEY_FINGERPRINT)
             .await?
             .unwrap_or(0);
-
-        let mut transaction_items = vec![
-            KeyValue {
-                key: BACKUP_KEY_DATA.to_string(),
-                version: data_version,
-                value: data,
-            },
-            KeyValue {
-                key: BACKUP_KEY_MANIFEST.to_string(),
-                version: manifest_version,
-                value: manifest_json,
-            },
-            KeyValue {
-                key: BACKUP_KEY_FINGERPRINT.to_string(),
-                version: fingerprint_version,
-                value: fingerprint.as_bytes().to_vec(),
-            },
-        ];
-
-        // Add encryption metadata if present
-        if let Some(metadata) = encryption_metadata {
-            let metadata_json = serde_json::to_vec(&metadata).map_err(|e| Error::Internal {
-                details: format!("Failed to serialize encryption metadata: {e}"),
-            })?;
-            let metadata_version = self
-                .get_current_version(BACKUP_KEY_METADATA)
-                .await?
-                .unwrap_or(0);
-            transaction_items.push(KeyValue {
-                key: BACKUP_KEY_METADATA.to_string(),
-                version: metadata_version,
-                value: metadata_json,
-            });
-        }
-
-        let request = PutObjectRequest {
-            store_id: self.store_id.clone(),
-            global_version: None,
-            transaction_items,
-            delete_items: vec![],
+        let metadata = VssEncryptionMetadata::new();
+        let upload_data = encrypt_data(&data, &self.signing_key, &metadata, None)?;
+        drop(data);
+        let generation = hex::encode(rand::random::<[u8; 32]>());
+        let manifest = BackupManifest {
+            chunk_count: upload_data.len().div_ceil(VSS_CHUNK_SIZE),
+            total_size: upload_data.len(),
+            encrypted: true,
+            version: VSS_MANIFEST_VERSION,
+            generation: Some(generation),
         };
-
-        self.client
-            .put_object(&request)
-            .await
-            .map_err(vss_error_to_rgb_error)?;
-
-        // Server increments version, so return expected new version
-        Ok(data_version + 1)
-    }
-
-    /// Upload a chunked backup for large data
-    ///
-    /// Each chunk is uploaded in a separate request to avoid sending the entire
-    /// backup in a single HTTP body. The manifest is uploaded last so that a
-    /// partial failure leaves the previous manifest (and thus the previous
-    /// valid backup) intact. Orphaned chunks from a failed partial upload are
-    /// harmlessly overwritten on the next backup attempt.
-    async fn upload_chunked(
-        &self,
-        data: Vec<u8>,
-        encryption_metadata: Option<VssEncryptionMetadata>,
-        fingerprint: &str,
-    ) -> Result<i64, Error> {
-        let chunks: Vec<&[u8]> = data.chunks(VSS_CHUNK_SIZE).collect();
-        let chunk_count = chunks.len();
-        let total_size = data.len();
-
-        // Upload each chunk in a separate request
-        for (i, chunk) in chunks.iter().enumerate() {
-            let key = format!("{}{}", BACKUP_KEY_CHUNK_PREFIX, i);
-            let chunk_version = self.get_current_version(&key).await?.unwrap_or(0);
-
-            let request = PutObjectRequest {
-                store_id: self.store_id.clone(),
-                global_version: None,
-                transaction_items: vec![KeyValue {
-                    key,
-                    version: chunk_version,
-                    value: chunk.to_vec(),
-                }],
-                delete_items: vec![],
-            };
-
+        for (index, chunk) in upload_data.chunks(VSS_CHUNK_SIZE).enumerate() {
             self.client
-                .put_object(&request)
+                .put_object(&PutObjectRequest {
+                    store_id: self.store_id.clone(),
+                    global_version: None,
+                    transaction_items: vec![KeyValue {
+                        key: manifest.chunk_key(index),
+                        version: 0,
+                        value: chunk.to_vec(),
+                    }],
+                    delete_items: vec![],
+                })
                 .await
                 .map_err(vss_error_to_rgb_error)?;
         }
-
-        // Upload manifest + fingerprint + metadata atomically (small, logically related)
-        let manifest = BackupManifest {
-            chunk_count,
-            total_size,
-            encrypted: encryption_metadata.is_some(),
-            version: VSS_BACKUP_VERSION,
-        };
-        let manifest_json = serde_json::to_vec(&manifest).map_err(|e| Error::Internal {
-            details: format!("Failed to serialize manifest: {e}"),
-        })?;
-        let manifest_version = self
-            .get_current_version(BACKUP_KEY_MANIFEST)
-            .await?
-            .unwrap_or(0);
-
-        let fingerprint_version = self
-            .get_current_version(BACKUP_KEY_FINGERPRINT)
-            .await?
-            .unwrap_or(0);
-
-        let mut transaction_items = vec![
-            KeyValue {
-                key: BACKUP_KEY_MANIFEST.to_string(),
-                version: manifest_version,
-                value: manifest_json,
-            },
-            KeyValue {
-                key: BACKUP_KEY_FINGERPRINT.to_string(),
-                version: fingerprint_version,
-                value: fingerprint.as_bytes().to_vec(),
-            },
-        ];
-
-        if let Some(metadata) = encryption_metadata {
-            let metadata_json = serde_json::to_vec(&metadata).map_err(|e| Error::Internal {
-                details: format!("Failed to serialize encryption metadata: {e}"),
-            })?;
-            let metadata_version = self
-                .get_current_version(BACKUP_KEY_METADATA)
-                .await?
-                .unwrap_or(0);
-            transaction_items.push(KeyValue {
-                key: BACKUP_KEY_METADATA.to_string(),
-                version: metadata_version,
-                value: metadata_json,
-            });
-        }
-
-        let request = PutObjectRequest {
-            store_id: self.store_id.clone(),
-            global_version: None,
-            transaction_items,
-            delete_items: vec![],
-        };
-
+        // The one mutable pointer and its generation-specific metadata become
+        // visible atomically. Published generations are retained for readers
+        // that fetched an earlier manifest; delete_backup removes all of them.
         self.client
-            .put_object(&request)
+            .put_object(&PutObjectRequest {
+                store_id: self.store_id.clone(),
+                global_version: None,
+                transaction_items: vec![
+                    KeyValue {
+                        key: BACKUP_KEY_MANIFEST.to_string(),
+                        version: manifest_version,
+                        value: serde_json::to_vec(&manifest).map_err(InternalError::from)?,
+                    },
+                    KeyValue {
+                        key: manifest.metadata_key(),
+                        version: 0,
+                        value: serde_json::to_vec(&metadata).map_err(InternalError::from)?,
+                    },
+                    KeyValue {
+                        key: manifest.fingerprint_key(),
+                        version: 0,
+                        value: fingerprint.as_bytes().to_vec(),
+                    },
+                    // Old clients ignore unknown manifest fields and versions.
+                    // Rotate their metadata too: they must fail to decrypt old
+                    // data rather than silently restore an obsolete v1 backup.
+                    KeyValue {
+                        key: BACKUP_KEY_METADATA.to_string(),
+                        version: legacy_metadata_version,
+                        value: serde_json::to_vec(&metadata).map_err(InternalError::from)?,
+                    },
+                    KeyValue {
+                        key: BACKUP_KEY_FINGERPRINT.to_string(),
+                        version: legacy_fingerprint_version,
+                        value: fingerprint.into_bytes(),
+                    },
+                ],
+                delete_items: vec![],
+            })
             .await
             .map_err(vss_error_to_rgb_error)?;
-
         Ok(manifest_version + 1)
     }
 
@@ -548,70 +484,48 @@ impl VssBackupClient {
     /// If the backup was encrypted, it will be decrypted using a key derived from
     /// the signing key via HKDF-SHA256.
     pub async fn download_backup(&self) -> Result<Vec<u8>, Error> {
-        // First get the manifest
-        let manifest = self.get_manifest().await?;
+        let (_, data, _) = self.download_record().await?;
+        Ok(data)
+    }
 
-        // Download the raw data
-        let raw_data = if manifest.chunk_count == 1 {
-            self.download_single().await?
-        } else {
-            self.download_chunked(&manifest).await?
-        };
-
-        // Decrypt if the backup was encrypted
-        if manifest.encrypted {
-            let metadata = self.get_encryption_metadata().await?;
-            decrypt_data(&raw_data, &self.signing_key, &metadata, None)
-        } else {
-            Ok(raw_data)
+    async fn download_record(&self) -> Result<(BackupManifest, Vec<u8>, String), Error> {
+        for _ in 0..3 {
+            let manifest = self.get_manifest().await?;
+            let data = self.download_manifest(&manifest).await;
+            let fingerprint = self.get_fingerprint(&manifest).await;
+            // A v1 -> v2 upgrade rotates the old mutable metadata. If it
+            // overlapped this read, retry the complete new generation instead
+            // of mixing legacy bytes with the newly published metadata.
+            if manifest.generation.is_none() && self.get_manifest().await?.generation.is_some() {
+                continue;
+            }
+            return Ok((manifest, data?, fingerprint?));
         }
+        Err(Error::VssVersionConflict {
+            details: "backup changed repeatedly during restore".to_string(),
+        })
     }
 
-    /// Download a single backup (non-chunked)
-    async fn download_single(&self) -> Result<Vec<u8>, Error> {
-        let request = GetObjectRequest {
-            store_id: self.store_id.clone(),
-            key: BACKUP_KEY_DATA.to_string(),
-        };
-
-        let response = self
-            .client
-            .get_object(&request)
-            .await
-            .map_err(vss_error_to_rgb_error)?;
-
-        response
-            .value
-            .map(|kv| kv.value)
-            .ok_or(Error::VssBackupNotFound)
-    }
-
-    /// Download a chunked backup
-    async fn download_chunked(&self, manifest: &BackupManifest) -> Result<Vec<u8>, Error> {
+    async fn download_manifest(&self, manifest: &BackupManifest) -> Result<Vec<u8>, Error> {
         let mut data = Vec::with_capacity(manifest.total_size);
-
-        for i in 0..manifest.chunk_count {
-            let key = format!("{}{}", BACKUP_KEY_CHUNK_PREFIX, i);
-            let request = GetObjectRequest {
-                store_id: self.store_id.clone(),
-                key,
-            };
-
+        for index in 0..manifest.chunk_count {
             let response = self
                 .client
-                .get_object(&request)
+                .get_object(&GetObjectRequest {
+                    store_id: self.store_id.clone(),
+                    key: manifest.chunk_key(index),
+                })
                 .await
                 .map_err(vss_error_to_rgb_error)?;
-
-            let chunk = response
-                .value
-                .map(|kv| kv.value)
-                .ok_or(Error::VssBackupNotFound)?;
-
-            data.extend(chunk);
+            let chunk = response.value.ok_or(Error::VssBackupNotFound)?;
+            data.extend(chunk.value);
         }
-
-        Ok(data)
+        if manifest.encrypted {
+            let metadata = self.get_encryption_metadata(manifest).await?;
+            decrypt_data(&data, &self.signing_key, &metadata, None)
+        } else {
+            Ok(data)
+        }
     }
 
     /// Get the backup manifest
@@ -632,16 +546,22 @@ impl VssBackupClient {
             .map(|kv| kv.value)
             .ok_or(Error::VssBackupNotFound)?;
 
-        serde_json::from_slice(&manifest_bytes).map_err(|e| Error::Internal {
-            details: format!("Failed to parse backup manifest: {e}"),
-        })
+        let manifest: BackupManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|e| Error::Internal {
+                details: format!("Failed to parse backup manifest: {e}"),
+            })?;
+        manifest.validate()?;
+        Ok(manifest)
     }
 
     /// Get the encryption metadata
-    async fn get_encryption_metadata(&self) -> Result<VssEncryptionMetadata, Error> {
+    async fn get_encryption_metadata(
+        &self,
+        manifest: &BackupManifest,
+    ) -> Result<VssEncryptionMetadata, Error> {
         let request = GetObjectRequest {
             store_id: self.store_id.clone(),
-            key: BACKUP_KEY_METADATA.to_string(),
+            key: manifest.metadata_key(),
         };
 
         let response = self
@@ -668,10 +588,10 @@ impl VssBackupClient {
     }
 
     /// Get the wallet fingerprint stored on the server
-    async fn get_fingerprint(&self) -> Result<String, Error> {
+    async fn get_fingerprint(&self, manifest: &BackupManifest) -> Result<String, Error> {
         let request = GetObjectRequest {
             store_id: self.store_id.clone(),
-            key: BACKUP_KEY_FINGERPRINT.to_string(),
+            key: manifest.fingerprint_key(),
         };
 
         let response = self
@@ -708,80 +628,48 @@ impl VssBackupClient {
 
     /// Delete the backup from VSS server
     pub async fn delete_backup(&self) -> Result<(), Error> {
-        // Get manifest to know what to delete
-        let manifest = match self.get_manifest().await {
-            Ok(m) => m,
-            Err(_) => return Ok(()), // No backup to delete
-        };
-
-        let mut delete_items = vec![];
-
-        // Delete chunks if any
-        if manifest.chunk_count > 1 {
-            for i in 0..manifest.chunk_count {
-                let key = format!("{}{}", BACKUP_KEY_CHUNK_PREFIX, i);
-                if let Some(version) = self.get_current_version(&key).await? {
-                    delete_items.push(KeyValue {
-                        key,
-                        version,
-                        value: vec![],
-                    });
-                }
+        // Include retained reader generations and abandoned partial uploads,
+        // even when no manifest was ever published. Pin the store version so
+        // a concurrent upload makes deletion fail atomically rather than
+        // removing chunks that another writer is about to publish.
+        let mut page_token = None;
+        let mut global_version = None;
+        let mut delete_items = Vec::new();
+        loop {
+            let page = self
+                .client
+                .list_key_versions(&ListKeyVersionsRequest {
+                    store_id: self.store_id.clone(),
+                    key_prefix: Some("backup/".to_string()),
+                    page_size: Some(1000),
+                    page_token: page_token.clone(),
+                })
+                .await
+                .map_err(vss_error_to_rgb_error)?;
+            if page_token.is_none() {
+                global_version = page.global_version;
             }
-        } else {
-            // Delete single data key
-            if let Some(version) = self.get_current_version(BACKUP_KEY_DATA).await? {
-                delete_items.push(KeyValue {
-                    key: BACKUP_KEY_DATA.to_string(),
-                    version,
-                    value: vec![],
-                });
+            delete_items.extend(page.key_versions);
+            page_token = page.next_page_token.filter(|token| !token.is_empty());
+            if page_token.is_none() {
+                break;
             }
         }
-
-        // Delete manifest
-        if let Some(version) = self.get_current_version(BACKUP_KEY_MANIFEST).await? {
-            delete_items.push(KeyValue {
-                key: BACKUP_KEY_MANIFEST.to_string(),
-                version,
-                value: vec![],
-            });
-        }
-
-        // Delete metadata if exists
-        if let Some(version) = self.get_current_version(BACKUP_KEY_METADATA).await? {
-            delete_items.push(KeyValue {
-                key: BACKUP_KEY_METADATA.to_string(),
-                version,
-                value: vec![],
-            });
-        }
-
-        // Delete fingerprint if exists
-        if let Some(version) = self.get_current_version(BACKUP_KEY_FINGERPRINT).await? {
-            delete_items.push(KeyValue {
-                key: BACKUP_KEY_FINGERPRINT.to_string(),
-                version,
-                value: vec![],
-            });
-        }
-
         if delete_items.is_empty() {
             return Ok(());
         }
-
-        let request = PutObjectRequest {
-            store_id: self.store_id.clone(),
-            global_version: None,
-            transaction_items: vec![],
-            delete_items,
-        };
-
+        let global_version = global_version.ok_or_else(|| Error::Internal {
+            details: "VSS server omitted the store version during backup deletion".to_string(),
+        })?;
         self.client
-            .put_object(&request)
+            .put_object(&PutObjectRequest {
+                store_id: self.store_id.clone(),
+                global_version: Some(global_version),
+                transaction_items: vec![],
+                delete_items,
+            })
             .await
             .map_err(vss_error_to_rgb_error)?;
-
         Ok(())
     }
 
@@ -1220,11 +1108,8 @@ pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Resu
     // Create VSS client and download backup
     let client = VssBackupClient::new(config)?;
 
-    // Check manifest to determine if backup is encrypted
-    let manifest = client.get_manifest().await?;
-
     info!(logger, "Downloading backup from VSS server...");
-    let backup_data = client.download_backup().await?;
+    let (manifest, backup_data, fingerprint) = client.download_record().await?;
     info!(
         logger,
         "Downloaded {} bytes ({:.2} MB)",
@@ -1232,8 +1117,6 @@ pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Resu
         backup_data.len() as f64 / 1_000_000.0
     );
 
-    // Get fingerprint from server (stored during upload)
-    let fingerprint = client.get_fingerprint().await?;
     info!(logger, "Wallet fingerprint: {}", fingerprint);
 
     let target_dir_path = PathBuf::from(target_dir);
@@ -1263,6 +1146,14 @@ pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Resu
         }
     }
 
+    // Old backups could contain a transient lock from the source process.
+    // The target directory is newly extracted and has no live runtime owner.
+    match fs::remove_file(wallet_dir.join(crate::utils::RGB_RUNTIME_LOCK_FILE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
     if let Err(e) = fs::write(wallet_dir.join(VSS_RESTORE_MARKER), b"") {
         info!(logger, "Could not write restore marker: {e}");
     }
@@ -1285,6 +1176,9 @@ pub fn create_backup_data(wallet_dir: &Path, logger: &Logger) -> Result<Vec<u8>,
     );
     Ok(data)
 }
+
+#[cfg(test)]
+pub(crate) mod publication_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1344,6 +1238,7 @@ mod tests {
             total_size: 20_000_000,
             encrypted: true,
             version: 1,
+            generation: None,
         };
 
         let json = serde_json::to_string(&manifest).unwrap();

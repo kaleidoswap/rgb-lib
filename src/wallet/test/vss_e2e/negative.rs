@@ -3,8 +3,8 @@ use super::*;
 use std::io::Read;
 
 use crate::wallet::test::utils::vss::{
-    VSS_KEY_CHUNK_PREFIX, VSS_KEY_DATA, VSS_KEY_MANIFEST, VSS_KEY_METADATA, VssBackupDeleteGuard,
-    build_raw_vss_client, generate_signing_key_and_store_id, get_vss_key,
+    VSS_KEY_MANIFEST, VssBackupDeleteGuard, build_raw_vss_client,
+    generate_signing_key_and_store_id, get_vss_key,
 };
 use crate::wallet::test::utils::vss::{dir_has_any_subdir, tokio_runtime, vss_server_url};
 
@@ -206,12 +206,12 @@ fn scenario_4_1_wrong_signing_key_restore_fails_and_writes_no_wallet_data() {
     );
 
     let encrypted_bytes = if manifest.chunk_count == 1 {
-        rt.block_on(get_vss_key(&raw_a, &store_id, VSS_KEY_DATA))
+        rt.block_on(get_vss_key(&raw_a, &store_id, &manifest.chunk_key(0)))
             .expect("backup/data")
     } else {
         let mut data = Vec::with_capacity(manifest.total_size);
         for i in 0..manifest.chunk_count {
-            let key = format!("{VSS_KEY_CHUNK_PREFIX}{i}");
+            let key = manifest.chunk_key(i);
             data.extend(
                 rt.block_on(get_vss_key(&raw_a, &store_id, &key))
                     .expect("chunk bytes"),
@@ -220,7 +220,7 @@ fn scenario_4_1_wrong_signing_key_restore_fails_and_writes_no_wallet_data() {
         data
     };
     let metadata_bytes = rt
-        .block_on(get_vss_key(&raw_a, &store_id, VSS_KEY_METADATA))
+        .block_on(get_vss_key(&raw_a, &store_id, &manifest.metadata_key()))
         .expect("metadata");
     let metadata: VssEncryptionMetadata =
         serde_json::from_slice(&metadata_bytes).expect("metadata json");
