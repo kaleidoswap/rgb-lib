@@ -9,7 +9,9 @@ use std::{
     time::Instant,
 };
 
-use std::{cell::RefCell, path::MAIN_SEPARATOR_STR};
+use std::cell::RefCell;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use std::path::MAIN_SEPARATOR_STR;
 
 #[cfg(feature = "electrum")]
 use amplify::set;
@@ -39,18 +41,14 @@ use crate::wallet::rust_only::check_proxy_url;
 #[cfg(all(feature = "esplora", not(feature = "electrum")))]
 use crate::wallet::rust_only::*;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
-use crate::wallet::{
-    online::*,
-    rust_only::{check_indexer_url, validate_consignment_offchain},
-    utils::build_indexer,
-};
+use crate::wallet::{online::*, rust_only::check_indexer_url, utils::build_indexer};
 use crate::{
     keys::generate_keys,
     utils::{
         KEYCHAIN_BTC, KEYCHAIN_RGB, get_account_derivation_children, get_coin_type,
         get_extended_derivation_path,
     },
-    wallet::{core::*, offline::*, singlesig::*},
+    wallet::{backup::*, core::*, offline::*, singlesig::*},
 };
 #[cfg(feature = "electrum")]
 use crate::{
@@ -58,14 +56,17 @@ use crate::{
         RGB_RUNTIME_DIR, get_account_data, recipient_id_from_script_buf,
         script_buf_from_recipient_id,
     },
-    wallet::{backup::*, multisig::*, rust_only::*},
+    wallet::{multisig::*, rust_only::*},
 };
 
 const PROXY_HOST: &str = "127.0.0.1:3000/json-rpc";
 static PROXY_ENDPOINT: Lazy<String> = Lazy::new(|| format!("rpc://{PROXY_HOST}"));
-const TEST_DATA_DIR_PARTS: [&str; 2] = ["tests", "tmp"];
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const TEST_DATA_DIR_PARTS: [&str; 2] = ["tests", "tmp_srv"];
+const NOSRV_DATA_DIR_PARTS: [&str; 2] = ["tests", "tmp_nosrv"];
 const PASSWORD: &str = "password";
-const RESTORE_DIR_PARTS: [&str; 3] = ["tests", "tmp", "restored"];
+#[cfg(feature = "electrum")]
+const RESTORE_DIR_PARTS: [&str; 3] = ["tests", "tmp_srv", "restored"];
 const MAX_ALLOCATIONS_PER_UTXO: u32 = 5;
 
 #[cfg(feature = "electrum")]
@@ -78,7 +79,6 @@ const PROXY_URL: &str = "http://127.0.0.1:3000/json-rpc";
 const PROXY_URL_MOD_API: &str = "http://127.0.0.1:3002/json-rpc";
 #[cfg(feature = "electrum")]
 const PROXY_URL_MOD_PROTO: &str = "http://127.0.0.1:3001/json-rpc";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 static TRANSPORT_ENDPOINTS: Lazy<Vec<String>> = Lazy::new(|| vec![PROXY_ENDPOINT.clone()]);
 #[cfg(feature = "electrum")]
 const ELECTRUM_URL: &str = "127.0.0.1:50001";
@@ -128,7 +128,6 @@ const IDENT_TOO_LONG_MSG: &str = "string has invalid length.";
 const IDENT_NOT_ASCII_MSG: &str = "string '{0}' contains invalid character '{1}' at position {2}.";
 #[cfg(feature = "electrum")]
 const IDENT_NOT_START_MSG: &str = "string '{0}' must not start with character '{1}'.";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 const MIN_CONFIRMATIONS: u8 = 1;
 const FAKE_TXID: &str = "e5a3e577309df31bd606f48049049d2e1e02b048206ba232944fcc053a176ccb";
 #[cfg(feature = "electrum")]
@@ -233,6 +232,33 @@ pub fn restart_multisig_hub() {
         .expect("failed to start hub service");
 }
 
+#[cfg(all(feature = "vss", feature = "electrum"))]
+macro_rules! get_empty_wallet {
+    () => {
+        get_empty_wallet(true, None)
+    };
+    ($i:expr) => {
+        get_empty_wallet(true, Some($i.to_string()))
+    };
+}
+#[cfg(all(feature = "vss", feature = "electrum"))]
+macro_rules! get_funded_noutxo_wallet {
+    () => {
+        get_funded_noutxo_wallet(true, None)
+    };
+    ($i:expr) => {
+        get_funded_noutxo_wallet(true, Some($i.to_string()))
+    };
+}
+#[cfg(all(feature = "vss", feature = "electrum"))]
+macro_rules! get_funded_wallet {
+    () => {
+        get_funded_wallet(true, None)
+    };
+    ($i:expr) => {
+        get_funded_wallet(true, Some($i.to_string()))
+    };
+}
 // the get_*_wallet! macros can be called with no arguments to use defaults
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 macro_rules! get_empty_party {
@@ -261,42 +287,6 @@ macro_rules! get_funded_party {
     };
     () => {
         get_funded_party(true, None)
-    };
-}
-
-// Raw (Wallet, Online) tuple acquisition macros, used by the VSS test modules which
-// drive the wallet API directly rather than through the SinglesigParty test DSL.
-// Only invoked behind the `vss` feature, so unused under plain electrum/esplora.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-#[allow(unused_macros)]
-macro_rules! get_empty_wallet {
-    ($i: expr) => {
-        get_empty_wallet(true, Some($i))
-    };
-    () => {
-        get_empty_wallet(true, None)
-    };
-}
-
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-#[allow(unused_macros)]
-macro_rules! get_funded_noutxo_wallet {
-    ($i: expr) => {
-        get_funded_noutxo_wallet(true, Some($i))
-    };
-    () => {
-        get_funded_noutxo_wallet(true, None)
-    };
-}
-
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-#[allow(unused_macros)]
-macro_rules! get_funded_wallet {
-    ($i: expr) => {
-        get_funded_wallet(true, Some($i))
-    };
-    () => {
-        get_funded_wallet(true, None)
     };
 }
 
@@ -427,8 +417,8 @@ pub(crate) use utils::{api::*, helpers::*};
 // API tests
 #[cfg(feature = "electrum")]
 mod abort_pending_vanilla_tx;
-mod address_reuse;
 #[cfg(feature = "electrum")]
+mod address_reuse;
 mod backup;
 mod blind_receive;
 #[cfg(feature = "electrum")]
@@ -488,15 +478,17 @@ mod rust_only;
 mod send;
 #[cfg(feature = "electrum")]
 mod send_btc;
-#[cfg(feature = "electrum")]
 mod sign_psbt;
 #[cfg(feature = "electrum")]
 mod sync;
+mod witness_receive;
+
 #[cfg(feature = "electrum")]
 mod tx_known_to_wallet;
-#[cfg(feature = "vss")]
+#[cfg(all(feature = "vss", feature = "electrum"))]
 mod vss;
-#[cfg(feature = "vss")]
+#[cfg(all(feature = "vss", feature = "electrum"))]
 mod vss_e2e;
-#[cfg(feature = "electrum")]
-mod witness_receive;
+
+#[cfg(feature = "vss")]
+mod vss_sqlite;

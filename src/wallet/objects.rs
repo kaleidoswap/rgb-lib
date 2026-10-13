@@ -35,8 +35,7 @@ pub struct WalletData {
     /// Default: `false`
     ///
     /// **Privacy:** enabling this reduces on-chain privacy since all incoming transactions to the
-    /// same keychain become linkable. Only enable when address reuse is acceptable (e.g. MPC
-    /// wallets, CEX deposit addresses).
+    /// same keychain become linkable. Only enable when address reuse is acceptable (e.g. exchange deposit addresses).
     #[serde(default)]
     pub reuse_addresses: bool,
 }
@@ -2085,11 +2084,9 @@ pub struct ReceivedConsignmentMeta {
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub enum TryFailBatchTransferOutcome {
+    CannotFail,
     Failed,
     Refreshed,
-    /// Failing the batch would misreport state that already landed elsewhere: its TX is known to
-    /// the indexer (so the inputs cannot be credited back), or its fascia is already in the stash
-    CannotFail,
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]

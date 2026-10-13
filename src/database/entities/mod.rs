@@ -6,10 +6,15 @@ pub mod asset;
 pub mod asset_transfer;
 pub mod backup_info;
 pub mod batch_transfer;
+pub mod bdk_anchor;
+pub mod bdk_block;
+pub mod bdk_descriptor_last_revealed;
+pub mod bdk_tx;
+pub mod bdk_txout;
+pub mod bdk_wallet;
+pub mod bdk_wallet_locked_outpoint;
 pub mod coloring;
 pub mod media;
-#[cfg(feature = "mpc")]
-pub mod mpc_address;
 pub mod pending_witness_script;
 pub mod reserved_txo;
 pub mod reuse_address_index;

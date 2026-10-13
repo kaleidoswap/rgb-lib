@@ -76,9 +76,17 @@ pub(super) trait Sanitizable {
 
 // replace the variable part of file paths with a fixed string
 fn sanitize_path(path: &str) -> String {
-    regex::Regex::new(r"tmp/[^/]*")
-        .unwrap()
-        .replace(path, "tmp/variable")
+    // the test data dir holds one directory per wallet, named differently on every run: that name
+    // is the only variable part, everything below it has to be compared. The pattern is built from
+    // the data dir itself so that renaming it cannot silently stop the sanitization
+    let data_dir = join_with_sep(&TEST_DATA_DIR_PARTS);
+    let sep = regex::escape(MAIN_SEPARATOR_STR);
+    let re = regex::Regex::new(&format!("{}{sep}[^{sep}]*", regex::escape(&data_dir))).unwrap();
+    assert!(
+        re.is_match(path),
+        "cannot sanitize path outside the test data dir {data_dir}: {path}"
+    );
+    re.replace(path, format!("{data_dir}{MAIN_SEPARATOR_STR}variable"))
         .to_string()
 }
 
@@ -290,12 +298,12 @@ pub(super) fn get_test_ms_wallet(keys: &MultisigKeys, dir: String) -> MultisigWa
     let _ = fs::create_dir_all(&data_dir);
     let wallet = MultisigWallet::new(
         WalletData {
+            reuse_addresses: false,
             data_dir,
             bitcoin_network: BitcoinNetwork::Regtest,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: AssetSchema::VALUES.to_vec(),
-            reuse_addresses: false,
         },
         keys.clone(),
     )
@@ -1443,22 +1451,6 @@ pub(super) fn inspect_burn(
     assert_eq!(burn_transitions.len(), 1);
 }
 
-pub(super) fn check_send_op_has_consignment(wallet: &MultisigParty, op_idx: i32) {
-    let (_, files) = wallet.get_op_and_files(op_idx);
-    let consignments: Vec<_> = files
-        .iter()
-        .filter(|f| matches!(f.r#type, FileType::Consignment))
-        .collect();
-    assert!(
-        !consignments.is_empty(),
-        "send operation should expose a consignment on the hub"
-    );
-    for consignment in consignments {
-        let size = fs::metadata(&consignment.filepath).unwrap().len();
-        assert!(size > 0, "posted consignment must be non-empty");
-    }
-}
-
 pub(super) fn inspect_send(
     wallet: &MultisigParty,
     op_init: &InitOperationResult,
@@ -1636,6 +1628,10 @@ pub(super) fn operation_complete<H>(
     H: OperationHandler,
     H::Details: Sanitizable,
 {
+    // stop mining so the TX broadcast by the final sign_and_ack doesn't get confirmed
+    // before callers check the unconfirmed state
+    let _mining_guard = stop_mining();
+
     let (op, files) = if !ackers.is_empty() {
         let party = ackers.first().unwrap();
         party.get_op_and_files(op_idx)
@@ -1916,5 +1912,21 @@ pub(super) fn sync_wallets_full(wallets: &mut [&mut MultisigParty]) {
             .unwrap();
         assert_eq!(final_processed, last_hub_operation);
         wallet.assert_up_to_date();
+    }
+}
+
+pub(super) fn check_send_op_has_consignment(wallet: &MultisigParty, op_idx: i32) {
+    let (_, files) = wallet.get_op_and_files(op_idx);
+    let consignments: Vec<_> = files
+        .iter()
+        .filter(|f| matches!(f.r#type, FileType::Consignment))
+        .collect();
+    assert!(
+        !consignments.is_empty(),
+        "send operation should expose a consignment on the hub"
+    );
+    for consignment in consignments {
+        let size = fs::metadata(&consignment.filepath).unwrap().len();
+        assert!(size > 0, "posted consignment must be non-empty");
     }
 }

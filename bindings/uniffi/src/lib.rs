@@ -1,6 +1,5 @@
-#![allow(clippy::too_many_arguments)]
-// uniffi-generated scaffolding declares a large metadata array as const; not editable here
 #![allow(clippy::large_const_arrays)]
+#![allow(clippy::too_many_arguments)]
 
 use std::{
     collections::HashMap,
@@ -19,11 +18,15 @@ fn vss_runtime() -> &'static tokio::runtime::Runtime {
         tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for VSS")
     })
 }
-
+use rgb_lib::bdk_wallet::bitcoin::secp256k1::SecretKey;
+use rgb_lib::wallet::vss::{
+    VssBackupClient as RgbLibVssBackupClient, VssBackupConfig as RgbLibVssBackupConfig,
+    VssBackupInfo, VssBackupMode, restore_from_vss as rgb_lib_restore_from_vss,
+};
 use rgb_lib::{
     AssetSchema, Assignment as RgbLibAssignment, CloseMethod, ContractId, Error as RgbLibError,
     FileContent, RgbTransfer, TransferStatus, TransportType, WalletTransactionType,
-    bdk_wallet::bitcoin::{OutPoint as BitcoinOutPoint, Psbt, Txid, secp256k1::SecretKey},
+    bdk_wallet::bitcoin::{OutPoint as BitcoinOutPoint, Psbt, Txid},
     keys::{Keys, WitnessVersion},
     utils::BitcoinNetwork,
     wallet::{
@@ -51,16 +54,12 @@ use rgb_lib::{
             AssetColoringInfo as RgbAssetColoringInfo, ColoringInfo as RgbColoringInfo,
             ExpectedTransfer as RgbExpectedTransfer,
         },
-        vss::{
-            VssBackupClient as RgbLibVssBackupClient, VssBackupConfig as RgbLibVssBackupConfig,
-            VssBackupInfo, VssBackupMode, restore_from_vss as rgb_lib_restore_from_vss,
-        },
     },
 };
 
 uniffi::include_scaffolding!("rgb-lib");
 
-// temporary solution needed because the Enum attribute doesn't support the Remote one
+// temporary solution needed because the UDL Enum and Remote attributes are incompatible with each other
 pub enum SyncKeychain {
     Colored,
     Vanilla { lookback: u32 },
@@ -109,7 +108,7 @@ impl From<AssetFilter> for RgbLibAssetFilter {
     }
 }
 
-// temporary solution needed because the Enum attribute doesn't support the Remote one
+// temporary solution needed because the UDL Enum and Remote attributes are incompatible with each other
 pub enum Assignment {
     Fungible { amount: u64 },
     NonFungible,
@@ -605,7 +604,7 @@ impl From<RgbInspection> for RgbLibRgbInspection {
     }
 }
 
-// temporary solution needed because the Enum attribute doesn't support the Remote one
+// temporary solution needed because the UDL Enum and Remote attributes are incompatible with each other
 pub enum Operation {
     CreateUtxosToReview {
         psbt: String,
@@ -996,7 +995,7 @@ impl From<RgbLibOperationInfo> for OperationInfo {
     }
 }
 
-// temporary solution needed because the Enum attribute doesn't support the Remote one
+// temporary solution needed because the UDL Enum and Remote attributes are incompatible with each other
 pub enum RespondToOperation {
     Ack { signed_psbt: String },
     Nack,
@@ -1028,14 +1027,6 @@ fn restore_keys(
     witness_version: WitnessVersion,
 ) -> Result<Keys, RgbLibError> {
     rgb_lib::keys::restore_keys(bitcoin_network, mnemonic, witness_version)
-}
-
-fn restore_backup(
-    backup_path: String,
-    password: String,
-    data_dir: String,
-) -> Result<(), RgbLibError> {
-    rgb_lib::wallet::restore_backup(&backup_path, &password, &data_dir)
 }
 
 pub struct ValidateConsignmentResult {
@@ -1482,28 +1473,6 @@ impl Wallet {
             .rotate_address(rgb_lib::bdk_wallet::KeychainKind::External)
     }
 
-    fn configure_vss_backup(&self, config: VssBackupConfig) -> Result<(), RgbLibError> {
-        let rgb_lib_config: RgbLibVssBackupConfig = config.try_into()?;
-        self._get_wallet().configure_vss_backup(rgb_lib_config)
-    }
-
-    fn disable_vss_auto_backup(&self) {
-        self._get_wallet().disable_vss_auto_backup()
-    }
-
-    fn vss_backup(&self, client: std::sync::Arc<VssBackupClient>) -> Result<i64, RgbLibError> {
-        let vss_client = client._get_client();
-        vss_runtime().block_on(self._get_wallet().vss_backup(&vss_client))
-    }
-
-    fn vss_backup_info(
-        &self,
-        client: std::sync::Arc<VssBackupClient>,
-    ) -> Result<VssBackupInfo, RgbLibError> {
-        let vss_client = client._get_client();
-        vss_runtime().block_on(self._get_wallet().vss_backup_info(&vss_client))
-    }
-
     fn get_asset_balance(&self, asset_id: String) -> Result<Balance, RgbLibError> {
         self._get_wallet().get_asset_balance(asset_id)
     }
@@ -1850,6 +1819,28 @@ impl Wallet {
 
     fn abort_pending_vanilla_tx(&self, txid: String) -> Result<(), RgbLibError> {
         self._get_wallet().abort_pending_vanilla_tx(txid)
+    }
+
+    fn configure_vss_backup(&self, config: VssBackupConfig) -> Result<(), RgbLibError> {
+        let rgb_lib_config: RgbLibVssBackupConfig = config.try_into()?;
+        self._get_wallet().configure_vss_backup(rgb_lib_config)
+    }
+
+    fn disable_vss_auto_backup(&self) {
+        self._get_wallet().disable_vss_auto_backup()
+    }
+
+    fn vss_backup(&self, client: std::sync::Arc<VssBackupClient>) -> Result<i64, RgbLibError> {
+        let vss_client = client._get_client();
+        vss_runtime().block_on(self._get_wallet().vss_backup(&vss_client))
+    }
+
+    fn vss_backup_info(
+        &self,
+        client: std::sync::Arc<VssBackupClient>,
+    ) -> Result<VssBackupInfo, RgbLibError> {
+        let vss_client = client._get_client();
+        vss_runtime().block_on(self._get_wallet().vss_backup_info(&vss_client))
     }
 }
 
@@ -2333,10 +2324,136 @@ impl MultisigWallet {
 }
 
 uniffi::deps::static_assertions::assert_impl_all!(MultisigWallet: Sync, Send);
+uniffi::deps::static_assertions::assert_impl_all!(VssBackupClient: Sync, Send);
+
+fn restore_backup(
+    backup_path: String,
+    password: String,
+    data_dir: String,
+) -> Result<(), RgbLibError> {
+    rgb_lib::wallet::restore_backup(&backup_path, &password, &data_dir)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compact(s: &str) -> String {
+        s.split_whitespace().collect()
+    }
+
+    #[test]
+    fn udl_exports_vss_api_surface() {
+        let udl = include_str!("rgb-lib.udl");
+        let udl = compact(udl);
+
+        // Types
+        assert!(
+            udl.contains("enumVssBackupMode"),
+            "missing VssBackupMode in UDL"
+        );
+        assert!(
+            udl.contains("dictionaryVssBackupConfig"),
+            "missing VssBackupConfig in UDL"
+        );
+        assert!(
+            udl.contains("dictionaryVssBackupInfo"),
+            "missing VssBackupInfo in UDL"
+        );
+        assert!(
+            udl.contains("interfaceVssBackupClient"),
+            "missing VssBackupClient in UDL"
+        );
+
+        // Functions / methods
+        assert!(
+            udl.contains("restore_from_vss(VssBackupConfigconfig,stringtarget_dir);"),
+            "missing restore_from_vss(...) in UDL"
+        );
+        assert!(
+            udl.contains("configure_vss_backup(VssBackupConfigconfig);"),
+            "missing Wallet.configure_vss_backup(...) in UDL"
+        );
+        assert!(
+            udl.contains("vss_backup(VssBackupClientclient);"),
+            "missing Wallet.vss_backup(...) in UDL"
+        );
+        assert!(
+            udl.contains("vss_backup_info(VssBackupClientclient);"),
+            "missing Wallet.vss_backup_info(...) in UDL"
+        );
+        assert!(
+            udl.contains("disable_vss_auto_backup();"),
+            "missing Wallet.disable_vss_auto_backup() in UDL"
+        );
+    }
+
+    #[test]
+    fn vss_bindings_smoke_runtime_and_type_conversion() {
+        // Shared runtime must be reusable and safe to call from multiple threads (FFI-style).
+        let rt_ptr_1 = std::ptr::from_ref(vss_runtime());
+        let rt_ptr_2 = std::ptr::from_ref(vss_runtime());
+        assert_eq!(
+            rt_ptr_1, rt_ptr_2,
+            "expected vss_runtime() to be a singleton"
+        );
+
+        let threads = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..50 {
+                        let v = vss_runtime().block_on(async { 42u8 });
+                        assert_eq!(v, 42);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for t in threads {
+            t.join().expect("thread join");
+        }
+
+        // Config conversion must validate signing key shape (SDK uses bytes).
+        let bad = VssBackupConfig {
+            server_url: "http://127.0.0.1:1/vss".to_string(),
+            store_id: "qa_udl_smoke_store".to_string(),
+            signing_key: vec![1, 2, 3],
+            encryption_enabled: true,
+            auto_backup: false,
+            backup_mode: VssBackupMode::Async,
+        };
+        let err = match RgbLibVssBackupConfig::try_from(bad) {
+            Ok(_) => panic!("expected invalid signing key error"),
+            Err(e) => e,
+        };
+        match err {
+            RgbLibError::Internal { details } => {
+                assert!(
+                    details.contains("Invalid signing key"),
+                    "unexpected error: {details}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        // Use a deterministic unreachable local URL (no DNS dependency). This test must remain
+        // unit-level and must not require a live VSS server.
+        let server_url = "http://127.0.0.1:1/vss".to_string();
+
+        let good = VssBackupConfig {
+            server_url: server_url.clone(),
+            store_id: "qa_udl_smoke_store".to_string(),
+            signing_key: vec![1u8; 32],
+            encryption_enabled: true,
+            auto_backup: false,
+            backup_mode: VssBackupMode::Async,
+        };
+        let client = VssBackupClient::new(good).expect("VssBackupClient::new");
+        assert!(
+            client.encryption_enabled(),
+            "expected encryption_enabled=true"
+        );
+    }
+
     use rgb_lib::{
         bdk_wallet::{
             KeychainKind, Wallet as BdkWallet,
@@ -2414,8 +2531,7 @@ mod tests {
         let script = wallet
             .peek_address(KeychainKind::External, 0)
             .script_pubkey();
-        let recipient_id =
-            recipient_id_from_script_buf(script.clone(), BitcoinNetwork::Regtest).unwrap();
+        let recipient_id = recipient_id_from_script_buf(script.clone(), BitcoinNetwork::Regtest);
         let script_hex = script_hex_from_recipient_id(recipient_id).unwrap().unwrap();
         assert_eq!(script_hex, script.to_hex_string());
     }
