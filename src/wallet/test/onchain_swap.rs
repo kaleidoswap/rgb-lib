@@ -162,8 +162,7 @@ fn swap_refuses_counterparty_inputs_that_belong_to_this_wallet() {
     let proposal = maker
         .accept_swap_request(maker_online, request.clone(), 0, false, vec![])
         .unwrap();
-    let mut smuggled_proposal = proposal.clone();
-    smuggled_proposal.maker_inputs[0] = request.taker_inputs[0].clone();
+    let smuggled_proposal = smuggle_maker_input(&proposal, request.taker_inputs[0].clone());
     let err = taker
         .complete_swap_proposal(taker_online, smuggled_proposal, 0, false)
         .unwrap_err();
@@ -171,6 +170,103 @@ fn swap_refuses_counterparty_inputs_that_belong_to_this_wallet() {
     taker
         .complete_swap_proposal(taker_online, proposal, 0, false)
         .unwrap();
+}
+
+/// A maker that lists one of the taker's coins the taker did not declare (not a duplicate of a
+/// taker input), with a PSBT rebuilt to match so the shape checks pass. Covers an uncolored coin
+/// and a colored one holding another asset.
+#[test]
+#[parallel]
+fn taker_refuses_undeclared_own_coins_as_maker_inputs() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SUND",
+        "Swap Undeclared",
+        SWAP_RGB_AMOUNT,
+    );
+    // a second colored coin carrying another asset, which the swap must not touch
+    issue_swap_asset(&mut taker, taker_online, "SOTH", "Swap Other", 500);
+
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let proposal = maker
+        .accept_swap_request(maker_online, request.clone(), 0, false, vec![])
+        .unwrap();
+
+    let declared = request
+        .taker_inputs
+        .iter()
+        .map(|i| i.outpoint.clone())
+        .collect::<Vec<_>>();
+    let undeclared = taker
+        .list_unspents(Some(taker_online), false, false)
+        .unwrap()
+        .into_iter()
+        .filter(|u| !declared.contains(&u.utxo.outpoint))
+        .collect::<Vec<_>>();
+    let uncolored = undeclared
+        .iter()
+        .find(|u| !u.utxo.colorable)
+        .expect("taker has an undeclared uncolored coin");
+    let colored = undeclared
+        .iter()
+        .find(|u| u.utxo.colorable && !u.rgb_allocations.is_empty())
+        .expect("taker has an undeclared colored coin");
+
+    for unspent in [uncolored, colored] {
+        let local_output = taker
+            .bdk_wallet()
+            .get_utxo(unspent.utxo.outpoint.clone().into())
+            .unwrap();
+        let smuggled = smuggle_maker_input(&proposal, swap_build_input(&local_output));
+        let err = taker
+            .complete_swap_proposal(taker_online, smuggled, 0, false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("belongs to this wallet"),
+            "{}: {err}",
+            unspent.utxo.outpoint
+        );
+    }
+
+    // the refusals left nothing behind: the honest proposal still completes and settles
+    let completion = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap();
+    maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap();
+}
+
+/// Add `input` to the maker inputs (its value goes to the maker's change) and rebuild the PSBT
+/// and txid to match, as a malicious maker would.
+fn smuggle_maker_input(
+    proposal: &OnchainSwapProposal,
+    input: OnchainSwapInput,
+) -> OnchainSwapProposal {
+    let mut smuggled = proposal.clone();
+    smuggled.maker_inputs.push(input);
+    let (psbt, _, _) = swap_build_psbt(&smuggled).unwrap();
+    smuggled.txid = psbt.unsigned_tx.compute_txid().to_string();
+    smuggled.psbt = psbt.to_string();
+    smuggled
 }
 
 #[test]
