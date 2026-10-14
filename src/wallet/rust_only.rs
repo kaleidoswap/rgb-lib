@@ -144,7 +144,15 @@ thread_local! {
 /// RGB asset-specific information to color a transaction
 #[derive(Debug, Clone)]
 pub struct AssetColoringInfo {
-    /// Map of vouts and asset amounts to color the transaction outputs
+    /// Map of vouts and asset amounts to color the transaction outputs.
+    ///
+    /// How keys are read depends on the method: [`Wallet::color_psbt`],
+    /// [`Wallet::color_psbt_stage`] and [`Wallet::color_psbt_and_prepare_consume`] take
+    /// pre-OP_RETURN indices (shifted by +1 when the PSBT has a P2TR output), while
+    /// [`Wallet::color_psbt_for_outpoints`], [`Wallet::color_psbt_for_outpoints_and_prepare_consume`]
+    /// and [`Wallet::psbt_op_prepare`] take final vouts. Every method rejects a key that does not
+    /// resolve to an existing, non-OP_RETURN output with a witness-seal script (P2PKH, P2SH,
+    /// P2WPKH, P2WSH or P2TR), naming the convention it expected.
     pub output_map: HashMap<u32, u64>,
     /// Static blinding to keep the transaction construction deterministic
     pub static_blinding: Option<u64>,
@@ -576,6 +584,70 @@ fn rebuild_psbt_preserving_maps(
     Ok(rebuilt)
 }
 
+/// Resolve an `output_map` key to the vout of the (already OP_RETURN-prepared) PSBT it seals,
+/// failing unless that output exists, is not the OP_RETURN commitment host and can carry a
+/// witness seal (P2PKH, P2SH, P2WPKH, P2WSH or P2TR, the scripts a witness recipient can name).
+///
+/// The two `output_map` conventions only differ on a P2TR PSBT, where the OP_RETURN is vout 0:
+/// [`Wallet::color_psbt`] and friends shift their pre-OP_RETURN keys by +1
+/// (`shift_output_map_for_opreturn_first`), while [`Wallet::color_psbt_for_outpoints`] and
+/// [`Wallet::psbt_op_prepare`] take final vouts as-is. A key written for the other convention is
+/// off by one, so errors name the convention the key was read with.
+fn output_map_seal_vout(
+    psbt: &Psbt,
+    key: u32,
+    shift_output_map_for_opreturn_first: bool,
+) -> Result<u32, Error> {
+    let outputs = &psbt.unsigned_tx.output;
+    let vout = if shift_output_map_for_opreturn_first {
+        key.checked_add(1)
+            .ok_or_else(|| Error::InvalidColoringInfo {
+                details: s!("vout in output_map is too large"),
+            })?
+    } else {
+        key
+    };
+    let convention = if shift_output_map_for_opreturn_first {
+        "keys are pre-OP_RETURN indices (color_psbt, color_psbt_stage, \
+         color_psbt_and_prepare_consume): this PSBT has a P2TR output, so the OP_RETURN is vout 0 \
+         and every key is shifted by +1; do not pass final vouts"
+    } else if outputs
+        .first()
+        .is_some_and(|o| o.script_pubkey.is_op_return())
+        && outputs.iter().any(|o| o.script_pubkey.is_p2tr())
+    {
+        // only the final-vout entry points leave a P2TR PSBT unshifted
+        "keys are final vout indices (color_psbt_for_outpoints, psbt_op_prepare): the OP_RETURN \
+         is vout 0, so pre-OP_RETURN indices as taken by color_psbt are off by one"
+    } else {
+        "keys are final vout indices (without a P2TR output both index conventions coincide)"
+    };
+    let Some(txout) = outputs.get(vout as usize) else {
+        return Err(Error::InvalidColoringInfo {
+            details: format!(
+                "invalid vout in output_map, does not exist in the given PSBT: key {key} seals vout {vout} of {}; {convention}",
+                outputs.len()
+            ),
+        });
+    };
+    if txout.script_pubkey.is_op_return() {
+        return Err(Error::InvalidColoringInfo {
+            details: format!(
+                "output_map vout {vout} points to the OP_RETURN output (key {key}); {convention}"
+            ),
+        });
+    }
+    if AddressPayload::from_script(&txout.script_pubkey).is_err() {
+        return Err(Error::InvalidColoringInfo {
+            details: format!(
+                "output_map vout {vout} script cannot carry an RGB witness seal (not P2PKH, P2SH, \
+                 P2WPKH, P2WSH or P2TR) (key {key}); {convention}"
+            ),
+        });
+    }
+    Ok(vout)
+}
+
 /// Indexer protocol
 #[derive(Debug, Clone)]
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -897,8 +969,20 @@ impl Wallet {
 
     /// Color a PSBT.
     ///
-    /// With P2TR, OP_RETURN is at vout 0 and `output_map` keys are pre-OP_RETURN indices. Signed
-    /// inputs are rejected.
+    /// Signed inputs are rejected. An OP_RETURN output is appended if missing, or inserted at
+    /// vout 0 when any output is P2TR (RGB `OpretFirst`); with P2TR an existing OP_RETURN must
+    /// already be vout 0.
+    ///
+    /// # `output_map` index convention (differs from [`Self::color_psbt_for_outpoints`])
+    ///
+    /// Keys are **pre-OP_RETURN indices**: when any output is P2TR every key is shifted by +1 to
+    /// skip the OP_RETURN at vout 0, even if the PSBT already contains it. Without P2TR keys are
+    /// final vouts, so both conventions coincide. Each shifted key must resolve to an existing
+    /// output that is not the OP_RETURN and has a witness-seal script (P2PKH, P2SH, P2WPKH, P2WSH
+    /// or P2TR), otherwise [`Error::InvalidColoringInfo`] names the expected convention. These
+    /// checks catch a final vout passed by mistake only when the shift lands on the end of the
+    /// PSBT or on an output that cannot carry a seal; shifting onto another valid output cannot
+    /// be told apart from a correct key.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
@@ -1074,16 +1158,9 @@ impl Wallet {
             let mut sending_amt: u64 = 0;
             // walk vouts in ascending order: iterating the HashMap directly would let the reported
             // validation error and the beneficiary ordering vary between otherwise identical calls
-            for (mut vout, amount) in BTreeMap::from_iter(asset_coloring_info.output_map) {
+            for (key, amount) in BTreeMap::from_iter(asset_coloring_info.output_map) {
                 if amount == 0 {
                     continue;
-                }
-                if shift_output_map_for_opreturn_first {
-                    vout = vout
-                        .checked_add(1)
-                        .ok_or_else(|| Error::InvalidColoringInfo {
-                            details: s!("vout in output_map is too large"),
-                        })?;
                 }
                 sending_amt =
                     sending_amt
@@ -1091,19 +1168,7 @@ impl Wallet {
                         .ok_or_else(|| Error::InvalidColoringInfo {
                             details: s!("total amount in output_map exceeds u64::MAX"),
                         })?;
-                if vout as usize >= psbt.unsigned_tx.output.len() {
-                    return Err(Error::InvalidColoringInfo {
-                        details: s!("invalid vout in output_map, does not exist in the given PSBT"),
-                    });
-                }
-                if psbt.unsigned_tx.output[vout as usize]
-                    .script_pubkey
-                    .is_op_return()
-                {
-                    return Err(Error::InvalidColoringInfo {
-                        details: format!("output_map vout {vout} points to the OP_RETURN output"),
-                    });
-                }
+                let vout = output_map_seal_vout(psbt, key, shift_output_map_for_opreturn_first)?;
                 let graph_seal = if let Some(blinding) = asset_coloring_info.static_blinding {
                     GraphSeal::with_blinded_vout(vout, blinding)
                 } else {
@@ -1374,7 +1439,8 @@ impl Wallet {
     ///
     /// Multiple parties may each call this method on the same PSBT (each for their own contracts),
     /// in which case [`Wallet::color_psbt_finalize`] must be invoked once after all staging is
-    /// complete to produce the [`Fascia`]. `output_map` indexing follows [`Self::color_psbt`].
+    /// complete to produce the [`Fascia`]. `output_map` indexing (pre-OP_RETURN) and its checks
+    /// follow [`Self::color_psbt`].
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
@@ -1470,7 +1536,8 @@ impl Wallet {
 
     /// Color a PSBT, build consignments, and register a fallible batch transfer.
     ///
-    /// `output_map` indexing follows [`Self::color_psbt`] (legacy P2TR / `OpretFirst` +1 shift).
+    /// `output_map` indexing (pre-OP_RETURN, legacy P2TR / `OpretFirst` +1 shift) and its checks
+    /// follow [`Self::color_psbt`].
     ///
     /// Consignments are built from the fascia **before** any stash update. The fascia is saved
     /// under the wallet transfer dir and a [`TransferStatus::Initiated`] batch is written so
@@ -1576,8 +1643,13 @@ impl Wallet {
     ///
     /// Keys are always **final PSBT vout indices**. This method never inserts outputs and never
     /// shifts keys. Do **not** pass the pre-OP_RETURN indices used by [`Self::color_psbt`] when
-    /// that method applies the P2TR / `OpretFirst` +1 shift — using the wrong base silently seals
-    /// the wrong output.
+    /// that method applies the P2TR / `OpretFirst` +1 shift: they are off by one.
+    ///
+    /// Each key must be an existing output that is not the OP_RETURN and has a witness-seal
+    /// script (P2PKH, P2SH, P2WPKH, P2WSH or P2TR), otherwise [`Error::InvalidColoringInfo`] names
+    /// the expected convention. With P2TR this rejects a pre-OP_RETURN key 0 (it lands on the
+    /// OP_RETURN) and any key landing on an output that cannot carry a seal, but a pre-OP_RETURN
+    /// key that lands on another valid output cannot be told apart from a correct final vout.
     ///
     /// Coloring must happen **before** any input is signed (same rule as [`Self::color_psbt`]).
     ///
@@ -1685,6 +1757,7 @@ impl Wallet {
     /// Same recovery model as [`Self::color_psbt_and_prepare_consume`]: stash is updated only by
     /// [`Self::consume_transfer_fascia`] after broadcast; use `fail_transfers` if the tx is dropped.
     /// `min_confirmations` and `expiration_timestamp` have the same meaning as there.
+    /// `output_map` keys are final vouts, checked as in [`Self::color_psbt_for_outpoints`].
     ///
     /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -2144,6 +2217,10 @@ impl Wallet {
     /// payloads under `psbt_ops/{operation_id}/`, and persist SQL accounting for colored contracts.
     /// `expiration_timestamp` defaults to [`PSBT_OP_DEFAULT_EXPIRATION_SECS`] from now; see
     /// [`Self::psbt_op_prepare_with_expiry`] to disable expiry.
+    ///
+    /// `output_map` keys are **final PSBT vout indices**, not the pre-OP_RETURN indices of
+    /// [`Self::color_psbt`]; PSBT and key requirements and checks are those of
+    /// [`Self::color_psbt_for_outpoints`]. A rejected `output_map` leaves the PSBT untouched.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
