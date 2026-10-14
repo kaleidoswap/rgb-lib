@@ -78,6 +78,22 @@ fn refund_leaf_script(refund_key: &XOnlyPublicKey, timeout_height: u32) -> Scrip
         .into_script()
 }
 
+/// Both leaves at depth 1, claim first, under `internal_key` (the Boltz/maker layout).
+fn swap_tree_spend_info(
+    secp: &Secp256k1<All>,
+    claim_leaf: &ScriptBuf,
+    refund_leaf: &ScriptBuf,
+    internal_key: XOnlyPublicKey,
+) -> TaprootSpendInfo {
+    TaprootBuilder::new()
+        .add_leaf(1, claim_leaf.clone())
+        .unwrap()
+        .add_leaf(1, refund_leaf.clone())
+        .unwrap()
+        .finalize(secp, internal_key)
+        .unwrap()
+}
+
 impl SwapTreeHtlc {
     fn new(timeout_height: u32) -> Self {
         let secp = Secp256k1::new();
@@ -90,13 +106,12 @@ impl SwapTreeHtlc {
             &claim_key.x_only_public_key().0,
         );
         let refund_leaf = refund_leaf_script(&refund_key.x_only_public_key().0, timeout_height);
-        let spend_info = TaprootBuilder::new()
-            .add_leaf(1, claim_leaf.clone())
-            .unwrap()
-            .add_leaf(1, refund_leaf.clone())
-            .unwrap()
-            .finalize(&secp, internal_key.x_only_public_key().0)
-            .unwrap();
+        let spend_info = swap_tree_spend_info(
+            &secp,
+            &claim_leaf,
+            &refund_leaf,
+            internal_key.x_only_public_key().0,
+        );
         Self {
             secp,
             preimage,
@@ -1262,4 +1277,315 @@ fn ops_spending_lists_every_operation_on_an_outpoint() {
         vout: 0,
     });
     assert_matches!(result, Err(Error::InvalidTxid));
+}
+
+/// Golden vectors frozen from real maker responses and shared with the SDK (see
+/// `tests/fixtures/kaleidoswap-sdk/rgb-v1/README.md`). They pin the swap tree, the MuSig2 key
+/// order and the recipient-id encoder used here to what the maker and the SDK produce, so all
+/// three sides build the same HTLC. No services needed.
+mod sdk_golden_vectors {
+    use std::str::FromStr;
+
+    use bitcoin::{
+        Address, Network, PublicKey as BtcPublicKey,
+        hashes::sha256,
+        opcodes::all::OP_SIZE,
+        taproot::{TapNodeHash, TaprootSpendInfo},
+    };
+    use secp256k1_musig::{PublicKey as MusigPublicKey, musig::KeyAggCache};
+
+    use super::*;
+    use crate::utils::{
+        BitcoinNetwork, recipient_id_from_script_buf, script_buf_from_recipient_id,
+    };
+
+    const VECTORS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/kaleidoswap-sdk/rgb-v1/htlc-golden-vectors.json"
+    ));
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SwapKind {
+        Submarine,
+        Reverse,
+    }
+
+    struct GoldenSwap {
+        kind: SwapKind,
+        claim_key: BtcPublicKey,
+        refund_key: BtcPublicKey,
+        claim_leaf: ScriptBuf,
+        refund_leaf: ScriptBuf,
+        timeout_height: u32,
+        address: String,
+        script_pubkey: ScriptBuf,
+        recipient_id: String,
+    }
+
+    fn vectors() -> Value {
+        serde_json::from_str(VECTORS).unwrap()
+    }
+
+    fn str_at<'a>(v: &'a Value, pointer: &str) -> &'a str {
+        v.pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("golden vector missing string at {pointer}"))
+    }
+
+    fn bytes_at(v: &Value, pointer: &str) -> Vec<u8> {
+        hex::decode(str_at(v, pointer)).unwrap()
+    }
+
+    fn script_at(v: &Value, pointer: &str) -> ScriptBuf {
+        ScriptBuf::from_bytes(bytes_at(v, pointer))
+    }
+
+    fn key_at(v: &Value, pointer: &str) -> BtcPublicKey {
+        BtcPublicKey::from_str(str_at(v, pointer)).unwrap()
+    }
+
+    fn leaf_at(v: &Value, pointer: &str) -> ScriptBuf {
+        let leaf = v.pointer(pointer).unwrap();
+        assert_eq!(
+            leaf["version"].as_u64().unwrap(),
+            LeafVersion::TapScript.to_consensus() as u64,
+            "{pointer} leaf version"
+        );
+        script_at(leaf, "/output")
+    }
+
+    fn preimage(v: &Value) -> [u8; 32] {
+        bytes_at(v, "/wireContract/preimage").try_into().unwrap()
+    }
+
+    fn golden_swap(v: &Value, kind: SwapKind) -> GoldenSwap {
+        let (base, claim_key, refund_key, address) = match kind {
+            SwapKind::Submarine => (
+                "/wireContract/create/submarine",
+                "/response/claimPublicKey",
+                "/request/refundPublicKey",
+                "/response/address",
+            ),
+            SwapKind::Reverse => (
+                "/wireContract/create/reverse",
+                "/request/claimPublicKey",
+                "/response/refundPublicKey",
+                "/response/lockupAddress",
+            ),
+        };
+        let swap = v.pointer(base).unwrap();
+        GoldenSwap {
+            kind,
+            claim_key: key_at(swap, claim_key),
+            refund_key: key_at(swap, refund_key),
+            claim_leaf: leaf_at(swap, "/response/swapTree/claimLeaf"),
+            refund_leaf: leaf_at(swap, "/response/swapTree/refundLeaf"),
+            timeout_height: swap
+                .pointer("/response/timeoutBlockHeight")
+                .and_then(Value::as_u64)
+                .unwrap() as u32,
+            address: str_at(swap, address).to_string(),
+            script_pubkey: script_at(swap, "/response/rgb/scriptPubkey"),
+            recipient_id: str_at(swap, "/response/rgb/recipientId").to_string(),
+        }
+    }
+
+    fn golden_swaps() -> [GoldenSwap; 2] {
+        let v = vectors();
+        [
+            golden_swap(&v, SwapKind::Submarine),
+            golden_swap(&v, SwapKind::Reverse),
+        ]
+    }
+
+    fn x_only(key: &BtcPublicKey) -> XOnlyPublicKey {
+        key.inner.x_only_public_key().0
+    }
+
+    /// BIP327 KeyAgg of `keys` in the given order (libsecp256k1's MuSig2 module).
+    fn musig_agg(keys: [&BtcPublicKey; 2]) -> XOnlyPublicKey {
+        let keys = keys.map(|k| MusigPublicKey::from_slice(&k.to_bytes()).unwrap());
+        let agg = KeyAggCache::new(&[&keys[0], &keys[1]]).agg_pk();
+        XOnlyPublicKey::from_slice(&agg.serialize()).unwrap()
+    }
+
+    /// Boltz key order: the swap provider's key first. That is the claim key in a submarine swap
+    /// (the maker claims) and the refund key in a reverse swap (the maker refunds).
+    fn boltz_key_order(swap: &GoldenSwap) -> [&BtcPublicKey; 2] {
+        match swap.kind {
+            SwapKind::Submarine => [&swap.claim_key, &swap.refund_key],
+            SwapKind::Reverse => [&swap.refund_key, &swap.claim_key],
+        }
+    }
+
+    fn golden_spend_info(secp: &Secp256k1<All>, swap: &GoldenSwap) -> TaprootSpendInfo {
+        swap_tree_spend_info(
+            secp,
+            &swap.claim_leaf,
+            &swap.refund_leaf,
+            musig_agg(boltz_key_order(swap)),
+        )
+    }
+
+    fn network_from_prefix(prefix: &str) -> BitcoinNetwork {
+        match prefix {
+            "bc" => BitcoinNetwork::Mainnet,
+            "tb3" => BitcoinNetwork::Testnet,
+            "tb4" => BitcoinNetwork::Testnet4,
+            "sb" => BitcoinNetwork::Signet,
+            "sbc" => BitcoinNetwork::SignetCustom,
+            "bcrt" => BitcoinNetwork::Regtest,
+            other => panic!("golden vector uses an unknown RGB network prefix {other}"),
+        }
+    }
+
+    #[test]
+    #[parallel]
+    fn htlc_swap_tree_leaves_match_sdk_golden_vectors() {
+        let v = vectors();
+        let preimage = preimage(&v);
+        assert_eq!(
+            sha256::Hash::hash(&preimage).to_byte_array().to_vec(),
+            bytes_at(&v, "/wireContract/create/reverse/request/preimageHash"),
+        );
+        let payment_hash160 = hash160::Hash::hash(&preimage);
+
+        for swap in golden_swaps() {
+            assert_eq!(
+                refund_leaf_script(&x_only(&swap.refund_key), swap.timeout_height),
+                swap.refund_leaf,
+                "{:?} refund leaf",
+                swap.kind
+            );
+            let claim_leaf = claim_leaf_script(&payment_hash160, &x_only(&swap.claim_key));
+            match swap.kind {
+                SwapKind::Submarine => {
+                    assert_eq!(claim_leaf, swap.claim_leaf, "submarine claim leaf")
+                }
+                SwapKind::Reverse => {
+                    // the reverse claim leaf adds Boltz's preimage-size guard in front of the
+                    // hashlock; claim_leaf_script only builds the submarine shape
+                    let mut guarded = Builder::new()
+                        .push_opcode(OP_SIZE)
+                        .push_int(32)
+                        .push_opcode(OP_EQUALVERIFY)
+                        .into_script()
+                        .into_bytes();
+                    guarded.extend(claim_leaf.as_bytes());
+                    assert_eq!(
+                        ScriptBuf::from_bytes(guarded),
+                        swap.claim_leaf,
+                        "reverse claim leaf"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[parallel]
+    fn htlc_swap_tree_output_key_matches_sdk_golden_vectors() {
+        let secp = Secp256k1::new();
+        for swap in golden_swaps() {
+            let kind = swap.kind;
+            assert_eq!(
+                Address::from_str(&swap.address)
+                    .unwrap()
+                    .require_network(Network::Regtest)
+                    .unwrap()
+                    .script_pubkey(),
+                swap.script_pubkey,
+                "{kind:?} lockup address and RGB scriptPubkey must be the same output"
+            );
+
+            let spend_info = golden_spend_info(&secp, &swap);
+            assert_eq!(
+                ScriptBuf::new_p2tr_tweaked(spend_info.output_key()),
+                swap.script_pubkey,
+                "{kind:?} output key (MuSig2 internal key tweaked by the swap tree)"
+            );
+
+            // the key order matters: the other order must not produce the vector output
+            let [first, second] = boltz_key_order(&swap);
+            let swapped = swap_tree_spend_info(
+                &secp,
+                &swap.claim_leaf,
+                &swap.refund_leaf,
+                musig_agg([second, first]),
+            );
+            assert_ne!(
+                ScriptBuf::new_p2tr_tweaked(swapped.output_key()),
+                swap.script_pubkey,
+                "{kind:?} MuSig2 aggregation order"
+            );
+
+            // tapleaf hashes: both leaves at depth 1, committed by the vector's output key
+            let output_key =
+                XOnlyPublicKey::from_slice(&swap.script_pubkey.as_bytes()[2..]).unwrap();
+            let leaf_hashes = [&swap.claim_leaf, &swap.refund_leaf]
+                .map(|leaf| TapLeafHash::from_script(leaf, LeafVersion::TapScript));
+            assert_eq!(
+                spend_info.merkle_root(),
+                Some(TapNodeHash::from_node_hashes(
+                    leaf_hashes[0].into(),
+                    leaf_hashes[1].into()
+                )),
+                "{kind:?} merkle root"
+            );
+            for (leaf, leaf_hash) in [&swap.claim_leaf, &swap.refund_leaf]
+                .into_iter()
+                .zip(leaf_hashes)
+            {
+                let control_block = spend_info
+                    .control_block(&(leaf.clone(), LeafVersion::TapScript))
+                    .unwrap();
+                assert_eq!(control_block.merkle_branch.len(), 1, "{kind:?} leaf depth");
+                assert!(
+                    control_block.verify_taproot_commitment(&secp, output_key, leaf),
+                    "{kind:?} leaf {leaf_hash} not committed by the vector output key"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[parallel]
+    fn htlc_recipient_ids_match_sdk_golden_vectors() {
+        let v = vectors();
+        let recipients = v
+            .pointer("/goldenVectors/recipients")
+            .and_then(Value::as_array)
+            .unwrap();
+        let swaps = golden_swaps();
+        // both HTLC scripts on all six RGB networks
+        assert_eq!(recipients.len(), 12);
+        let mut seen = std::collections::BTreeSet::new();
+        for recipient in recipients {
+            let script = script_at(recipient, "/scriptPubkey");
+            let prefix = str_at(recipient, "/network");
+            let expected = str_at(recipient, "/recipientId");
+            assert!(swaps.iter().any(|s| s.script_pubkey == script));
+            assert!(seen.insert((script.clone(), prefix)), "duplicate vector");
+            assert_eq!(
+                recipient_id_from_script_buf(script.clone(), network_from_prefix(prefix)).unwrap(),
+                expected,
+                "{prefix} recipient id"
+            );
+            assert_eq!(
+                script_buf_from_recipient_id(expected.to_string()).unwrap(),
+                Some(script),
+                "{prefix} recipient id round trip"
+            );
+        }
+
+        // the ids the maker returned in its create responses
+        for swap in swaps {
+            assert_eq!(
+                recipient_id_from_script_buf(swap.script_pubkey, BitcoinNetwork::Regtest).unwrap(),
+                swap.recipient_id,
+                "{:?} create response recipient id",
+                swap.kind
+            );
+        }
+    }
 }
