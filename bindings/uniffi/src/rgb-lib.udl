@@ -321,6 +321,7 @@ dictionary ColoringInfo {
 
 [Enum]
 interface PsbtOperationStatus {
+  Staged();
   Prepared();
   Applied();
   Failed();
@@ -339,6 +340,13 @@ dictionary PsbtOpPrepareResult {
   string operation_id;
   string colored_psbt;
   // Wallet-relative directory with fascia, colored.psbt, consignments/, foreign_inputs.json, meta.json
+  string operation_dir;
+};
+
+dictionary PsbtOpStageResult {
+  string operation_id;
+  string staged_psbt;
+  // Wallet-relative directory with staged.psbt, staged.json, foreign_inputs.json, meta.json
   string operation_dir;
 };
 
@@ -1114,6 +1122,20 @@ interface Wallet {
   PsbtOpPrepareResult psbt_op_prepare(
     string psbt, ColoringInfo coloring_info, sequence<Outpoint> input_outpoints,
     u8 min_confirmations, u64? expiration_timestamp);
+
+  // Multi-party form (final vout output_map only): each party psbt_op_stage on the same PSBT,
+  // exactly one psbt_op_finalize, each party psbt_op_complete with the finalized PSBT (moves
+  // the operation from Staged to Prepared), then as above. abort releases a Staged operation.
+  [Throws=RgbLibError]
+  PsbtOpStageResult psbt_op_stage(
+    string psbt, ColoringInfo coloring_info, sequence<Outpoint> input_outpoints,
+    u8 min_confirmations, u64? expiration_timestamp);
+
+  [Throws=RgbLibError]
+  string psbt_op_finalize(string psbt, u64? static_entropy);
+
+  [Throws=RgbLibError]
+  PsbtOpPrepareResult psbt_op_complete(string operation_id, string finalized_psbt);
 
   [Throws=RgbLibError]
   void psbt_op_apply(Online online, string operation_id);

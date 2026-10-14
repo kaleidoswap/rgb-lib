@@ -7036,3 +7036,573 @@ fn color_psbt_for_outpoints_allows_opreturn_at_end_without_p2tr() {
         .color_psbt_for_outpoints(&mut psbt, coloring_info, vec![input])
         .unwrap();
 }
+
+// ─── Multi-party PSBT operations (psbt_op_stage / psbt_op_finalize / psbt_op_complete) ───────
+
+const PSBT_OP_SWAP_UTXO_SIZE: u32 = 5_000;
+const PSBT_OP_SWAP_FEE_SHARE: u64 = 500;
+const PSBT_OP_SWAP_BLINDING: u64 = 777;
+const PSBT_OP_SWAP_ENTROPY: u64 = 4242;
+
+/// One side of a two-wallet RGB-for-RGB swap: the wallet, the NIA asset it gives (all of it, from
+/// a single colored UTXO) and the witness receive it gets the other side's asset on.
+struct PsbtOpSwapSide {
+    party: SinglesigParty,
+    asset_id: String,
+    amount: u64,
+    input: OutPoint,
+    receive: ReceiveData,
+}
+
+impl PsbtOpSwapSide {
+    fn new(amount: u64) -> Self {
+        let mut party = get_funded_noutxo_party!();
+        party.create_utxos(false, Some(1), Some(PSBT_OP_SWAP_UTXO_SIZE), FEE_RATE, None);
+        let asset = party.issue_asset_nia(Some(&[amount]));
+        let input = party
+            .list_unspents(true)
+            .into_iter()
+            .find(|u| u.utxo.colorable && !u.rgb_allocations.is_empty())
+            .unwrap()
+            .utxo
+            .outpoint
+            .into();
+        let receive = party.witness_receive();
+        Self {
+            party,
+            asset_id: asset.asset_id,
+            amount,
+            input,
+            receive,
+        }
+    }
+
+    fn restart(self) -> Self {
+        Self {
+            party: restart_party(self.party),
+            ..self
+        }
+    }
+
+    fn receive_script(&self) -> ScriptBuf {
+        script_buf_from_recipient_id(self.receive.recipient_id.clone())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn psbt_input(&self) -> bdk_wallet::bitcoin::psbt::Input {
+        let bdk_wallet = self.party.wallet.bdk_wallet();
+        let utxo = bdk_wallet.get_utxo(self.input).unwrap();
+        bdk_wallet.get_psbt_input(utxo, None, false).unwrap()
+    }
+
+    /// Stage this side's whole asset onto output `vout` (final vout) of `psbt`.
+    fn stage(&self, psbt: &mut Psbt, vout: u32) -> PsbtOpStageResult {
+        self.party
+            .wallet
+            .psbt_op_stage(
+                psbt,
+                coloring_info_for(
+                    &self.asset_id,
+                    HashMap::from([(vout, self.amount)]),
+                    PSBT_OP_SWAP_BLINDING,
+                ),
+                vec![self.input],
+                MIN_CONFIRMATIONS,
+                PsbtOpExpiry::Default,
+            )
+            .unwrap()
+    }
+
+    fn reconcile(&self, operation_id: &str) -> PsbtOperationStatus {
+        self.party.wallet.psbt_op_reconcile(operation_id).unwrap()
+    }
+
+    /// Hand `operation_dir`'s consignment of this side's asset to the other side's receive.
+    fn post_consignment(&self, operation_dir: &str, other: &PsbtOpSwapSide, txid: &str, vout: u32) {
+        let invoice = Invoice::new(other.receive.invoice.clone()).unwrap();
+        let consignment_path = crate::wallet::rust_only::psbt_op_consignment_path(
+            &self.party.wallet.get_wallet_dir().join(operation_dir),
+            &self.asset_id,
+        );
+        self.party
+            .wallet
+            .post_consignment_to_proxy(
+                &get_proxy_client(None),
+                invoice.invoice_data().proxy_recipient_id,
+                consignment_path,
+                txid.to_string(),
+                Some(vout),
+            )
+            .unwrap();
+    }
+}
+
+/// Vout of the swap PSBT paying A's asset to B's receive (B's asset goes to `B_VOUT`).
+const A_VOUT: u32 = 1;
+const B_VOUT: u32 = 2;
+
+/// The unsigned swap PSBT: A's and B's colored inputs, the OP_RETURN at vout 0, A's asset to B's
+/// receive at [`A_VOUT`] and B's asset to A's receive at [`B_VOUT`]; each side pays half the fee.
+fn psbt_op_swap_psbt(a: &PsbtOpSwapSide, b: &PsbtOpSwapSide) -> Psbt {
+    let txin = |previous_output| bitcoin::TxIn {
+        previous_output,
+        script_sig: Default::default(),
+        sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+        witness: Default::default(),
+    };
+    let txout = |script_pubkey| TxOut {
+        value: BdkAmount::from_sat(PSBT_OP_SWAP_UTXO_SIZE as u64 - PSBT_OP_SWAP_FEE_SHARE),
+        script_pubkey,
+    };
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![txin(a.input), txin(b.input)],
+        output: vec![
+            TxOut {
+                value: BdkAmount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return([]),
+            },
+            txout(b.receive_script()),
+            txout(a.receive_script()),
+        ],
+    };
+    let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    psbt.inputs[0] = a.psbt_input();
+    psbt.inputs[1] = b.psbt_input();
+    psbt
+}
+
+/// Both sides sign their own input, report the broadcast attempt and A broadcasts.
+fn psbt_op_swap_broadcast(
+    a: &PsbtOpSwapSide,
+    a_op: &str,
+    b: &PsbtOpSwapSide,
+    b_op: &str,
+    colored_psbt: &str,
+) -> String {
+    let signed = a
+        .party
+        .wallet
+        .sign_psbt(colored_psbt.to_string(), None)
+        .unwrap();
+    let signed = b.party.wallet.sign_psbt(signed, None).unwrap();
+    let finalized = b.party.wallet.finalize_psbt(signed, None).unwrap();
+    let tx = Psbt::from_str(&finalized).unwrap().extract_tx().unwrap();
+    a.party.wallet.psbt_op_mark_broadcast(a_op).unwrap();
+    b.party.wallet.psbt_op_mark_broadcast(b_op).unwrap();
+    a.party.wallet.broadcast_tx(tx.clone()).unwrap();
+    tx.compute_txid().to_string()
+}
+
+/// Apply both operations, hand each consignment to the other side's receive, mine and refresh
+/// until both receives and both operations settle, then check the swapped balances.
+fn psbt_op_swap_settle(
+    a: &mut PsbtOpSwapSide,
+    a_prepared: &PsbtOpPrepareResult,
+    b: &mut PsbtOpSwapSide,
+    b_prepared: &PsbtOpPrepareResult,
+    txid: &str,
+) {
+    a.party
+        .wallet
+        .psbt_op_apply(a.party.party_online(), &a_prepared.operation_id)
+        .unwrap();
+    b.party
+        .wallet
+        .psbt_op_apply(b.party.party_online(), &b_prepared.operation_id)
+        .unwrap();
+    assert_eq!(
+        a.reconcile(&a_prepared.operation_id),
+        PsbtOperationStatus::Applied
+    );
+    assert_eq!(
+        b.reconcile(&b_prepared.operation_id),
+        PsbtOperationStatus::Applied
+    );
+
+    a.post_consignment(&a_prepared.operation_dir, b, txid, A_VOUT);
+    b.post_consignment(&b_prepared.operation_dir, a, txid, B_VOUT);
+    mine(false);
+    for side in [&mut *a, &mut *b] {
+        let receive_idx = side.receive.batch_transfer_idx;
+        side.party.wait_for_refresh_raw(None, Some(&[receive_idx]));
+    }
+    mine(false);
+    a.party.wait_for_refresh(None);
+    b.party.wait_for_refresh(None);
+    assert_eq!(
+        a.reconcile(&a_prepared.operation_id),
+        PsbtOperationStatus::Settled
+    );
+    assert_eq!(
+        b.reconcile(&b_prepared.operation_id),
+        PsbtOperationStatus::Settled
+    );
+
+    for (side, gave, got, got_amount) in [
+        (&*a, &a.asset_id, &b.asset_id, b.amount),
+        (&*b, &b.asset_id, &a.asset_id, a.amount),
+    ] {
+        let given = side.party.get_asset_balance(gave);
+        assert_eq!((given.settled, given.future, given.spendable), (0, 0, 0));
+        let received = side.party.get_asset_balance(got);
+        assert_eq!(
+            (received.settled, received.future, received.spendable),
+            (got_amount, got_amount, got_amount)
+        );
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn psbt_op_stage_two_wallet_rgb_for_rgb_swap() {
+    initialize();
+
+    let mut a = PsbtOpSwapSide::new(AMOUNT);
+    let mut b = PsbtOpSwapSide::new(AMOUNT_SMALL);
+    let mut psbt = psbt_op_swap_psbt(&a, &b);
+    let staged_txid = psbt.unsigned_tx.compute_txid().to_string();
+
+    // A stages, then B stages on A's result: both journal a Staged operation and reserve inputs
+    let a_staged = a.stage(&mut psbt, A_VOUT);
+    let b_staged = b.stage(&mut psbt, B_VOUT);
+    assert_eq!(psbt.unsigned_tx.compute_txid().to_string(), staged_txid);
+    assert_eq!(b_staged.staged_psbt, psbt.to_string());
+    for (side, staged, vout) in [(&a, &a_staged, A_VOUT), (&b, &b_staged, B_VOUT)] {
+        assert_eq!(
+            side.reconcile(&staged.operation_id),
+            PsbtOperationStatus::Staged
+        );
+        assert_eq!(
+            staged.allocations,
+            vec![PsbtOpAllocation {
+                asset_id: side.asset_id.clone(),
+                vout: Some(vout),
+                assignment: Assignment::Fungible(side.amount),
+            }]
+        );
+        assert!(
+            side.party
+                .check_test_transfer_status_sender(&staged_txid, TransferStatus::Initiated)
+        );
+        assert_eq!(side.party.get_asset_balance(&side.asset_id).spendable, 0);
+        let op = side.party.wallet.psbt_op_by_txid(&staged_txid).unwrap();
+        assert_eq!(op.operation_id, staged.operation_id);
+        assert_eq!(op.status, PsbtOperationStatus::Staged);
+        assert_eq!(op.allocations, staged.allocations);
+        let spending = side
+            .party
+            .wallet
+            .psbt_ops_spending(side.input.into())
+            .unwrap();
+        assert_eq!(spending.len(), 1);
+        assert_eq!(spending[0].operation_id, staged.operation_id);
+    }
+    // a Staged operation cannot be broadcast or applied yet
+    assert!(matches!(
+        a.party
+            .wallet
+            .psbt_op_mark_broadcast(&a_staged.operation_id),
+        Err(Error::InvalidPsbtOperationStatus { .. })
+    ));
+    assert!(matches!(
+        a.party
+            .wallet
+            .psbt_op_apply(a.party.party_online(), &a_staged.operation_id),
+        Err(Error::InvalidPsbtOperationStatus { .. })
+    ));
+    // each contract is staged by one party only
+    let mut restaged = psbt.clone();
+    assert!(matches!(
+        b.party.wallet.psbt_op_stage(
+            &mut restaged,
+            coloring_info_for(&a.asset_id, HashMap::from([(A_VOUT, a.amount)]), 1),
+            vec![b.input],
+            MIN_CONFIRMATIONS,
+            PsbtOpExpiry::Default,
+        ),
+        Err(Error::InvalidColoringInfo { .. })
+    ));
+
+    // B alone finalizes; both complete with the same finalized PSBT
+    b.party
+        .wallet
+        .psbt_op_finalize(&mut psbt, Some(PSBT_OP_SWAP_ENTROPY))
+        .unwrap();
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+    assert_ne!(txid, staged_txid);
+    let a_prepared = a
+        .party
+        .wallet
+        .psbt_op_complete(&a_staged.operation_id, &psbt)
+        .unwrap();
+    let b_prepared = b
+        .party
+        .wallet
+        .psbt_op_complete(&b_staged.operation_id, &psbt)
+        .unwrap();
+    for (side, staged, prepared) in [(&a, &a_staged, &a_prepared), (&b, &b_staged, &b_prepared)] {
+        assert_eq!(prepared.operation_id, staged.operation_id);
+        assert_eq!(prepared.colored_psbt, psbt.to_string());
+        assert_eq!(prepared.allocations, staged.allocations);
+        assert_eq!(
+            side.reconcile(&prepared.operation_id),
+            PsbtOperationStatus::Prepared
+        );
+        // the reservation moved to the final txid
+        assert!(
+            side.party
+                .check_test_transfer_status_sender(&txid, TransferStatus::Initiated)
+        );
+        assert!(
+            side.party
+                .wallet
+                .psbt_op_by_txid(&staged_txid)
+                .is_err_and(|e| matches!(e, Error::PsbtOperationNotFound { .. }))
+        );
+        assert_eq!(
+            side.party.wallet.psbt_op_by_txid(&txid).unwrap().status,
+            PsbtOperationStatus::Prepared
+        );
+        assert_eq!(side.party.get_asset_balance(&side.asset_id).spendable, 0);
+    }
+    // a retried complete (lost response) returns the same result
+    let retried = a
+        .party
+        .wallet
+        .psbt_op_complete(&a_staged.operation_id, &psbt)
+        .unwrap();
+    assert_eq!(retried.colored_psbt, a_prepared.colored_psbt);
+    assert_eq!(retried.allocations, a_prepared.allocations);
+
+    let broadcast_txid = psbt_op_swap_broadcast(
+        &a,
+        &a_prepared.operation_id,
+        &b,
+        &b_prepared.operation_id,
+        &a_prepared.colored_psbt,
+    );
+    assert_eq!(broadcast_txid, txid);
+    psbt_op_swap_settle(&mut a, &a_prepared, &mut b, &b_prepared, &txid);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn psbt_op_stage_finalize_complete_survive_restarts() {
+    initialize();
+
+    let a = PsbtOpSwapSide::new(AMOUNT);
+    let b = PsbtOpSwapSide::new(AMOUNT_SMALL);
+    let mut psbt = psbt_op_swap_psbt(&a, &b);
+    let staged_txid = psbt.unsigned_tx.compute_txid().to_string();
+    let a_op = a.stage(&mut psbt, A_VOUT).operation_id;
+    let b_op = b.stage(&mut psbt, B_VOUT).operation_id;
+
+    // restart between stage and finalize: the journal and the reservations survive
+    let a = a.restart();
+    let b = b.restart();
+    for (side, op) in [(&a, &a_op), (&b, &b_op)] {
+        assert_eq!(side.reconcile(op), PsbtOperationStatus::Staged);
+        assert_eq!(
+            &side
+                .party
+                .wallet
+                .psbt_op_by_txid(&staged_txid)
+                .unwrap()
+                .operation_id,
+            op
+        );
+        assert_eq!(side.party.get_asset_balance(&side.asset_id).spendable, 0);
+    }
+
+    a.party
+        .wallet
+        .psbt_op_finalize(&mut psbt, Some(PSBT_OP_SWAP_ENTROPY))
+        .unwrap();
+    let finalized = psbt.to_string();
+
+    // restart between finalize and complete; the finalized PSBT is all that crosses it
+    let mut a = a.restart();
+    let mut b = b.restart();
+    let psbt = Psbt::from_str(&finalized).unwrap();
+    let a_prepared = a.party.wallet.psbt_op_complete(&a_op, &psbt).unwrap();
+
+    // restart after one side completed: each side's journal stands on its own
+    a = a.restart();
+    b = b.restart();
+    assert_eq!(a.reconcile(&a_op), PsbtOperationStatus::Prepared);
+    assert_eq!(b.reconcile(&b_op), PsbtOperationStatus::Staged);
+    let b_prepared = b.party.wallet.psbt_op_complete(&b_op, &psbt).unwrap();
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+
+    // restart after complete: the operation is a plain prepared one
+    a = a.restart();
+    b = b.restart();
+    let a_recovered = a.party.wallet.psbt_op_by_txid(&txid).unwrap();
+    assert_eq!(a_recovered.operation_id, a_op);
+    assert_eq!(a_recovered.status, PsbtOperationStatus::Prepared);
+    assert_eq!(a_recovered.colored_psbt, a_prepared.colored_psbt);
+    assert_eq!(b.reconcile(&b_op), PsbtOperationStatus::Prepared);
+
+    psbt_op_swap_broadcast(&a, &a_op, &b, &b_op, &finalized);
+    psbt_op_swap_settle(&mut a, &a_prepared, &mut b, &b_prepared, &txid);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn psbt_op_abort_staged_releases_both_inputs() {
+    initialize();
+
+    let mut a = PsbtOpSwapSide::new(AMOUNT);
+    let mut b = PsbtOpSwapSide::new(AMOUNT_SMALL);
+    let mut psbt = psbt_op_swap_psbt(&a, &b);
+    let staged_txid = psbt.unsigned_tx.compute_txid().to_string();
+    let a_op = a.stage(&mut psbt, A_VOUT).operation_id;
+    let b_op = b.stage(&mut psbt, B_VOUT).operation_id;
+    for side in [&a, &b] {
+        let balance = side.party.get_asset_balance(&side.asset_id);
+        assert_eq!(
+            (balance.settled, balance.future, balance.spendable),
+            (side.amount, 0, 0)
+        );
+    }
+
+    // someone finalized the PSBT, but nobody signed it: both sides may still walk away
+    let mut finalized = psbt.clone();
+    a.party
+        .wallet
+        .psbt_op_finalize(&mut finalized, Some(PSBT_OP_SWAP_ENTROPY))
+        .unwrap();
+
+    for (side, op) in [(&mut a, &a_op), (&mut b, &b_op)] {
+        let online = side.party.party_online();
+        side.party.wallet.psbt_op_abort(online, op).unwrap();
+        assert_eq!(side.reconcile(op), PsbtOperationStatus::Failed);
+        assert!(
+            side.party
+                .check_test_transfer_status_sender(&staged_txid, TransferStatus::Failed)
+        );
+        let balance = side.party.get_asset_balance(&side.asset_id);
+        assert_eq!(
+            (balance.settled, balance.future, balance.spendable),
+            (side.amount, side.amount, side.amount)
+        );
+        // abort is idempotent; an aborted operation cannot be completed
+        side.party.wallet.psbt_op_abort(online, op).unwrap();
+        assert!(matches!(
+            side.party.wallet.psbt_op_complete(op, &finalized),
+            Err(Error::InvalidPsbtOperationStatus { .. })
+        ));
+    }
+
+    // the released inputs can be spent again: run the whole swap on them
+    let mut psbt = psbt_op_swap_psbt(&a, &b);
+    let a_op = a.stage(&mut psbt, A_VOUT).operation_id;
+    let b_op = b.stage(&mut psbt, B_VOUT).operation_id;
+    a.party
+        .wallet
+        .psbt_op_finalize(&mut psbt, Some(PSBT_OP_SWAP_ENTROPY + 1))
+        .unwrap();
+    let a_prepared = a.party.wallet.psbt_op_complete(&a_op, &psbt).unwrap();
+    let b_prepared = b.party.wallet.psbt_op_complete(&b_op, &psbt).unwrap();
+    let txid = psbt_op_swap_broadcast(&a, &a_op, &b, &b_op, &a_prepared.colored_psbt);
+    psbt_op_swap_settle(&mut a, &a_prepared, &mut b, &b_prepared, &txid);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn psbt_op_complete_rejects_dropped_or_altered_bundle() {
+    initialize();
+
+    let mut a = PsbtOpSwapSide::new(AMOUNT);
+    let mut b = PsbtOpSwapSide::new(AMOUNT_SMALL);
+    let base = psbt_op_swap_psbt(&a, &b);
+    let mut psbt = base.clone();
+    let a_op = a.stage(&mut psbt, A_VOUT).operation_id;
+    let b_op = b.stage(&mut psbt, B_VOUT).operation_id;
+    let refused = |side: &PsbtOpSwapSide, op: &str, finalized: &Psbt| {
+        let result = side.party.wallet.psbt_op_complete(op, finalized);
+        assert!(
+            matches!(result, Err(Error::InvalidColoringInfo { .. })),
+            "complete must refuse the finalized PSBT; got {result:?}"
+        );
+        assert_eq!(side.reconcile(op), PsbtOperationStatus::Staged);
+    };
+
+    // dropped: B's bundle alone is committed, A's staged transition is missing
+    let mut dropped = base.clone();
+    b.party
+        .wallet
+        .color_psbt_stage(
+            &mut dropped,
+            psbt_op_legacy_coloring_info(&base, &b.asset_id, B_VOUT, b.amount),
+        )
+        .unwrap();
+    b.party.wallet.psbt_op_finalize(&mut dropped, None).unwrap();
+    refused(&a, &a_op, &dropped);
+
+    // altered: A's asset redirected to A's own receive instead of B's, so the committed bundle
+    // for A's contract is not the one A staged
+    let mut altered = base.clone();
+    a.party
+        .wallet
+        .color_psbt_stage(
+            &mut altered,
+            psbt_op_legacy_coloring_info(&base, &a.asset_id, B_VOUT, a.amount),
+        )
+        .unwrap();
+    b.party
+        .wallet
+        .color_psbt_stage(
+            &mut altered,
+            psbt_op_legacy_coloring_info(&base, &b.asset_id, B_VOUT, b.amount),
+        )
+        .unwrap();
+    b.party.wallet.psbt_op_finalize(&mut altered, None).unwrap();
+    refused(&a, &a_op, &altered);
+    refused(&b, &b_op, &altered);
+
+    // the honest PSBT with one output value changed after finalizing
+    let mut honest = psbt.clone();
+    b.party.wallet.psbt_op_finalize(&mut honest, None).unwrap();
+    let mut skimmed = honest.clone();
+    skimmed.unsigned_tx.output[A_VOUT as usize].value -= BdkAmount::from_sat(100);
+    refused(&a, &a_op, &skimmed);
+
+    // the honest finalized PSBT is still accepted afterwards, then both walk away
+    a.party.wallet.psbt_op_complete(&a_op, &honest).unwrap();
+    b.party.wallet.psbt_op_complete(&b_op, &honest).unwrap();
+    for (side, op) in [(&mut a, &a_op), (&mut b, &b_op)] {
+        assert_eq!(side.reconcile(op), PsbtOperationStatus::Prepared);
+        let online = side.party.party_online();
+        side.party.wallet.psbt_op_abort(online, op).unwrap();
+        assert_eq!(side.reconcile(op), PsbtOperationStatus::Failed);
+    }
+}
+
+/// Non-journaled [`Wallet::color_psbt_stage`] coloring of `vout` (a final vout of `psbt`),
+/// converted to its legacy convention: pre-OP_RETURN keys when any output is P2TR.
+fn psbt_op_legacy_coloring_info(
+    psbt: &Psbt,
+    asset_id: &str,
+    vout: u32,
+    amount: u64,
+) -> ColoringInfo {
+    let shifted = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .any(|o| o.script_pubkey.is_p2tr());
+    let key = if shifted { vout - 1 } else { vout };
+    coloring_info_for(
+        asset_id,
+        HashMap::from([(key, amount)]),
+        PSBT_OP_SWAP_BLINDING + 1,
+    )
+}
