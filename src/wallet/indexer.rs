@@ -491,6 +491,115 @@ mod tests {
         result
     }
 
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn test_outpoint(vout: u32) -> OutPoint {
+        OutPoint::new(
+            bdk_wallet::bitcoin::Txid::from_str(TEST_TXID).unwrap(),
+            vout,
+        )
+    }
+
+    #[cfg(feature = "electrum")]
+    fn run_electrum_is_txo_unspent_case(vout: u32) -> bool {
+        let (url, handle) = start_electrum_mock(|method, req| {
+            assert_eq!(method, "blockchain.scripthash.listunspent");
+            electrum_tx_get_result(
+                req,
+                &format!(r#"[{{"height":0,"tx_hash":"{TEST_TXID}","tx_pos":1,"value":1000}}]"#),
+            )
+        });
+        let res = electrum_indexer(&url)
+            .is_txo_unspent(&test_outpoint(vout), &ScriptBuf::new())
+            .unwrap();
+        handle.join().expect("mock electrum thread");
+        res
+    }
+
+    /// The outspend endpoint is only mocked (and so only allowed to be called) when
+    /// `outspend_body` is set.
+    #[cfg(feature = "esplora")]
+    fn run_esplora_is_txo_unspent_case(
+        raw_tx: Option<Vec<u8>>,
+        vout: u32,
+        script: &ScriptBuf,
+        outspend_body: Option<&str>,
+    ) -> bool {
+        let mut server = mockito::Server::new();
+        let mock_raw = server.mock("GET", format!("/tx/{TEST_TXID}/raw").as_str());
+        let mock_raw = match raw_tx {
+            Some(bytes) => mock_raw
+                .with_status(200)
+                .with_header("content-type", "application/octet-stream")
+                .with_body(bytes)
+                .create(),
+            None => mock_raw.with_status(404).create(),
+        };
+        let mock_outspend = outspend_body.map(|body| {
+            server
+                .mock("GET", format!("/tx/{TEST_TXID}/outspend/{vout}").as_str())
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create()
+        });
+
+        let res = esplora_indexer(&server.url())
+            .is_txo_unspent(&test_outpoint(vout), script)
+            .unwrap();
+
+        mock_raw.assert();
+        if let Some(mock) = mock_outspend {
+            mock.assert();
+        }
+        res
+    }
+
+    #[cfg(feature = "electrum")]
+    #[test]
+    fn test_electrum_is_txo_unspent() {
+        assert!(run_electrum_is_txo_unspent_case(1));
+        // an outpoint missing from the script's unspents is spent, unknown or locks another script
+        assert!(!run_electrum_is_txo_unspent_case(0));
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn test_esplora_is_txo_unspent() {
+        // minimal_tx_raw_bytes has a single output locking an empty script
+        let script = ScriptBuf::new();
+        let unspent = Some(r#"{"spent": false}"#);
+        assert!(run_esplora_is_txo_unspent_case(
+            Some(minimal_tx_raw_bytes()),
+            0,
+            &script,
+            unspent,
+        ));
+        let spent = Some(
+            r#"{"spent": true, "txid": "1111111111111111111111111111111111111111111111111111111111111111", "vin": 0}"#,
+        );
+        assert!(!run_esplora_is_txo_unspent_case(
+            Some(minimal_tx_raw_bytes()),
+            0,
+            &script,
+            spent,
+        ));
+        // outspend reports unknown outpoints as unspent: it must not be trusted alone
+        assert!(!run_esplora_is_txo_unspent_case(None, 0, &script, None));
+        assert!(!run_esplora_is_txo_unspent_case(
+            Some(minimal_tx_raw_bytes()),
+            1,
+            &script,
+            None,
+        ));
+        let other_script = ScriptBuf::from_bytes(vec![0x51]);
+        assert!(!run_esplora_is_txo_unspent_case(
+            Some(minimal_tx_raw_bytes()),
+            0,
+            &other_script,
+            None,
+        ));
+    }
+
     #[cfg(feature = "electrum")]
     #[test]
     fn test_electrum_fee_estimation_unavailable() {
