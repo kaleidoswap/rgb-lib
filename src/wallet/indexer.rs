@@ -214,6 +214,45 @@ impl Indexer {
         })
     }
 
+    /// Whether `outpoint` exists, locks `script` and is unspent, counting mempool spends.
+    pub(crate) fn is_txo_unspent(
+        &self,
+        outpoint: &OutPoint,
+        script: &ScriptBuf,
+    ) -> Result<bool, Error> {
+        Ok(match self {
+            #[cfg(feature = "electrum")]
+            Indexer::Electrum(client) => client
+                .inner
+                .script_list_unspent(script)
+                .map_err(IndexerError::from)?
+                .iter()
+                .any(|u| u.tx_hash == outpoint.txid && u.tx_pos == outpoint.vout as usize),
+            #[cfg(feature = "esplora")]
+            Indexer::Esplora(client) => {
+                // the outspend endpoint reports an unknown outpoint as unspent, so check the
+                // funding tx first
+                let Some(tx) = client.get_tx(&outpoint.txid).map_err(IndexerError::from)? else {
+                    return Ok(false);
+                };
+                if tx
+                    .output
+                    .get(outpoint.vout as usize)
+                    .map(|o| &o.script_pubkey)
+                    != Some(script)
+                {
+                    return Ok(false);
+                }
+                matches!(
+                    client
+                        .get_output_status(&outpoint.txid, outpoint.vout as u64)
+                        .map_err(IndexerError::from)?,
+                    Some(status) if !status.spent
+                )
+            }
+        })
+    }
+
     pub(crate) fn populate_tx_cache(
         &self,
         #[cfg_attr(feature = "esplora", allow(unused))] bdk_wallet: &PersistedWallet<

@@ -1282,6 +1282,208 @@ fn maker_refuses_a_completion_missing_taker_signatures() {
     );
 }
 
+/// Spend all of `wallet`'s coins to itself and mine, double-spending any swap input it declared.
+fn double_spend_own_coins(wallet: &mut Wallet, online: Online, esplora: bool) {
+    let address = wallet.get_address().unwrap();
+    wallet.drain_to(online, address, FEE_RATE).unwrap();
+    mine(esplora);
+}
+
+/// The taker spends its declared input after sending the request: the maker refuses to build a
+/// proposal over it.
+fn maker_refuses_request_with_spent_taker_input(indexer_url: Option<String>, esplora: bool) {
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, indexer_url.clone());
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, indexer_url);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SDSR",
+        "Swap Spent Request",
+        SWAP_RGB_AMOUNT,
+    );
+    let offer = maker
+        .create_swap_offer(
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            btc(SWAP_BTC_PRICE),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    double_spend_own_coins(&mut taker, taker_online, esplora);
+    let err = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap_err();
+    assert!(err.to_string().contains("already spent"), "{err}");
+}
+
+/// The maker spends its declared input after sending the proposal: the taker refuses to sign.
+fn taker_refuses_proposal_with_spent_maker_input(indexer_url: Option<String>, esplora: bool) {
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, indexer_url.clone());
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, indexer_url);
+    let asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SDSP",
+        "Swap Spent Proposal",
+        SWAP_RGB_AMOUNT,
+    );
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let proposal = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap();
+    double_spend_own_coins(&mut maker, maker_online, esplora);
+    let err = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap_err();
+    assert!(err.to_string().contains("already spent"), "{err}");
+}
+
+/// The taker spends its declared input after sending the completion: the maker refuses to sign.
+fn maker_refuses_completion_with_spent_taker_input(indexer_url: Option<String>, esplora: bool) {
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, indexer_url.clone());
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, indexer_url);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SDSC",
+        "Swap Spent Completion",
+        SWAP_RGB_AMOUNT,
+    );
+    let completion = swap_to_completion(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        None,
+    );
+    double_spend_own_coins(&mut taker, taker_online, esplora);
+    let err = maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap_err();
+    assert!(err.to_string().contains("already spent"), "{err}");
+}
+
+/// The indexer reports a coin as spent as soon as the spend is in the mempool, and refuses a coin
+/// declared with the wrong script or that does not exist.
+fn indexer_reports_spent_txos(indexer_url: Option<String>, esplora: bool) {
+    let (mut wallet, online) = get_funded_noutxo_wallet(true, indexer_url);
+    wallet.get_btc_balance(Some(online), false).unwrap();
+    let utxo = wallet.bdk_wallet().list_unspent().next().unwrap();
+    let script = utxo.txout.script_pubkey.clone();
+    let indexer = wallet.indexer();
+    assert!(indexer.is_txo_unspent(&utxo.outpoint, &script).unwrap());
+    assert!(
+        !indexer
+            .is_txo_unspent(&utxo.outpoint, &ScriptBuf::new())
+            .unwrap()
+    );
+    let unknown = BdkOutPoint {
+        vout: utxo.outpoint.vout + 100,
+        ..utxo.outpoint
+    };
+    assert!(!indexer.is_txo_unspent(&unknown, &script).unwrap());
+
+    let address = wallet.get_address().unwrap();
+    wallet.drain_to(online, address, FEE_RATE).unwrap();
+    let indexer = wallet.indexer();
+    assert!(wait_for_function(
+        || !indexer.is_txo_unspent(&utxo.outpoint, &script).unwrap(),
+        10,
+        200,
+    ));
+    mine(esplora);
+    assert!(!indexer.is_txo_unspent(&utxo.outpoint, &script).unwrap());
+}
+
+#[test]
+#[parallel]
+fn indexer_reports_spent_txos_electrum() {
+    initialize();
+
+    indexer_reports_spent_txos(None, false);
+}
+
+#[cfg(feature = "esplora")]
+#[test]
+#[parallel]
+fn indexer_reports_spent_txos_esplora() {
+    initialize();
+
+    indexer_reports_spent_txos(Some(ESPLORA_URL.to_string()), true);
+}
+
+#[test]
+#[parallel]
+fn maker_refuses_request_with_spent_taker_input_electrum() {
+    initialize();
+
+    maker_refuses_request_with_spent_taker_input(None, false);
+}
+
+#[cfg(feature = "esplora")]
+#[test]
+#[parallel]
+fn maker_refuses_request_with_spent_taker_input_esplora() {
+    initialize();
+
+    maker_refuses_request_with_spent_taker_input(Some(ESPLORA_URL.to_string()), true);
+}
+
+#[test]
+#[parallel]
+fn taker_refuses_proposal_with_spent_maker_input_electrum() {
+    initialize();
+
+    taker_refuses_proposal_with_spent_maker_input(None, false);
+}
+
+#[cfg(feature = "esplora")]
+#[test]
+#[parallel]
+fn taker_refuses_proposal_with_spent_maker_input_esplora() {
+    initialize();
+
+    taker_refuses_proposal_with_spent_maker_input(Some(ESPLORA_URL.to_string()), true);
+}
+
+#[test]
+#[parallel]
+fn maker_refuses_completion_with_spent_taker_input_electrum() {
+    initialize();
+
+    maker_refuses_completion_with_spent_taker_input(None, false);
+}
+
+#[cfg(feature = "esplora")]
+#[test]
+#[parallel]
+fn maker_refuses_completion_with_spent_taker_input_esplora() {
+    initialize();
+
+    maker_refuses_completion_with_spent_taker_input(Some(ESPLORA_URL.to_string()), true);
+}
+
 #[test]
 #[parallel]
 fn refused_rebroadcast_keeps_swap_uncancellable() {

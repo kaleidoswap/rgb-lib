@@ -17,9 +17,10 @@ use super::offline::{
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use super::online::{
     SwapRgbSend, swap_accept_transfer_from_file, swap_color_rgb_leg, swap_emit_asset_history,
-    swap_ensure_inputs_confirmed, swap_ensure_inputs_foreign, swap_fetch_consignment_to_file,
-    swap_finalize_psbt, swap_finalize_psbt_required, swap_import_asset_history,
-    swap_input_rgb_amounts, swap_prepare_rgb_leg, swap_select_inputs, swap_sign_psbt,
+    swap_ensure_inputs_confirmed, swap_ensure_inputs_foreign, swap_ensure_inputs_unspent,
+    swap_fetch_consignment_to_file, swap_finalize_psbt, swap_finalize_psbt_required,
+    swap_import_asset_history, swap_input_rgb_amounts, swap_prepare_rgb_leg, swap_select_inputs,
+    swap_sign_psbt,
     swap_stage_rgb_leg, swap_validate_fascia_received_leg, swap_validate_received_swap_leg,
 };
 use super::*;
@@ -1664,10 +1665,11 @@ impl Wallet {
             return Err(Error::BitcoinNetworkMismatch);
         }
         swap_validate_extra_outputs(&offer.extra_outputs, offer.bitcoin_network)?;
-        // Correctness: verify the taker's inputs are sufficiently confirmed before the maker
-        // commits resources to building the PSBT.
+        // Correctness: verify the taker's inputs are unspent and sufficiently confirmed before the
+        // maker commits resources to building the PSBT.
         swap_ensure_inputs_foreign(self, &request.taker_inputs, &[])?;
         swap_ensure_inputs_confirmed(self, &request.taker_inputs, min_confirmations)?;
+        swap_ensure_inputs_unspent(self, &request.taker_inputs)?;
         swap_require_rgb_destination(
             &offer.maker_gives,
             &request.taker_rgb_script_pubkey_hex,
@@ -1693,6 +1695,8 @@ impl Wallet {
             skip_sync,
             &exclude_outpoints,
         )?;
+        // with `skip_sync` the wallet may not know its selected coins were spent already
+        swap_ensure_inputs_unspent(self, &maker_inputs)?;
         let maker_change_keychain = if matches!(offer.maker_gives.kind, OnchainSwapLegKind::Rgb) {
             KeychainKind::External
         } else {
@@ -1932,6 +1936,7 @@ impl Wallet {
         self.sync_if_requested(&txn, Some(online), skip_sync, KeychainKind::External)?;
         swap_ensure_inputs_confirmed(self, &proposal.maker_inputs, min_confirmations)?;
         swap_ensure_inputs_confirmed(self, &proposal.request.taker_inputs, min_confirmations)?;
+        swap_ensure_inputs_unspent(self, &all_inputs)?;
         swap_sign_psbt(self, &mut psbt, &proposal, OnchainSwapRole::Taker)?;
         let finalized_psbt = swap_finalize_psbt(self, &psbt)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
@@ -2008,8 +2013,7 @@ impl Wallet {
                 let txn = self.database().begin_transaction()?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::Internal)?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
-                swap_ensure_inputs_confirmed(self, &completion.proposal.maker_inputs, 0)?;
-                swap_ensure_inputs_confirmed(self, &completion.proposal.request.taker_inputs, 0)?;
+                swap_ensure_inputs_unspent(self, &all_inputs)?;
                 swap_sign_psbt(
                     self,
                     &mut psbt,
@@ -2050,8 +2054,7 @@ impl Wallet {
                 let txn = self.database().begin_transaction()?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::Internal)?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
-                swap_ensure_inputs_confirmed(self, &completion.proposal.maker_inputs, 0)?;
-                swap_ensure_inputs_confirmed(self, &completion.proposal.request.taker_inputs, 0)?;
+                swap_ensure_inputs_unspent(self, &all_inputs)?;
                 swap_sign_psbt(
                     self,
                     &mut psbt,
@@ -2141,8 +2144,7 @@ impl Wallet {
                 )?);
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::Internal)?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
-                swap_ensure_inputs_confirmed(self, &completion.proposal.maker_inputs, 0)?;
-                swap_ensure_inputs_confirmed(self, &completion.proposal.request.taker_inputs, 0)?;
+                swap_ensure_inputs_unspent(self, &all_inputs)?;
                 swap_sign_psbt(
                     self,
                     &mut psbt,
