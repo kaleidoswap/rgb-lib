@@ -5724,7 +5724,8 @@ pub(crate) fn swap_select_inputs(
             };
             let (_, _, mut input_unspents, _) = wallet.get_transfer_begin_data(txn, 1)?;
             input_unspents.retain(|u| !excluded.contains(&(u.utxo.txid.as_str(), u.utxo.vout)));
-            let selected = wallet.select_rgb_inputs(asset_id, &assignments, input_unspents)?;
+            let selected =
+                wallet.select_rgb_inputs(asset_id.clone(), &assignments, input_unspents)?;
             let selected_outpoints = selected
                 .input_outpoints
                 .into_iter()
@@ -5740,15 +5741,45 @@ pub(crate) fn swap_select_inputs(
             if swap_inputs.is_empty() {
                 return Err(swap_invalid("could not resolve selected RGB inputs"));
             }
-            let total = swap_selected_inputs_total(&swap_inputs);
-            let needed = extra_sat;
-            if total < needed {
-                return Err(Error::InsufficientBitcoins {
-                    needed,
-                    available: total,
-                });
-            }
             swap_ensure_inputs_confirmed(wallet, &swap_inputs, min_confirmations)?;
+            // RGB change (of this asset or of others sharing the inputs) is carried by this
+            // side's change output, which then has to be above dust
+            let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
+            let rgb_change = swap_input_rgb_amounts(wallet, &selected_outpoints)?
+                .into_iter()
+                .any(|(cid, amount)| amount > if cid == contract_id { gives.amount } else { 0 });
+            let needed = if rgb_change {
+                let dust = wallet
+                    .bdk_wallet()
+                    .public_descriptor(KeychainKind::External)
+                    .dust_value()
+                    .to_sat();
+                extra_sat
+                    .checked_add(dust)
+                    .ok_or_else(|| swap_invalid("swap amounts overflow"))?
+            } else {
+                extra_sat
+            };
+            let total = swap_selected_inputs_total(&swap_inputs);
+            if total < needed {
+                // colored UTXOs usually hold too few sats to pay for this side, so top them
+                // up with plain BTC inputs, as the BTC-giving side does
+                let btc_inputs = swap_select_btc_inputs(
+                    wallet,
+                    online,
+                    needed - total,
+                    min_confirmations,
+                    &excluded,
+                )
+                .map_err(|e| match e {
+                    Error::InsufficientBitcoins { available, .. } => Error::InsufficientBitcoins {
+                        needed,
+                        available: total.saturating_add(available),
+                    },
+                    e => e,
+                })?;
+                swap_inputs.extend(btc_inputs);
+            }
             Ok(swap_inputs)
         }
     }
