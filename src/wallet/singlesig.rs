@@ -7,10 +7,10 @@ use super::offline::{
     SWAP_ACCEPTED_FILE, SWAP_BROADCAST_FILE, SWAP_CANCELLED_EXTENSION, SWAP_OFFER_FILE,
     SWAP_OUTGOING_FILE, SWAP_PROPOSAL_FILE, SWAP_REQUEST_FILE, SwapDirection, SwapOutgoingState,
     swap_build_psbt, swap_consignment_dir, swap_ensure_not_expired, swap_ensure_state_matches,
-    swap_invalid, swap_load_state, swap_mpc_entropy, swap_random_blinding,
+    swap_extra_funded_by, swap_invalid, swap_load_state, swap_mpc_entropy, swap_random_blinding,
     swap_require_rgb_destination, swap_restore_input_metadata, swap_save_state,
-    swap_side_rgb_output_cost, swap_state_path, swap_validate_legs, swap_validate_proposal_psbt,
-    swap_validate_proxy_url,
+    swap_side_rgb_output_cost, swap_state_path, swap_validate_extra_outputs, swap_validate_legs,
+    swap_validate_proposal_psbt, swap_validate_proxy_url,
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use super::online::{
@@ -1490,9 +1490,9 @@ impl Wallet {
     /// posted there so the counterparty can fetch them, and it is also used to publish the current
     /// asset history so the taker can validate the asset before accepting.
     ///
-    /// `platform_fee_sat`/`fee_recipient` reserve an additional output for a third-party
-    /// facilitator, funded by the taker alongside `network_fee_sat`. Pass `0`/`None` when there
-    /// is no facilitator.
+    /// `extra_outputs` are further Bitcoin outputs the swap transaction pays, such as a fee owed
+    /// to a third party. Each names the side that funds it. The offer commits to them, so the
+    /// taker and the maker both build and verify them. Pass an empty list for none.
     ///
     /// This method is **offline** — no network connection is required.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -1504,8 +1504,7 @@ impl Wallet {
         network_fee_sat: u64,
         expiration_timestamp: Option<u64>,
         proxy_url: Option<String>,
-        platform_fee_sat: u64,
-        fee_recipient: Option<String>,
+        extra_outputs: Vec<OnchainSwapExtraOutput>,
     ) -> Result<OnchainSwapOffer, Error> {
         info!(self.logger(), "Creating on-chain swap offer...");
         let txn = self.database().begin_transaction()?;
@@ -1516,8 +1515,7 @@ impl Wallet {
             network_fee_sat,
             expiration_timestamp,
             proxy_url,
-            platform_fee_sat,
-            fee_recipient,
+            extra_outputs,
         )?;
         swap_save_state(self.wallet_dir(), &offer.swap_id, SWAP_OFFER_FILE, &offer)?;
         self.update_backup_info(&txn, false)?;
@@ -1549,6 +1547,7 @@ impl Wallet {
         if offer.bitcoin_network != self.bitcoin_network() {
             return Err(Error::BitcoinNetworkMismatch);
         }
+        swap_validate_extra_outputs(&offer.extra_outputs, offer.bitcoin_network)?;
         let taker_gives = offer.maker_receives.clone();
         let taker_receives = offer.maker_gives.clone();
         let taker_inputs = swap_select_inputs(
@@ -1558,7 +1557,11 @@ impl Wallet {
             &taker_gives,
             swap_side_rgb_output_cost(&taker_receives, offer.rgb_output_sat)
                 .checked_add(offer.network_fee_sat)
-                .and_then(|v| v.checked_add(offer.platform_fee_sat))
+                .and_then(|v| {
+                    v.checked_add(
+                        swap_extra_funded_by(&offer.extra_outputs, OnchainSwapRole::Taker).ok()?,
+                    )
+                })
                 .ok_or_else(|| swap_invalid("swap amounts overflow"))?,
             min_confirmations,
             skip_sync,
@@ -1656,6 +1659,7 @@ impl Wallet {
         if offer.bitcoin_network != self.bitcoin_network() {
             return Err(Error::BitcoinNetworkMismatch);
         }
+        swap_validate_extra_outputs(&offer.extra_outputs, offer.bitcoin_network)?;
         // Correctness: verify the taker's inputs are sufficiently confirmed before the maker
         // commits resources to building the PSBT.
         swap_ensure_inputs_foreign(self, &request.taker_inputs, &[])?;
@@ -1675,7 +1679,12 @@ impl Wallet {
             &txn,
             online,
             &offer.maker_gives,
-            swap_side_rgb_output_cost(&offer.maker_receives, offer.rgb_output_sat),
+            swap_side_rgb_output_cost(&offer.maker_receives, offer.rgb_output_sat)
+                .checked_add(swap_extra_funded_by(
+                    &offer.extra_outputs,
+                    OnchainSwapRole::Maker,
+                )?)
+                .ok_or_else(|| swap_invalid("swap amounts overflow"))?,
             min_confirmations,
             skip_sync,
             &exclude_outpoints,

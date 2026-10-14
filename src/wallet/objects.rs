@@ -1969,6 +1969,21 @@ pub struct OnchainSwapInput {
     pub script_pubkey_hex: String,
 }
 
+/// An extra Bitcoin output a swap transaction pays on top of the swap legs, for example a
+/// fee owed to a third party. The offer commits to it, so both sides build and verify it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct OnchainSwapExtraOutput {
+    /// Receive address, valid for the offer's network
+    pub address: String,
+    /// Output value in satoshis
+    #[serde(deserialize_with = "from_str_or_number_mandatory")]
+    pub amount_sat: u64,
+    /// The side whose inputs fund this output
+    pub funded_by: OnchainSwapRole,
+}
+
 /// A maker-created on-chain swap offer.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -2000,12 +2015,9 @@ pub struct OnchainSwapOffer {
     pub maker_rgb_blinding: Option<u64>,
     /// Required proxy URL for consignment and asset-history delivery
     pub proxy_url: Option<String>,
-    /// Platform fee reserved for a third-party facilitator, in sats. Funded by the taker
-    /// alongside `network_fee_sat`. Zero when there is no facilitator.
-    #[serde(default, deserialize_with = "from_str_or_number_mandatory")]
-    pub platform_fee_sat: u64,
-    /// Facilitator's fee-receive script pubkey, required when `platform_fee_sat > 0`
-    pub fee_recipient_script_pubkey_hex: Option<String>,
+    /// Additional Bitcoin outputs the swap transaction pays, each funded by one side
+    #[serde(default)]
+    pub extra_outputs: Vec<OnchainSwapExtraOutput>,
 }
 
 /// A taker response to an on-chain swap offer.

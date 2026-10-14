@@ -2853,23 +2853,11 @@ pub trait WalletOffline: WalletBackup {
         network_fee_sat: u64,
         expiration_timestamp: Option<u64>,
         proxy_url: Option<String>,
-        platform_fee_sat: u64,
-        fee_recipient: Option<String>,
+        extra_outputs: Vec<OnchainSwapExtraOutput>,
     ) -> Result<OnchainSwapOffer, Error> {
         swap_validate_legs(&maker_gives, &maker_receives)?;
         swap_validate_proxy_url(&proxy_url)?;
-        let fee_recipient_script_pubkey_hex = if platform_fee_sat > 0 {
-            let address = fee_recipient.ok_or_else(|| {
-                swap_invalid("fee_recipient is required when platform_fee_sat > 0")
-            })?;
-            Some(
-                parse_address_str(&address, self.bitcoin_network())?
-                    .script_pubkey()
-                    .to_hex_string(),
-            )
-        } else {
-            None
-        };
+        swap_validate_extra_outputs(&extra_outputs, self.bitcoin_network())?;
         let (
             maker_btc_address,
             maker_rgb_recipient_id,
@@ -2906,8 +2894,7 @@ pub trait WalletOffline: WalletBackup {
             maker_rgb_script_pubkey_hex,
             maker_rgb_blinding,
             proxy_url,
-            platform_fee_sat,
-            fee_recipient_script_pubkey_hex,
+            extra_outputs,
         })
     }
 }
@@ -3002,6 +2989,39 @@ pub(crate) fn swap_validate_leg(leg: &OnchainSwapLeg) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_MAX_EXTRA_OUTPUTS: usize = 8;
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_validate_extra_outputs(
+    extra_outputs: &[OnchainSwapExtraOutput],
+    network: BitcoinNetwork,
+) -> Result<(), Error> {
+    if extra_outputs.len() > SWAP_MAX_EXTRA_OUTPUTS {
+        return Err(swap_invalid("too many extra outputs"));
+    }
+    for output in extra_outputs {
+        let script = parse_address_str(&output.address, network)?.script_pubkey();
+        if output.amount_sat < script.minimal_non_dust().to_sat() {
+            return Err(swap_invalid("extra output is below the dust limit"));
+        }
+    }
+    Ok(())
+}
+
+/// The sats the given side funds on top of its swap legs: the extra outputs it pays for.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_extra_funded_by(
+    extra_outputs: &[OnchainSwapExtraOutput],
+    role: OnchainSwapRole,
+) -> Result<u64, Error> {
+    extra_outputs
+        .iter()
+        .filter(|o| o.funded_by == role)
+        .try_fold(0u64, |total, o| total.checked_add(o.amount_sat))
+        .ok_or_else(|| swap_invalid("swap amounts overflow"))
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -3386,32 +3406,30 @@ pub(crate) fn swap_build_psbt(
         });
     }
 
-    if offer.platform_fee_sat > 0 {
+    for extra in &offer.extra_outputs {
         outputs.push(TxOut {
-            value: BdkAmount::from_sat(offer.platform_fee_sat),
-            script_pubkey: swap_parse_script(
-                offer
-                    .fee_recipient_script_pubkey_hex
-                    .as_ref()
-                    .ok_or_else(|| swap_invalid("missing fee recipient script"))?,
-            )?,
+            value: BdkAmount::from_sat(extra.amount_sat),
+            script_pubkey: parse_address_str(&extra.address, offer.bitcoin_network)?
+                .script_pubkey(),
         });
     }
 
-    // The taker funds the network fee and the platform fee, same convention as
-    // rgb-onchain-swaps-atomic's earlier PSBT-level design: the platform fee is charged
-    // alongside the miner fee, both funded by whoever is buying/taking the offer.
+    // The taker funds the network fee, plus the extra outputs it is named for.
     let taker_fee_sat = offer
         .network_fee_sat
-        .checked_add(offer.platform_fee_sat)
+        .checked_add(swap_extra_funded_by(
+            &offer.extra_outputs,
+            OnchainSwapRole::Taker,
+        )?)
         .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+    let maker_fee_sat = swap_extra_funded_by(&offer.extra_outputs, OnchainSwapRole::Maker)?;
     swap_append_side_change(
         &mut outputs,
         maker_inputs,
         maker_gives,
         maker_receives,
         offer.rgb_output_sat,
-        0,
+        maker_fee_sat,
         &proposal.maker_change_script_pubkey_hex,
     )?;
     swap_append_side_change(
@@ -3820,8 +3838,7 @@ mod swap_unit_tests {
             maker_rgb_script_pubkey_hex: Some("51".to_string()),
             maker_rgb_blinding: Some(1),
             proxy_url: Some("rpc://127.0.0.1:3000".to_string()),
-            platform_fee_sat: 0,
-            fee_recipient_script_pubkey_hex: None,
+            extra_outputs: vec![],
         };
         OnchainSwapProposal {
             request: OnchainSwapRequest {
@@ -3960,6 +3977,118 @@ mod swap_unit_tests {
         proposal.txid = psbt.unsigned_tx.compute_txid().to_string();
         proposal.psbt = psbt.to_string();
         swap_validate_proposal_psbt(&proposal, &psbt).unwrap();
+    }
+
+    const EXTRA_ADDRESS: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+    fn extra(amount_sat: u64, funded_by: OnchainSwapRole) -> OnchainSwapExtraOutput {
+        OnchainSwapExtraOutput {
+            address: EXTRA_ADDRESS.to_string(),
+            amount_sat,
+            funded_by,
+        }
+    }
+
+    #[test]
+    fn extra_outputs_are_paid_by_the_side_that_funds_them() {
+        let extra_script = parse_address_str(EXTRA_ADDRESS, BitcoinNetwork::Regtest)
+            .unwrap()
+            .script_pubkey();
+        let value_to_extra = |psbt: &Psbt| {
+            psbt.unsigned_tx
+                .output
+                .iter()
+                .filter(|o| o.script_pubkey == extra_script)
+                .map(|o| o.value.to_sat())
+                .collect::<Vec<_>>()
+        };
+        let change_of = |psbt: &Psbt, total: u64| {
+            total
+                - psbt
+                    .unsigned_tx
+                    .output
+                    .iter()
+                    .map(|o| o.value.to_sat())
+                    .sum::<u64>()
+        };
+
+        // taker funded: the taker's 2100 sat pay 1000 (RGB output) + 100 (network) + 500
+        let mut proposal = rgb_rgb_proposal();
+        proposal.request.offer.extra_outputs = vec![extra(500, OnchainSwapRole::Taker)];
+        let (psbt, _, _) = swap_build_psbt(&proposal).unwrap();
+        assert_eq!(value_to_extra(&psbt), vec![500]);
+        // inputs 2100 + 1000, outputs add up to everything but the network fee
+        assert_eq!(change_of(&psbt, 3_100), 100);
+
+        // maker funded: the maker's 1000 sat cover its RGB output only, so 500 more are needed
+        let mut proposal = rgb_rgb_proposal();
+        proposal.request.offer.extra_outputs = vec![extra(500, OnchainSwapRole::Maker)];
+        assert!(matches!(
+            swap_build_psbt(&proposal),
+            Err(Error::InsufficientBitcoins { .. })
+        ));
+        proposal.maker_inputs[0].amount_sat = 1_500;
+        let (psbt, _, _) = swap_build_psbt(&proposal).unwrap();
+        assert_eq!(value_to_extra(&psbt), vec![500]);
+        assert_eq!(change_of(&psbt, 3_600), 100);
+
+        // no extra outputs: nothing is added
+        let (psbt, _, _) = swap_build_psbt(&rgb_rgb_proposal()).unwrap();
+        assert!(value_to_extra(&psbt).is_empty());
+    }
+
+    #[test]
+    fn rejects_a_proposal_with_an_output_the_offer_does_not_commit_to() {
+        let mut proposal = rgb_rgb_proposal();
+        let (mut psbt, _, _) = swap_build_psbt(&proposal).unwrap();
+        proposal.txid = psbt.unsigned_tx.compute_txid().to_string();
+        proposal.psbt = psbt.to_string();
+        swap_validate_proposal_psbt(&proposal, &psbt).unwrap();
+        // the maker adds an output paid from the taker's coins
+        let script = parse_address_str(EXTRA_ADDRESS, BitcoinNetwork::Regtest)
+            .unwrap()
+            .script_pubkey();
+        psbt.unsigned_tx.output.push(TxOut {
+            value: BdkAmount::from_sat(500),
+            script_pubkey: script,
+        });
+        psbt.outputs.push(Default::default());
+        assert!(swap_validate_proposal_psbt(&proposal, &psbt).is_err());
+    }
+
+    #[test]
+    fn validates_extra_outputs() {
+        let ok = vec![extra(500, OnchainSwapRole::Taker)];
+        swap_validate_extra_outputs(&ok, BitcoinNetwork::Regtest).unwrap();
+        // wrong network
+        assert!(swap_validate_extra_outputs(&ok, BitcoinNetwork::Mainnet).is_err());
+        // below dust
+        assert!(
+            swap_validate_extra_outputs(
+                &[extra(1, OnchainSwapRole::Taker)],
+                BitcoinNetwork::Regtest
+            )
+            .is_err()
+        );
+        // too many
+        let many = (0..=SWAP_MAX_EXTRA_OUTPUTS)
+            .map(|_| extra(500, OnchainSwapRole::Taker))
+            .collect::<Vec<_>>();
+        assert!(swap_validate_extra_outputs(&many, BitcoinNetwork::Regtest).is_err());
+        // sums per side
+        let mixed = vec![
+            extra(500, OnchainSwapRole::Taker),
+            extra(700, OnchainSwapRole::Maker),
+            extra(300, OnchainSwapRole::Taker),
+        ];
+        assert_eq!(
+            swap_extra_funded_by(&mixed, OnchainSwapRole::Taker).unwrap(),
+            800
+        );
+        assert_eq!(
+            swap_extra_funded_by(&mixed, OnchainSwapRole::Maker).unwrap(),
+            700
+        );
     }
 
     #[test]
