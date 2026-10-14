@@ -1808,6 +1808,10 @@ impl Wallet {
         if proposal.txid != psbt.unsigned_tx.compute_txid().to_string() {
             return Err(swap_invalid("swap proposal txid mismatch"));
         }
+        // Security: the maker picked `maker_inputs` and built the PSBT from them, so the checks
+        // above can't catch one of this wallet's coins listed as a maker input. Refuse it before
+        // coloring anything.
+        swap_ensure_inputs_foreign(self, &proposal.maker_inputs, &proposal.request.taker_inputs)?;
         let mut consignments = proposal.consignments.clone();
         let mut taker_history = None;
         let (_expected_psbt, maker_rgb_vout, taker_rgb_vout) = swap_build_psbt(&proposal)?;
