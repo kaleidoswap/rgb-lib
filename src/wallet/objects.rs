@@ -1867,11 +1867,16 @@ pub enum OnchainSwapStage {
     Requested,
     /// The maker built the proposal
     Proposed,
-    /// This wallet broadcast the swap transaction
+    /// The taker spent one of its swap inputs to invalidate the swap transaction; it becomes
+    /// [`Cancelled`](OnchainSwapStage::Cancelled) once that spend confirms, see
+    /// [`crate::wallet::Wallet::invalidate_swap`]
+    Invalidating,
+    /// The swap transaction has been broadcast, by this wallet or, as seen by the taker, by the
+    /// counterparty
     Broadcast,
     /// This wallet accepted the swap transfers
     Accepted,
-    /// The swap was cancelled before broadcast
+    /// The swap was cancelled before broadcast, or invalidated
     Cancelled,
 }
 
@@ -1888,7 +1893,8 @@ pub struct OnchainSwapSummary {
     pub stage: OnchainSwapStage,
     /// Offer expiration
     pub expiration_timestamp: Option<u64>,
-    /// Swap transaction ID, once the maker has built the proposal
+    /// Swap transaction ID, once the maker has built the proposal (the taker records it when
+    /// signing)
     pub txid: Option<String>,
 }
 

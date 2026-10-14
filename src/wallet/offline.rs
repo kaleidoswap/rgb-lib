@@ -23,6 +23,10 @@ pub(crate) const SWAP_BROADCAST_FILE: &str = "broadcast.json";
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const SWAP_ACCEPTED_FILE: &str = "accepted.json";
 #[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_COMPLETION_FILE: &str = "completion.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_INVALIDATION_FILE: &str = "invalidation.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const SWAP_CANCELLED_EXTENSION: &str = "cancelled";
 
 const ASSET_ID_PREFIX: &str = "rgb:";
@@ -2912,6 +2916,15 @@ pub(crate) struct SwapOutgoingState {
     pub(crate) batch_transfer_idx: i32,
 }
 
+/// The transaction the taker broadcast to spend one of its swap inputs, invalidating the swap
+/// transaction it signed. Kept until either transaction confirms.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct SwapInvalidationState {
+    pub(crate) txid: String,
+    pub(crate) tx_hex: String,
+}
+
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum SwapDirection {
@@ -3460,6 +3473,27 @@ pub(crate) fn swap_build_psbt(
     Ok((psbt, maker_rgb_vout, taker_rgb_vout))
 }
 
+/// The absolute fee the swap transaction pays: its inputs minus its outputs, which may exceed
+/// `network_fee_sat` when a side's change below the dust limit went to the fee.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_tx_fee(proposal: &OnchainSwapProposal) -> Result<u64, Error> {
+    let (psbt, _, _) = swap_build_psbt(proposal)?;
+    let inputs = swap_selected_inputs_total(&proposal.maker_inputs)
+        .checked_add(swap_selected_inputs_total(&proposal.request.taker_inputs))
+        .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+    let outputs = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .try_fold(0u64, |total, output| {
+            total.checked_add(output.value.to_sat())
+        })
+        .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+    inputs
+        .checked_sub(outputs)
+        .ok_or_else(|| swap_invalid("swap outputs exceed its inputs"))
+}
+
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn swap_restore_input_metadata(
     psbt: &mut Psbt,
@@ -3865,6 +3899,17 @@ mod swap_unit_tests {
             consignments: vec![],
             maker_history: None,
         }
+    }
+
+    #[test]
+    fn swap_tx_fee_is_inputs_minus_outputs() {
+        // inputs 2_100 + 1_000, two RGB receive outputs and 1_000 of taker change
+        let proposal = rgb_rgb_proposal();
+        assert_eq!(swap_tx_fee(&proposal).unwrap(), 100);
+        // inputs that can't pay the outputs are refused
+        let mut proposal = rgb_rgb_proposal();
+        proposal.request.taker_inputs[0].amount_sat = 1_000;
+        assert!(swap_tx_fee(&proposal).is_err());
     }
 
     #[test]

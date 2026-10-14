@@ -4,12 +4,14 @@
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use super::offline::{
-    SWAP_ACCEPTED_FILE, SWAP_BROADCAST_FILE, SWAP_CANCELLED_EXTENSION, SWAP_OFFER_FILE,
-    SWAP_OUTGOING_FILE, SWAP_PROPOSAL_FILE, SWAP_REQUEST_FILE, SwapDirection, SwapOutgoingState,
-    swap_build_psbt, swap_consignment_dir, swap_ensure_not_expired, swap_ensure_state_matches,
-    swap_extra_funded_by, swap_invalid, swap_load_state, swap_mpc_entropy, swap_random_blinding,
-    swap_require_rgb_destination, swap_restore_input_metadata, swap_save_state,
-    swap_side_rgb_output_cost, swap_state_path, swap_validate_extra_outputs, swap_validate_legs,
+    SWAP_ACCEPTED_FILE, SWAP_BROADCAST_FILE, SWAP_CANCELLED_EXTENSION, SWAP_COMPLETION_FILE,
+    SWAP_INVALIDATION_FILE, SWAP_OFFER_FILE, SWAP_OUTGOING_FILE, SWAP_PROPOSAL_FILE,
+    SWAP_REQUEST_FILE, SwapDirection, SwapInvalidationState, SwapOutgoingState, swap_build_psbt,
+    swap_consignment_dir, swap_ensure_not_expired, swap_ensure_state_matches,
+    swap_extra_funded_by, swap_input_to_outpoint, swap_invalid, swap_load_state, swap_mpc_entropy,
+    swap_random_blinding, swap_require_rgb_destination, swap_restore_input_metadata,
+    swap_save_state, swap_side_rgb_output_cost, swap_state_path, swap_tx_fee,
+    swap_validate_extra_outputs, swap_validate_legs,
     swap_validate_proposal_psbt, swap_validate_proxy_url,
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -17,10 +19,12 @@ use super::online::{
     SwapRgbSend, swap_accept_transfer_from_file, swap_color_rgb_leg, swap_emit_asset_history,
     swap_ensure_inputs_confirmed, swap_ensure_inputs_foreign, swap_fetch_consignment_to_file,
     swap_finalize_psbt, swap_finalize_psbt_required, swap_import_asset_history,
-    swap_prepare_rgb_leg, swap_select_inputs, swap_sign_psbt, swap_stage_rgb_leg,
-    swap_validate_fascia_received_leg, swap_validate_received_swap_leg,
+    swap_input_rgb_amounts, swap_prepare_rgb_leg, swap_select_inputs, swap_sign_psbt,
+    swap_stage_rgb_leg, swap_validate_fascia_received_leg, swap_validate_received_swap_leg,
 };
 use super::*;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use bdk_wallet::bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 
 /// Keys for the singlesig wallet.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1782,6 +1786,17 @@ impl Wallet {
     /// maker always signs last, so the returned [`OnchainSwapCompletion`] is never broadcastable
     /// by the taker: it must be forwarded to the maker, who calls
     /// [`process_swap_completion`](Wallet::process_swap_completion) and broadcasts.
+    ///
+    /// The completion is also saved in the local swap state, so the swap can be invalidated after
+    /// a restart.
+    ///
+    /// **Residual risk**: the completion carries this wallet's signatures on a transaction with
+    /// `lock_time = 0` and no other expiry, which stays valid for as long as the inputs this wallet
+    /// declared are unspent. An honest maker refuses to sign once the offer has expired, but a
+    /// dishonest one can keep the completion and broadcast it later, e.g. once the price has moved
+    /// in its favour. If the maker hasn't broadcast the swap in time, call
+    /// [`invalidate_swap`](Wallet::invalidate_swap): [`cancel_swap`](Wallet::cancel_swap) only
+    /// drops the local state and doesn't rule this out.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub fn complete_swap_proposal(
         &mut self,
@@ -1931,6 +1946,14 @@ impl Wallet {
             consignments,
             taker_history,
         };
+        // saved before the signatures leave this wallet: invalidate_swap needs the swap txid and
+        // the inputs it may spend
+        swap_save_state(
+            self.wallet_dir(),
+            &completion.proposal.request.offer.swap_id,
+            SWAP_COMPLETION_FILE,
+            &completion,
+        )?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
         info!(self.logger(), "Complete swap proposal completed");
@@ -2183,15 +2206,7 @@ impl Wallet {
         // the transaction yet: that would release inputs the transaction spends. Committed before
         // broadcasting, since a failed broadcast attempt may still have reached the network; a
         // rejected swap stays cancellable, cancel_swap doesn't depend on the expiration.
-        if let Some((_, batch_transfer)) = self.swap_outgoing_batch(&offer.swap_id)?
-            && batch_transfer.expiration.is_some()
-        {
-            let txn = self.database().begin_transaction()?;
-            let mut updated: DbBatchTransferActMod = batch_transfer.into();
-            updated.expiration = ActiveValue::Set(None);
-            txn.update_batch_transfer(&mut updated)?;
-            txn.commit()?;
-        }
+        self.swap_clear_outgoing_expiration(&offer.swap_id)?;
         let txn = self.database().begin_transaction()?;
         let tx = match self.broadcast_psbt(&txn, &psbt) {
             Ok(tx) => tx,
@@ -2231,16 +2246,18 @@ impl Wallet {
     /// its inputs, and archives the local swap state so no further step can be run on it.
     ///
     /// Returns [`Error::CannotFailBatchTransfer`] once the swap transaction has been broadcast by
-    /// this wallet, is known to the indexer or the swap has been settled. A counterparty holding a
-    /// fully signed transaction can still broadcast it: to rule that out, spend the inputs.
+    /// this wallet, is known to the indexer or the swap has been settled.
+    ///
+    /// Cancelling only drops the local state: a maker holding the completion this wallet signed as
+    /// the taker can still broadcast it. To rule that out, call
+    /// [`invalidate_swap`](Wallet::invalidate_swap), which also works on a swap cancelled here. A
+    /// swap being invalidated is only cancelled once the invalidation has confirmed.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub fn cancel_swap(&mut self, online: Online, swap_id: String) -> Result<(), Error> {
         info!(self.logger(), "Cancelling on-chain swap {swap_id}...");
         self.check_online(online)?;
+        swap_validate_id(&swap_id)?;
         let swap_dir = swap_consignment_dir(self.wallet_dir(), &swap_id);
-        if swap_id.is_empty() || !swap_id.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err(swap_invalid("invalid swap ID"));
-        }
         if !swap_dir.is_dir() {
             return Err(swap_invalid(format!("unknown swap {swap_id}")));
         }
@@ -2250,29 +2267,244 @@ impl Wallet {
         {
             return Err(Error::CannotFailBatchTransfer);
         }
-        if let Some((outgoing, batch_transfer)) = self.swap_outgoing_batch(&swap_id)? {
-            if self
-                .indexer()
-                .get_tx_confirmations(&outgoing.txid)?
-                .is_some()
-            {
-                return Err(Error::CannotFailBatchTransfer);
-            }
-            match batch_transfer.status {
-                TransferStatus::Initiated => {
-                    self.fail_transfers(online, Some(batch_transfer.idx), false, false)?;
+        if swap_dir.join(SWAP_INVALIDATION_FILE).exists() {
+            match self.swap_resolve_invalidation(online, &swap_id)? {
+                SwapInvalidationOutcome::Cancelled => {}
+                SwapInvalidationOutcome::Settled => return Err(Error::CannotFailBatchTransfer),
+                SwapInvalidationOutcome::Pending => {
+                    return Err(swap_invalid(format!(
+                        "swap {swap_id} is being invalidated, its invalidation is not confirmed yet"
+                    )));
                 }
-                TransferStatus::Failed => {}
-                _ => return Err(Error::CannotFailBatchTransfer),
             }
+        } else {
+            self.swap_archive_cancelled(online, &swap_id)?;
         }
-        fs::rename(&swap_dir, swap_dir.with_extension(SWAP_CANCELLED_EXTENSION))?;
         info!(self.logger(), "Cancel swap completed");
         Ok(())
     }
 
+    /// Invalidate an on-chain swap this wallet signed as the taker, by spending the uncolored
+    /// inputs it declared back to itself. Returns the ID of the invalidation transaction.
+    ///
+    /// Call this when the maker hasn't broadcast the swap in time: see the residual risk described
+    /// in [`complete_swap_proposal`](Wallet::complete_swap_proposal). Once the invalidation is
+    /// broadcast the swap is [`OnchainSwapStage::Invalidating`] and the race with the swap
+    /// transaction is settled by [`cancel_expired_swaps`](Wallet::cancel_expired_swaps) or
+    /// [`cancel_swap`](Wallet::cancel_swap): when the invalidation confirms, the RGB leg this
+    /// wallet prepared, if any, is failed and the swap is archived as cancelled; when the swap
+    /// transaction gets out first, the swap moves to [`OnchainSwapStage::Broadcast`] and settles
+    /// with [`accept_swap_transfers`](Wallet::accept_swap_transfers) as usual.
+    ///
+    /// The invalidation pays `fee_rate` (in sat/vB) but at least the absolute fee of the swap
+    /// transaction, so the swap transaction can't replace it in the mempool.
+    ///
+    /// Only uncolored inputs are spent, so no RGB allocation is ever destroyed. A taker sending an
+    /// RGB leg declares only colored inputs: its swap can't be invalidated this way and this
+    /// returns an error.
+    ///
+    /// Calling this again while the swap is being invalidated re-broadcasts the same transaction.
+    /// A swap cancelled after signing, e.g. by [`cancel_expired_swaps`], can still be invalidated.
+    ///
+    /// Returns [`Error::CannotFailBatchTransfer`] once the swap transaction is known to the
+    /// indexer or the swap has been settled.
+    ///
+    /// [`cancel_expired_swaps`]: Wallet::cancel_expired_swaps
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn invalidate_swap(
+        &mut self,
+        online: Online,
+        swap_id: String,
+        fee_rate: u64,
+    ) -> Result<String, Error> {
+        info!(self.logger(), "Invalidating on-chain swap {swap_id}...");
+        self.check_xprv()?;
+        self.check_online(online)?;
+        let fee_rate = self.check_fee_rate(fee_rate)?;
+        swap_validate_id(&swap_id)?;
+        let swap_dir = swap_consignment_dir(self.wallet_dir(), &swap_id);
+        let cancelled_dir = swap_dir.with_extension(SWAP_CANCELLED_EXTENSION);
+        let reopen = !swap_dir.is_dir() && cancelled_dir.is_dir();
+        let dir = if reopen { &cancelled_dir } else { &swap_dir };
+        if !dir.is_dir() {
+            return Err(swap_invalid(format!("unknown swap {swap_id}")));
+        }
+        if dir.join(SWAP_OFFER_FILE).exists() || !dir.join(SWAP_REQUEST_FILE).exists() {
+            return Err(swap_invalid("only the taker can invalidate a swap"));
+        }
+        if !dir.join(SWAP_COMPLETION_FILE).exists() {
+            return Err(swap_invalid(format!(
+                "this wallet has not signed swap {swap_id}, cancel it instead"
+            )));
+        }
+        if reopen {
+            if let Some(invalidation) =
+                swap_read_state::<SwapInvalidationState>(dir, SWAP_INVALIDATION_FILE)
+            {
+                // invalidated and archived already
+                return Ok(invalidation.txid);
+            }
+            fs::rename(&cancelled_dir, &swap_dir)?;
+        }
+        let res = self.invalidate_swap_impl(online, &swap_id, fee_rate);
+        // nothing is in flight: put a reopened swap back where it was
+        if reopen
+            && res.is_err()
+            && swap_dir.is_dir()
+            && ![SWAP_INVALIDATION_FILE, SWAP_BROADCAST_FILE]
+                .iter()
+                .any(|marker| swap_dir.join(marker).exists())
+        {
+            fs::rename(&swap_dir, &cancelled_dir)?;
+        }
+        let txid = res?;
+        info!(self.logger(), "Invalidate swap completed");
+        Ok(txid)
+    }
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn invalidate_swap_impl(
+        &mut self,
+        online: Online,
+        swap_id: &str,
+        fee_rate: FeeRate,
+    ) -> Result<String, Error> {
+        let swap_dir = swap_consignment_dir(self.wallet_dir(), swap_id);
+        if [SWAP_BROADCAST_FILE, SWAP_ACCEPTED_FILE]
+            .iter()
+            .any(|marker| swap_dir.join(marker).exists())
+        {
+            return Err(Error::CannotFailBatchTransfer);
+        }
+        let completion: OnchainSwapCompletion =
+            swap_load_state(self.wallet_dir(), swap_id, SWAP_COMPLETION_FILE)?;
+        if self
+            .indexer()
+            .get_tx_confirmations(&completion.txid)?
+            .is_some()
+        {
+            self.swap_record_settling(online, swap_id, &completion.txid)?;
+            return Err(Error::CannotFailBatchTransfer);
+        }
+        if swap_dir.join(SWAP_INVALIDATION_FILE).exists() {
+            let invalidation: SwapInvalidationState =
+                swap_load_state(self.wallet_dir(), swap_id, SWAP_INVALIDATION_FILE)?;
+            self.swap_rebroadcast_invalidation(&invalidation)?;
+            return Ok(invalidation.txid);
+        }
+
+        let txn = self.database().begin_transaction()?;
+        self.sync_if_requested(&txn, Some(online), false, KeychainKind::Internal)?;
+        // Security: a coin on the colored side may carry RGB allocations, which spending it
+        // without a transition would destroy, so only vanilla coins are spent
+        let colored_txos = txn
+            .iter_txos()?
+            .into_iter()
+            .map(BdkOutPoint::from)
+            .collect::<HashSet<_>>();
+        let taker_inputs = &completion.proposal.request.taker_inputs;
+        let mut inputs = vec![];
+        let mut any_unspent = false;
+        for declared in taker_inputs {
+            let outpoint = swap_input_to_outpoint(declared);
+            let Some(utxo) = self.bdk_wallet().get_utxo(outpoint) else {
+                continue;
+            };
+            if utxo.is_spent {
+                continue;
+            }
+            any_unspent = true;
+            if utxo.keychain == KeychainKind::Internal
+                && !colored_txos.contains(&outpoint)
+                && swap_input_rgb_amounts(self, &HashSet::from([outpoint]))?.is_empty()
+            {
+                inputs.push(outpoint);
+            }
+        }
+        if inputs.is_empty() {
+            return Err(swap_invalid(if any_unspent {
+                format!(
+                    "swap {swap_id} only spends colored inputs of this wallet, which can't be spent \
+                     outside the swap without destroying their RGB allocations"
+                )
+            } else {
+                format!("the inputs this wallet declared in swap {swap_id} are already spent")
+            }));
+        }
+        let script_pubkey = self
+            .get_new_addresses(KeychainKind::Internal, 1)?
+            .script_pubkey();
+        let swap_fee = swap_tx_fee(&completion.proposal)?;
+        let mut psbt =
+            self.swap_build_invalidation_psbt(&inputs, script_pubkey.clone(), fee_rate, None)?;
+        if psbt_fee(&psbt)? < swap_fee {
+            psbt = self.swap_build_invalidation_psbt(
+                &inputs,
+                script_pubkey,
+                fee_rate,
+                Some(swap_fee),
+            )?;
+        }
+        self.sign_psbt_impl(&mut psbt, None)?;
+        let tx = psbt.clone().extract_tx().map_err(InternalError::from)?;
+        let invalidation = SwapInvalidationState {
+            txid: tx.compute_txid().to_string(),
+            tx_hex: serialize_hex(&tx),
+        };
+        txn.commit()?;
+
+        // from here on the swap is being invalidated. Saved before broadcasting, since a failed
+        // broadcast attempt may still have reached the network
+        swap_save_state(
+            self.wallet_dir(),
+            swap_id,
+            SWAP_INVALIDATION_FILE,
+            &invalidation,
+        )?;
+        // the swap transaction may still confirm until the invalidation does
+        self.swap_clear_outgoing_expiration(swap_id)?;
+        let txn = self.database().begin_transaction()?;
+        match self.broadcast_psbt(&txn, &psbt) {
+            Ok(_) => {}
+            Err(
+                e @ (Error::FailedBroadcast { .. }
+                | Error::MinFeeNotMet { .. }
+                | Error::MaxFeeExceeded { .. }),
+            ) => {
+                // rejected and unknown to the indexer: nothing is being invalidated
+                drop(txn);
+                let _ = fs::remove_file(swap_state_path(
+                    self.wallet_dir(),
+                    swap_id,
+                    SWAP_INVALIDATION_FILE,
+                ));
+                // the swap transaction most likely got there first
+                if self
+                    .indexer()
+                    .get_tx_confirmations(&completion.txid)?
+                    .is_some()
+                {
+                    self.swap_record_settling(online, swap_id, &completion.txid)?;
+                    return Err(Error::CannotFailBatchTransfer);
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
+        self.finalize_vanilla_wallet_transaction(&txn, &psbt, WalletTransactionType::SendBtc)?;
+        self.update_backup_info(&txn, false)?;
+        txn.commit()?;
+        Ok(invalidation.txid)
+    }
+
     /// Cancel every on-chain swap whose offer has expired and whose transaction has not been
     /// broadcast, as [`cancel_swap`](Wallet::cancel_swap) does. Returns the cancelled swap IDs.
+    ///
+    /// This is also the recovery step for swaps being invalidated (see
+    /// [`invalidate_swap`](Wallet::invalidate_swap)), whatever their expiration: a swap whose
+    /// invalidation has confirmed is cancelled and returned, a swap whose transaction got out
+    /// first moves to [`OnchainSwapStage::Broadcast`] and an invalidation missing from the
+    /// mempool is re-broadcast.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub fn cancel_expired_swaps(&mut self, online: Online) -> Result<Vec<String>, Error> {
         info!(self.logger(), "Cancelling expired on-chain swaps...");
@@ -2292,6 +2524,14 @@ impl Wallet {
                 continue;
             };
             if !entry.path().is_dir() || !swap_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+                continue;
+            }
+            if entry.path().join(SWAP_INVALIDATION_FILE).exists() {
+                if self.swap_resolve_invalidation(online, swap_id)?
+                    == SwapInvalidationOutcome::Cancelled
+                {
+                    swap_ids.push(swap_id.to_string());
+                }
                 continue;
             }
             let offer = if let Ok(offer) =
@@ -2329,9 +2569,6 @@ impl Wallet {
         if !transfers_dir.is_dir() {
             return Ok(vec![]);
         }
-        fn load<T: serde::de::DeserializeOwned>(dir: &Path, file: &str) -> Option<T> {
-            serde_json::from_str(&fs::read_to_string(dir.join(file)).ok()?).ok()
-        }
         let cancelled_suffix = format!(".{SWAP_CANCELLED_EXTENSION}");
         let mut swaps = vec![];
         for entry in fs::read_dir(&transfers_dir)? {
@@ -2348,23 +2585,32 @@ impl Wallet {
             if !dir.is_dir() || !swap_id.chars().all(|c| c.is_ascii_alphanumeric()) {
                 continue;
             }
-            let (role, offer) = if let Some(offer) = load::<OnchainSwapOffer>(&dir, SWAP_OFFER_FILE)
-            {
-                (OnchainSwapRole::Maker, offer)
-            } else if let Some(request) = load::<OnchainSwapRequest>(&dir, SWAP_REQUEST_FILE) {
-                (OnchainSwapRole::Taker, request.offer)
-            } else {
-                continue;
-            };
-            let proposal_txid =
-                load::<OnchainSwapProposal>(&dir, SWAP_PROPOSAL_FILE).map(|p| p.txid);
-            let broadcast_txid = load::<String>(&dir, SWAP_BROADCAST_FILE);
+            let (role, offer) =
+                if let Some(offer) = swap_read_state::<OnchainSwapOffer>(&dir, SWAP_OFFER_FILE) {
+                    (OnchainSwapRole::Maker, offer)
+                } else if let Some(request) =
+                    swap_read_state::<OnchainSwapRequest>(&dir, SWAP_REQUEST_FILE)
+                {
+                    (OnchainSwapRole::Taker, request.offer)
+                } else {
+                    continue;
+                };
+            // the maker keeps its proposal, the taker the completion it signed
+            let proposal_txid = swap_read_state::<OnchainSwapProposal>(&dir, SWAP_PROPOSAL_FILE)
+                .map(|p| p.txid)
+                .or_else(|| {
+                    swap_read_state::<OnchainSwapCompletion>(&dir, SWAP_COMPLETION_FILE)
+                        .map(|c| c.txid)
+                });
+            let broadcast_txid = swap_read_state::<String>(&dir, SWAP_BROADCAST_FILE);
             let stage = if cancelled {
                 OnchainSwapStage::Cancelled
             } else if dir.join(SWAP_ACCEPTED_FILE).exists() {
                 OnchainSwapStage::Accepted
             } else if broadcast_txid.is_some() {
                 OnchainSwapStage::Broadcast
+            } else if dir.join(SWAP_INVALIDATION_FILE).exists() {
+                OnchainSwapStage::Invalidating
             } else if proposal_txid.is_some() {
                 OnchainSwapStage::Proposed
             } else if role == OnchainSwapRole::Maker {
@@ -2456,6 +2702,168 @@ impl Wallet {
         Ok(())
     }
 
+    /// A prepared RGB leg must never be failed by the expiry sweep while the swap transaction may
+    /// still confirm: that would release inputs the transaction spends.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn swap_clear_outgoing_expiration(&self, swap_id: &str) -> Result<(), Error> {
+        if let Some((_, batch_transfer)) = self.swap_outgoing_batch(swap_id)?
+            && batch_transfer.expiration.is_some()
+        {
+            let txn = self.database().begin_transaction()?;
+            let mut updated: DbBatchTransferActMod = batch_transfer.into();
+            updated.expiration = ActiveValue::Set(None);
+            txn.update_batch_transfer(&mut updated)?;
+            txn.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Fail the RGB leg this wallet prepared for a swap, if any, and archive the swap state.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn swap_archive_cancelled(&mut self, online: Online, swap_id: &str) -> Result<(), Error> {
+        if let Some((outgoing, batch_transfer)) = self.swap_outgoing_batch(swap_id)? {
+            if self
+                .indexer()
+                .get_tx_confirmations(&outgoing.txid)?
+                .is_some()
+            {
+                return Err(Error::CannotFailBatchTransfer);
+            }
+            match batch_transfer.status {
+                TransferStatus::Initiated => {
+                    self.fail_transfers(online, Some(batch_transfer.idx), false, false)?;
+                }
+                TransferStatus::Failed => {}
+                _ => return Err(Error::CannotFailBatchTransfer),
+            }
+        }
+        let swap_dir = swap_consignment_dir(self.wallet_dir(), swap_id);
+        fs::rename(&swap_dir, swap_dir.with_extension(SWAP_CANCELLED_EXTENSION))?;
+        Ok(())
+    }
+
+    /// Settle the race between a swap being invalidated and the swap transaction.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn swap_resolve_invalidation(
+        &mut self,
+        online: Online,
+        swap_id: &str,
+    ) -> Result<SwapInvalidationOutcome, Error> {
+        let swap_dir = swap_consignment_dir(self.wallet_dir(), swap_id);
+        if [SWAP_BROADCAST_FILE, SWAP_ACCEPTED_FILE]
+            .iter()
+            .any(|marker| swap_dir.join(marker).exists())
+        {
+            // interrupted while recording the swap transaction
+            let _ = fs::remove_file(swap_dir.join(SWAP_INVALIDATION_FILE));
+            return Ok(SwapInvalidationOutcome::Settled);
+        }
+        let invalidation: SwapInvalidationState =
+            swap_load_state(self.wallet_dir(), swap_id, SWAP_INVALIDATION_FILE)?;
+        let completion: OnchainSwapCompletion =
+            swap_load_state(self.wallet_dir(), swap_id, SWAP_COMPLETION_FILE)?;
+        let invalidation_confirmations = self.indexer().get_tx_confirmations(&invalidation.txid)?;
+        if invalidation_confirmations.unwrap_or_default() > 0 {
+            // the swap transaction can no longer confirm: release what it would have spent
+            self.swap_archive_cancelled(online, swap_id)?;
+            info!(self.logger(), "Swap {swap_id} invalidated");
+            return Ok(SwapInvalidationOutcome::Cancelled);
+        }
+        if self
+            .indexer()
+            .get_tx_confirmations(&completion.txid)?
+            .is_some()
+        {
+            self.swap_record_settling(online, swap_id, &completion.txid)?;
+            return Ok(SwapInvalidationOutcome::Settled);
+        }
+        if invalidation_confirmations.is_none() {
+            // evicted or never relayed: the swap transaction is still valid
+            self.swap_rebroadcast_invalidation(&invalidation)?;
+        }
+        Ok(SwapInvalidationOutcome::Pending)
+    }
+
+    /// The swap transaction this wallet signed as the taker is out: the swap settles, whatever
+    /// this wallet was doing to invalidate it.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn swap_record_settling(
+        &mut self,
+        online: Online,
+        swap_id: &str,
+        txid: &str,
+    ) -> Result<(), Error> {
+        warn!(
+            self.logger(),
+            "Swap {swap_id} transaction {txid} is out, it can no longer be invalidated"
+        );
+        if !swap_state_path(self.wallet_dir(), swap_id, SWAP_BROADCAST_FILE).exists() {
+            swap_save_state(self.wallet_dir(), swap_id, SWAP_BROADCAST_FILE, &txid)?;
+        }
+        let _ = fs::remove_file(swap_state_path(
+            self.wallet_dir(),
+            swap_id,
+            SWAP_INVALIDATION_FILE,
+        ));
+        self.swap_apply_outgoing(online, swap_id, txid)
+    }
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn swap_rebroadcast_invalidation(
+        &self,
+        invalidation: &SwapInvalidationState,
+    ) -> Result<(), Error> {
+        let tx: BdkTransaction =
+            deserialize_hex(&invalidation.tx_hex).map_err(|e| Error::Internal {
+                details: format!("invalid swap invalidation transaction: {e}"),
+            })?;
+        if let Err(e) = self.broadcast_tx(tx) {
+            warn!(
+                self.logger(),
+                "Re-broadcasting swap invalidation {} failed: {e}", invalidation.txid
+            );
+        }
+        Ok(())
+    }
+
+    /// Spend `inputs` (and nothing else) to `script_pubkey`.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn swap_build_invalidation_psbt(
+        &mut self,
+        inputs: &[BdkOutPoint],
+        script_pubkey: ScriptBuf,
+        fee_rate: FeeRate,
+        fee_absolute: Option<u64>,
+    ) -> Result<Psbt, Error> {
+        let mut tx_builder = self.bdk_wallet_mut().build_tx();
+        tx_builder
+            .add_utxos(inputs)
+            .map_err(|e| Error::Internal {
+                details: e.to_string(),
+            })?
+            .manually_selected_only()
+            .drain_to(script_pubkey);
+        match fee_absolute {
+            Some(fee) => tx_builder.fee_absolute(BdkAmount::from_sat(fee)),
+            None => tx_builder.fee_rate(fee_rate),
+        };
+        tx_builder.finish().map_err(|e| match e {
+            bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
+                needed,
+                available,
+            }) => Error::InsufficientBitcoins {
+                needed: needed.to_sat(),
+                available: available.to_sat(),
+            },
+            bdk_wallet::error::CreateTxError::OutputBelowDustLimit(_) => {
+                Error::OutputBelowDustLimit
+            }
+            _ => Error::Internal {
+                details: e.to_string(),
+            },
+        })
+    }
+
     /// Accept the RGB transfers received from a completed on-chain swap.
     ///
     /// Each party calls this method with their own `role` once the swap transaction has been
@@ -2538,6 +2946,41 @@ impl Wallet {
         info!(self.logger(), "Accept swap transfers completed");
         Ok(result)
     }
+}
+
+/// What became of a swap this wallet is invalidating.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum SwapInvalidationOutcome {
+    /// Neither transaction has confirmed yet
+    Pending,
+    /// The invalidation confirmed and the swap was archived as cancelled
+    Cancelled,
+    /// The swap transaction got out first
+    Settled,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn swap_validate_id(swap_id: &str) -> Result<(), Error> {
+    if swap_id.is_empty() || !swap_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(swap_invalid("invalid swap ID"));
+    }
+    Ok(())
+}
+
+/// Read a swap state file from `dir`, which may be an archived swap.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn swap_read_state<T: serde::de::DeserializeOwned>(dir: &Path, file: &str) -> Option<T> {
+    serde_json::from_str(&fs::read_to_string(dir.join(file)).ok()?).ok()
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn psbt_fee(psbt: &Psbt) -> Result<u64, Error> {
+    psbt.fee()
+        .map(|fee| fee.to_sat())
+        .map_err(|e| Error::Internal {
+            details: e.to_string(),
+        })
 }
 
 #[cfg(feature = "vss")]

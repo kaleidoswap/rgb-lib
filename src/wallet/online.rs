@@ -4884,7 +4884,7 @@ impl SwapRgbSend<'_> {
 }
 
 /// Amounts per contract carried by the given wallet inputs (1 for a UDA token).
-fn swap_input_rgb_amounts(
+pub(crate) fn swap_input_rgb_amounts(
     wallet: &Wallet,
     inputs: &HashSet<BdkOutPoint>,
 ) -> Result<BTreeMap<ContractId, u64>, Error> {
