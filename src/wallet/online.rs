@@ -5514,6 +5514,27 @@ pub(crate) fn swap_ensure_inputs_confirmed(
     Ok(())
 }
 
+/// Refuse swap inputs the indexer doesn't report as unspent (mempool included): signing over a
+/// spent input wastes the swap, as the transaction can never be mined.
+pub(crate) fn swap_ensure_inputs_unspent(
+    wallet: &Wallet,
+    inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    for input in inputs {
+        let script = swap_parse_script(&input.script_pubkey_hex)?;
+        if !wallet
+            .indexer()
+            .is_txo_unspent(&swap_input_to_outpoint(input), &script)?
+        {
+            return Err(swap_invalid(format!(
+                "swap input {} is already spent or does not exist",
+                input.outpoint
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn swap_accept_transfer_from_file(
     wallet: &mut Wallet,
     txn: &DbTxn,
