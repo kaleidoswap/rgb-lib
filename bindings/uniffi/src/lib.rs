@@ -19,8 +19,9 @@ use rgb_lib::{
         InflateBeginResult, InflateDetails, InitOperationResult, Invoice as RgbLibInvoice,
         InvoiceData as RgbLibInvoiceData, Media, Metadata, MultisigKeys, MultisigOnlineOptions,
         MultisigVotingStatus as RgbLibMultisigVotingStatus, MultisigWallet as RgbLibMultisigWallet,
-        OnchainSwapAssetHistory, OnchainSwapCompletion, OnchainSwapConsignment, OnchainSwapInput,
-        OnchainSwapLeg, OnchainSwapLegKind, OnchainSwapOffer, OnchainSwapProposal,
+        OnchainSwapAssetHistory, OnchainSwapCompletion, OnchainSwapConsignment,
+        OnchainSwapExtraOutput, OnchainSwapInput, OnchainSwapLeg, OnchainSwapLegKind,
+        OnchainSwapOffer, OnchainSwapProposal,
         OnchainSwapReceiveResult as RgbLibOnchainSwapReceiveResult, OnchainSwapRequest,
         OnchainSwapRole, Online, OnlineOptions, Operation as RgbLibOperation,
         OperationInfo as RgbLibOperationInfo, OperationResult, Outpoint, PendingVanillaTx,
@@ -1470,8 +1471,7 @@ impl Wallet {
         network_fee_sat: u64,
         expiration_timestamp: Option<u64>,
         proxy_url: Option<String>,
-        platform_fee_sat: u64,
-        fee_recipient: Option<String>,
+        extra_outputs: Vec<OnchainSwapExtraOutput>,
     ) -> Result<OnchainSwapOffer, RgbLibError> {
         self._get_wallet().create_swap_offer(
             maker_gives,
@@ -1479,8 +1479,7 @@ impl Wallet {
             network_fee_sat,
             expiration_timestamp,
             proxy_url,
-            platform_fee_sat,
-            fee_recipient,
+            extra_outputs,
         )
     }
 

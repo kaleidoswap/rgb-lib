@@ -61,8 +61,7 @@ fn swap_offer_requires_proxy_url() {
         SWAP_FEE,
         None,
         None,
-        0,
-        None,
+        vec![],
     );
 
     assert!(matches!(
@@ -144,8 +143,7 @@ fn swap_refuses_counterparty_inputs_that_belong_to_this_wallet() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let request = taker
@@ -203,8 +201,7 @@ fn taker_refuses_undeclared_own_coins_as_maker_inputs() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let request = taker
@@ -326,7 +323,7 @@ fn refresh_after_swap_settles_transfers_without_panicking() {
 
 #[test]
 #[parallel]
-fn taker_pays_platform_fee() {
+fn taker_funded_extra_output() {
     initialize();
 
     const PLATFORM_FEE: u64 = 500;
@@ -347,7 +344,7 @@ fn taker_pays_platform_fee() {
     let fee_btc_before = total_btc(&mut fee_wallet, fee_online);
     let fee_recipient = fee_wallet.get_address().unwrap();
 
-    execute_swap_with_fee(
+    execute_swap_with_extra_outputs(
         &mut maker,
         maker_online,
         &mut taker,
@@ -355,11 +352,14 @@ fn taker_pays_platform_fee() {
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
         PROXY_URL,
-        PLATFORM_FEE,
-        Some(fee_recipient),
+        vec![OnchainSwapExtraOutput {
+            address: fee_recipient,
+            amount_sat: PLATFORM_FEE,
+            funded_by: OnchainSwapRole::Taker,
+        }],
     );
 
-    assert_btc_delta_with_platform_fee(
+    assert_btc_delta_with_extra_outputs(
         &mut maker,
         maker_online,
         maker_btc_before,
@@ -385,7 +385,7 @@ fn taker_pays_platform_fee() {
     assert_eq!(
         fee_btc_after as i64 - fee_btc_before as i64,
         PLATFORM_FEE as i64,
-        "fee recipient should have received exactly the platform fee"
+        "the extra output recipient should have received exactly its amount"
     );
 }
 
@@ -655,8 +655,7 @@ fn maker_rejects_request_with_mutated_offer() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let mut request = taker
@@ -693,8 +692,7 @@ fn taker_rejects_proposal_with_mutated_request() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let request = taker
@@ -734,8 +732,7 @@ fn maker_rejects_tampered_rgb_consignment_before_signing_btc() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let request = taker
@@ -879,8 +876,7 @@ fn default_utxo_btc_for_rgb_balances() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let uncolored = taker
@@ -1140,8 +1136,7 @@ fn default_utxo_full_sale_returns_btc_change_to_vanilla() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let request = taker
@@ -1238,8 +1233,7 @@ fn default_utxo_partial_sale_colors_change_with_smallest_top_up() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let request = taker
@@ -1338,8 +1332,7 @@ fn swap_top_up_skips_reserved_coins() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let result = taker.accept_swap_offer(taker_online, offer.clone(), 0, false, vec![]);
@@ -1414,8 +1407,7 @@ fn swap_btc_leg_skips_reserved_coins() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let result = taker.accept_swap_offer(taker_online, offer.clone(), 0, false, vec![]);
@@ -1570,8 +1562,7 @@ fn cancel_before_broadcast_leaves_state_unchanged() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let swap_id = offer.swap_id.clone();
@@ -1662,8 +1653,7 @@ fn expired_unbroadcast_swap_is_cancelled() {
             SWAP_FEE,
             Some(expiration as u64),
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let swap_id = offer.swap_id.clone();
@@ -1747,8 +1737,7 @@ fn exclude_outpoints_and_list_swaps() {
             SWAP_FEE,
             Some(now().unix_timestamp() as u64 + 3600),
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let swap_id = offer.swap_id.clone();
@@ -1835,8 +1824,7 @@ fn exclude_outpoints_and_list_swaps() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     maker
@@ -1929,8 +1917,7 @@ fn swap_to_completion(
             SWAP_FEE,
             expiration,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let request = taker
@@ -2055,8 +2042,7 @@ fn maker_refuses_request_with_spent_taker_input(indexer_url: Option<String>, esp
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let request = taker
@@ -2087,8 +2073,7 @@ fn taker_refuses_proposal_with_spent_maker_input(indexer_url: Option<String>, es
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let request = taker
@@ -2142,8 +2127,7 @@ fn refused_proposal_is_swept_on_expiry() {
             SWAP_FEE,
             Some(expiration as u64),
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let swap_id = offer.swap_id.clone();
@@ -2250,8 +2234,7 @@ fn maker_refuses_request_with_wrong_taker_amount(indexer_url: Option<String>) {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let request = taker
@@ -2902,8 +2885,7 @@ fn invalidate_swap_rejects_invalid_calls() {
             SWAP_FEE,
             None,
             Some(PROXY_URL.to_string()),
-            0,
-            None,
+            vec![],
         )
         .unwrap();
     let swap_id = offer.swap_id.clone();
@@ -3107,7 +3089,7 @@ fn execute_swap(
     maker_receives: OnchainSwapLeg,
     proxy_url: &str,
 ) {
-    execute_swap_with_fee(
+    execute_swap_with_extra_outputs(
         maker,
         maker_online,
         taker,
@@ -3115,13 +3097,12 @@ fn execute_swap(
         maker_gives,
         maker_receives,
         proxy_url,
-        0,
-        None,
+        vec![],
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_swap_with_fee(
+fn execute_swap_with_extra_outputs(
     maker: &mut Wallet,
     maker_online: Online,
     taker: &mut Wallet,
@@ -3129,8 +3110,7 @@ fn execute_swap_with_fee(
     maker_gives: OnchainSwapLeg,
     maker_receives: OnchainSwapLeg,
     proxy_url: &str,
-    platform_fee_sat: u64,
-    fee_recipient: Option<String>,
+    extra_outputs: Vec<OnchainSwapExtraOutput>,
 ) {
     let maker_receives_rgb = matches!(maker_receives.kind, OnchainSwapLegKind::Rgb);
     let taker_receives_rgb = matches!(maker_gives.kind, OnchainSwapLegKind::Rgb);
@@ -3145,8 +3125,7 @@ fn execute_swap_with_fee(
             SWAP_FEE,
             None,
             Some(proxy_url.to_string()),
-            platform_fee_sat,
-            fee_recipient,
+            extra_outputs,
         )
         .unwrap();
     let request = taker
@@ -3436,7 +3415,7 @@ fn assert_btc_delta(
     taker_before: u64,
     expected: ExpectedBtcDelta,
 ) {
-    assert_btc_delta_with_platform_fee(
+    assert_btc_delta_with_extra_outputs(
         maker,
         maker_online,
         maker_before,
@@ -3449,7 +3428,7 @@ fn assert_btc_delta(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn assert_btc_delta_with_platform_fee(
+fn assert_btc_delta_with_extra_outputs(
     maker: &mut Wallet,
     maker_online: Online,
     maker_before: u64,
@@ -3457,7 +3436,7 @@ fn assert_btc_delta_with_platform_fee(
     taker_online: Online,
     taker_before: u64,
     expected: ExpectedBtcDelta,
-    platform_fee_sat: u64,
+    extra_outputs_sat: u64,
 ) {
     let maker_after = total_btc(maker, maker_online);
     let taker_after = total_btc(taker, taker_online);
@@ -3472,9 +3451,9 @@ fn assert_btc_delta_with_platform_fee(
         "taker BTC delta mismatch"
     );
     assert_eq!(
-        maker_after + taker_after + SWAP_FEE + platform_fee_sat,
+        maker_after + taker_after + SWAP_FEE + extra_outputs_sat,
         maker_before + taker_before,
-        "total BTC should only decrease by the swap fee and the platform fee"
+        "total BTC should only decrease by the swap fee and the extra outputs"
     );
 }
 
