@@ -1844,6 +1844,8 @@ impl Wallet {
         network_fee_sat: u64,
         expiration_timestamp: Option<u64>,
         proxy_url: Option<String>,
+        platform_fee_sat: u64,
+        fee_recipient: Option<String>,
     ) -> Result<OnchainSwapOffer, RgbLibError> {
         self._get_wallet().create_swap_offer(
             maker_gives,
@@ -1851,6 +1853,8 @@ impl Wallet {
             network_fee_sat,
             expiration_timestamp,
             proxy_url,
+            platform_fee_sat,
+            fee_recipient,
         )
     }
 

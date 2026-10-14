@@ -967,6 +967,8 @@ dictionary OnchainSwapOffer {
   string? maker_rgb_script_pubkey_hex;
   u64? maker_rgb_blinding;
   string? proxy_url;
+  u64 platform_fee_sat;
+  string? fee_recipient_script_pubkey_hex;
 };
 
 [Remote]
@@ -1311,7 +1313,8 @@ interface Wallet {
   [Throws=RgbLibError]
   OnchainSwapOffer create_swap_offer(
     OnchainSwapLeg maker_gives, OnchainSwapLeg maker_receives,
-    u64 network_fee_sat, u64? expiration_timestamp, string? proxy_url);
+    u64 network_fee_sat, u64? expiration_timestamp, string? proxy_url,
+    u64 platform_fee_sat, string? fee_recipient);
 
   [Throws=RgbLibError]
   OnchainSwapRequest accept_swap_offer(
