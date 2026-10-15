@@ -1,9 +1,9 @@
 use super::*;
 
 use crate::wallet::test::utils::vss::{
-    VSS_KEY_CHUNK_PREFIX, VSS_KEY_FINGERPRINT, VSS_KEY_MANIFEST, VSS_KEY_METADATA,
-    VssBackupDeleteGuard, build_raw_vss_client, generate_signing_key_and_store_id, get_vss_key,
-    summarize_transfers, tokio_runtime, vss_key_exists, vss_server_url, write_random_file,
+    VSS_KEY_MANIFEST, VssBackupDeleteGuard, build_raw_vss_client,
+    generate_signing_key_and_store_id, get_vss_key, summarize_transfers, tokio_runtime,
+    vss_key_exists, vss_server_url, write_random_file,
 };
 
 use crate::wallet::vss::{
@@ -122,19 +122,19 @@ fn scenario_1_chunked_encrypted_backup_upload_and_restore() {
     );
 
     assert!(
-        rt.block_on(vss_key_exists(&raw, &store_id, VSS_KEY_FINGERPRINT))
+        rt.block_on(vss_key_exists(&raw, &store_id, &manifest.fingerprint_key()))
             .expect("fingerprint key check"),
         "expected fingerprint key"
     );
     assert!(
-        rt.block_on(vss_key_exists(&raw, &store_id, VSS_KEY_METADATA))
+        rt.block_on(vss_key_exists(&raw, &store_id, &manifest.metadata_key()))
             .expect("metadata key check"),
         "expected metadata key for encrypted backup"
     );
 
     // Each chunk key should exist (allow brief eventual consistency).
     for i in 0..manifest.chunk_count {
-        let key = format!("{VSS_KEY_CHUNK_PREFIX}{i}");
+        let key = manifest.chunk_key(i);
         let mut ok = false;
         for _ in 0..30 {
             if rt

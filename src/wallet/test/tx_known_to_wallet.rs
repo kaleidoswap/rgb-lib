@@ -1,7 +1,9 @@
 use super::*;
 
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 use std::str::FromStr;
 
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 use bdk_wallet::bitcoin::Txid;
 
 // `tx_known_to_wallet` underpins the idempotent multisig SendEnd: an operation
