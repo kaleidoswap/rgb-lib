@@ -182,6 +182,7 @@ pub struct ColoringInfo {
 
 /// Status of a file-backed HTLC coloring operation.
 pub enum PsbtOperationStatus {
+    Staged,
     Prepared,
     Applied,
     Failed,
@@ -191,6 +192,7 @@ pub enum PsbtOperationStatus {
 impl From<rgb_lib::wallet::rust_only::PsbtOperationStatus> for PsbtOperationStatus {
     fn from(s: rgb_lib::wallet::rust_only::PsbtOperationStatus) -> Self {
         match s {
+            rgb_lib::wallet::rust_only::PsbtOperationStatus::Staged => Self::Staged,
             rgb_lib::wallet::rust_only::PsbtOperationStatus::Prepared => Self::Prepared,
             rgb_lib::wallet::rust_only::PsbtOperationStatus::Applied => Self::Applied,
             rgb_lib::wallet::rust_only::PsbtOperationStatus::Failed => Self::Failed,
@@ -222,6 +224,13 @@ impl From<rgb_lib::wallet::rust_only::PsbtBroadcastState> for PsbtBroadcastState
 pub struct PsbtOpPrepareResult {
     pub operation_id: String,
     pub colored_psbt: String,
+    pub operation_dir: String,
+}
+
+/// Result of `psbt_op_stage`: opaque operation ID + staged PSBT + file-backed payload dir.
+pub struct PsbtOpStageResult {
+    pub operation_id: String,
+    pub staged_psbt: String,
     pub operation_dir: String,
 }
 
@@ -1326,6 +1335,58 @@ impl Wallet {
             min_confirmations,
             expiration_timestamp,
         )?;
+        Ok(PsbtOpPrepareResult {
+            operation_id: result.operation_id,
+            colored_psbt: result.colored_psbt,
+            operation_dir: result.operation_dir,
+        })
+    }
+
+    fn psbt_op_stage(
+        &self,
+        psbt: String,
+        coloring_info: ColoringInfo,
+        input_outpoints: Vec<Outpoint>,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<PsbtOpStageResult, RgbLibError> {
+        let mut psbt = Psbt::from_str(&psbt)?;
+        let coloring = to_rgb_coloring_info(coloring_info)?;
+        let input_outpoints = to_bitcoin_outpoints(input_outpoints)?;
+        let result = self._get_wallet().psbt_op_stage(
+            &mut psbt,
+            coloring,
+            input_outpoints,
+            min_confirmations,
+            expiration_timestamp.into(),
+        )?;
+        Ok(PsbtOpStageResult {
+            operation_id: result.operation_id,
+            staged_psbt: result.staged_psbt,
+            operation_dir: result.operation_dir,
+        })
+    }
+
+    fn psbt_op_finalize(
+        &self,
+        psbt: String,
+        static_entropy: Option<u64>,
+    ) -> Result<String, RgbLibError> {
+        let mut psbt = Psbt::from_str(&psbt)?;
+        self._get_wallet()
+            .psbt_op_finalize(&mut psbt, static_entropy)?;
+        Ok(psbt.to_string())
+    }
+
+    fn psbt_op_complete(
+        &self,
+        operation_id: String,
+        finalized_psbt: String,
+    ) -> Result<PsbtOpPrepareResult, RgbLibError> {
+        let finalized_psbt = Psbt::from_str(&finalized_psbt)?;
+        let result = self
+            ._get_wallet()
+            .psbt_op_complete(&operation_id, &finalized_psbt)?;
         Ok(PsbtOpPrepareResult {
             operation_id: result.operation_id,
             colored_psbt: result.colored_psbt,
