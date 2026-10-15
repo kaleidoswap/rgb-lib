@@ -172,10 +172,9 @@ fn consistency_check_fail_bitcoins() {
         .bdk_wallet_mut()
         .apply_update(update)
         .unwrap();
-    {
-        let (bdk_wallet, bdk_database) = party_empty.wallet.bdk_wallet_db_mut();
-        bdk_wallet.persist(bdk_database).unwrap();
-    }
+    let txn = party_empty.wallet.database().begin_transaction().unwrap();
+    party_empty.wallet.persist_bdk(&txn).unwrap();
+    txn.commit().unwrap();
     let mut rcv_party = get_funded_party!();
     party_empty.drain_to(&rcv_party.get_address());
 
@@ -264,10 +263,9 @@ fn consistency_check_fail_utxos() {
         .bdk_wallet_mut()
         .apply_update(update)
         .unwrap();
-    {
-        let (bdk_wallet, bdk_database) = party_empty.wallet.bdk_wallet_db_mut();
-        bdk_wallet.persist(bdk_database).unwrap();
-    }
+    let txn = party_empty.wallet.database().begin_transaction().unwrap();
+    party_empty.wallet.persist_bdk(&txn).unwrap();
+    txn.commit().unwrap();
     let mut rcv_party = get_funded_party!();
     party_empty.drain_to(&rcv_party.get_address());
 
