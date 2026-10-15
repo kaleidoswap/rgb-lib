@@ -3463,6 +3463,44 @@ pub(crate) fn swap_restore_input_metadata(
     Ok(())
 }
 
+/// After signing, make sure this wallet added signatures only to the inputs it declared. A
+/// counterparty that smuggles one of this wallet's coins into the PSBT as its own input would
+/// otherwise have it spent. Signatures the counterparty already put on its own inputs stay.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_ensure_only_own_inputs_signed(
+    before: &Psbt,
+    after: &Psbt,
+    own_inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    let own = own_inputs
+        .iter()
+        .map(swap_input_to_outpoint)
+        .collect::<HashSet<_>>();
+    for ((txin, was), now) in after
+        .unsigned_tx
+        .input
+        .iter()
+        .zip(before.inputs.iter())
+        .zip(after.inputs.iter())
+    {
+        if own.contains(&txin.previous_output) {
+            continue;
+        }
+        if was.partial_sigs != now.partial_sigs
+            || was.final_script_sig != now.final_script_sig
+            || was.final_script_witness != now.final_script_witness
+            || was.tap_key_sig != now.tap_key_sig
+            || was.tap_script_sigs != now.tap_script_sigs
+        {
+            return Err(swap_invalid(format!(
+                "signing the swap PSBT would sign {}, which is not one of this wallet's inputs",
+                txin.previous_output
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn swap_validate_proposal_psbt(
     proposal: &OnchainSwapProposal,
@@ -3971,6 +4009,41 @@ mod swap_unit_tests {
         assert!(swap_validate_proxy_url(&Some("rpc://127.0.0.1:3000".to_string())).is_ok());
         assert!(swap_validate_proxy_url(&None).is_err());
         assert!(swap_validate_proxy_url(&Some("ws://127.0.0.1:3000".to_string())).is_err());
+    }
+
+    #[test]
+    fn only_the_declared_inputs_may_be_signed() {
+        let proposal = rgb_rgb_proposal();
+        let (unsigned, _, _) = swap_build_psbt(&proposal).unwrap();
+        let own = proposal.request.taker_inputs.clone();
+        let own_outpoint = swap_input_to_outpoint(&own[0]);
+        let own_idx = unsigned
+            .unsigned_tx
+            .input
+            .iter()
+            .position(|i| i.previous_output == own_outpoint)
+            .unwrap();
+        let other_idx = 1 - own_idx;
+
+        // nothing signed: fine
+        swap_ensure_only_own_inputs_signed(&unsigned, &unsigned, &own).unwrap();
+        // a signature on a declared input: fine
+        let mut signed = unsigned.clone();
+        signed.inputs[own_idx].final_script_witness = Some(Witness::new());
+        swap_ensure_only_own_inputs_signed(&unsigned, &signed, &own).unwrap();
+        // a signature the counterparty put on its own input before: fine, it is not ours
+        let mut counterparty_signed = unsigned.clone();
+        counterparty_signed.inputs[other_idx].final_script_witness = Some(Witness::new());
+        let mut both = counterparty_signed.clone();
+        both.inputs[own_idx].final_script_witness = Some(Witness::new());
+        swap_ensure_only_own_inputs_signed(&counterparty_signed, &both, &own).unwrap();
+        // a signature that appears on the counterparty's input while signing: refused
+        signed.inputs[other_idx].final_script_witness = Some(Witness::new());
+        let err = swap_ensure_only_own_inputs_signed(&unsigned, &signed, &own).unwrap_err();
+        assert!(
+            err.to_string().contains("not one of this wallet's inputs"),
+            "{err}"
+        );
     }
 
     #[test]
