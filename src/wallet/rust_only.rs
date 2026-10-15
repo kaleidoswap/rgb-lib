@@ -1219,14 +1219,29 @@ impl Wallet {
     /// still allowing the wallet to consume the RGB transition data.
     pub(crate) fn fascia_from_finalized_psbt(&self, psbt: &Psbt) -> Result<Fascia, Error> {
         let bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
+        // `rgb_commit` commits the MPC messages in the first OP_RETURN, which need not be vout 0.
+        // Its opret host flag is removed on commit, and any other output has an empty (not
+        // missing) message map, so look the output up by its script and check its commitment.
+        let opret_idx = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .position(|o| o.script_pubkey.is_op_return())
+            .ok_or_else(|| Error::InvalidColoringInfo {
+                details: s!("PSBT has no OP_RETURN output hosting the RGB commitment"),
+            })?;
         let output = psbt
             .outputs
-            .iter()
-            .find(|output| output.mpc_message_map().is_ok())
+            .get(opret_idx)
             .ok_or_else(|| Error::InvalidColoringInfo {
-                details: s!("PSBT has no RGB MPC message host"),
+                details: s!("PSBT has no map for its OP_RETURN output"),
             })?;
         let messages = output.mpc_message_map().map_err(InternalError::from)?;
+        if messages.is_empty() {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("PSBT OP_RETURN output carries no RGB MPC messages"),
+            });
+        }
         let min_depth = output
             .mpc_min_tree_depth()
             .map(u5::with)
@@ -1240,6 +1255,12 @@ impl Wallet {
             mpc::MerkleTree::try_commit(&source).map_err(|e| Error::InvalidColoringInfo {
                 details: format!("failed to reconstruct RGB MPC proof: {e}"),
             })?;
+        let expected_script = ScriptBuf::new_op_return(merkle_tree.commit_id().to_byte_array());
+        if psbt.unsigned_tx.output[opret_idx].script_pubkey != expected_script {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("PSBT OP_RETURN output does not carry its RGB MPC commitment"),
+            });
+        }
         let merkle_block = mpc::MerkleBlock::from(merkle_tree);
         let bundles = Confined::try_from(bundles).map_err(|_| Error::InvalidColoringInfo {
             details: s!("PSBT has no RGB bundles"),
