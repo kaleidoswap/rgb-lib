@@ -639,6 +639,16 @@ fn psbt_op_check_finalized_tx(
     Ok(opret_idx)
 }
 
+/// Whether an output of `psbt` already carries MPC messages, i.e. the RGB commitment was
+/// finalized. `mpc_message_map` returns an empty map for outputs without any, so `is_ok` alone
+/// is true for every PSBT.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn psbt_rgb_commitment_finalized(psbt: &Psbt) -> bool {
+    psbt.outputs
+        .iter()
+        .any(|o| o.mpc_message_map().is_ok_and(|m| !m.is_empty()))
+}
+
 /// Rebuild the MPC tree committed by the OP_RETURN at `opret_idx` of `psbt` and check the output
 /// script carries exactly that commitment and that every `expected` message is in the tree.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -2856,7 +2866,7 @@ impl Wallet {
             });
         }
         // checked before anything touches the caller's PSBT
-        if psbt.outputs.iter().any(|o| o.mpc_message_map().is_ok()) {
+        if psbt_rgb_commitment_finalized(psbt) {
             return Err(Error::InvalidColoringInfo {
                 details: s!("the PSBT's RGB commitment is already finalized"),
             });
@@ -2996,7 +3006,7 @@ impl Wallet {
                 ),
             });
         }
-        if psbt.outputs.iter().any(|o| o.mpc_message_map().is_ok()) {
+        if psbt_rgb_commitment_finalized(psbt) {
             return Err(Error::InvalidColoringInfo {
                 details: s!("the PSBT's RGB commitment is already finalized"),
             });
@@ -5133,6 +5143,19 @@ mod tests {
         }
         OpretProof::dbc_commit(&mut psbt).unwrap();
         psbt
+    }
+
+    #[test]
+    fn only_a_committed_psbt_counts_as_finalized() {
+        // outputs without MPC messages still give an (empty) message map
+        let unfinalized = Psbt::from_unsigned_tx(staged_tx()).unwrap();
+        assert!(unfinalized.outputs[0].mpc_message_map().is_ok());
+        assert!(!psbt_rgb_commitment_finalized(&unfinalized));
+        let finalized = committed_psbt(&[(
+            mpc::ProtocolId::from([1u8; 32]),
+            mpc::Message::from([2u8; 32]),
+        )]);
+        assert!(psbt_rgb_commitment_finalized(&finalized));
     }
 
     #[test]
