@@ -2624,7 +2624,8 @@ mod tests {
         let script = wallet
             .peek_address(KeychainKind::External, 0)
             .script_pubkey();
-        let recipient_id = recipient_id_from_script_buf(script.clone(), BitcoinNetwork::Regtest).unwrap();
+        let recipient_id =
+            recipient_id_from_script_buf(script.clone(), BitcoinNetwork::Regtest).unwrap();
         let script_hex = script_hex_from_recipient_id(recipient_id).unwrap().unwrap();
         assert_eq!(script_hex, script.to_hex_string());
     }
