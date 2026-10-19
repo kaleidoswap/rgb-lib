@@ -1618,7 +1618,7 @@ impl Wallet {
         )?;
         swap_save_state(self.wallet_dir(), &offer.swap_id, SWAP_OFFER_FILE, &offer)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Create swap offer completed");
         Ok(offer)
     }
@@ -1719,7 +1719,7 @@ impl Wallet {
             &request,
         )?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Accept swap offer completed");
         Ok(request)
     }
@@ -1858,7 +1858,7 @@ impl Wallet {
             &proposal,
         )?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Accept swap request completed");
         Ok(proposal)
     }
@@ -2010,7 +2010,7 @@ impl Wallet {
             taker_history,
         };
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Complete swap proposal completed");
         Ok(completion)
     }
@@ -2076,7 +2076,7 @@ impl Wallet {
                     ..completion
                 };
                 self.update_backup_info(&txn, false)?;
-                txn.commit()?;
+                self.persist_and_commit(txn)?;
                 info!(self.logger(), "Process swap completion completed");
                 Ok(completion)
             }
@@ -2113,7 +2113,7 @@ impl Wallet {
                     ..completion
                 };
                 self.update_backup_info(&txn, false)?;
-                txn.commit()?;
+                self.persist_and_commit(txn)?;
                 info!(self.logger(), "Process swap completion completed");
                 Ok(completion)
             }
@@ -2200,7 +2200,7 @@ impl Wallet {
                     ..completion
                 };
                 self.update_backup_info(&txn, false)?;
-                txn.commit()?;
+                self.persist_and_commit(txn)?;
                 info!(self.logger(), "Process swap completion completed");
                 Ok(completion)
             }
@@ -2279,7 +2279,7 @@ impl Wallet {
             Err(e) => return Err(e),
         };
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         let txid = tx.compute_txid().to_string();
         if self.indexer().get_tx_confirmations(&txid)?.is_some() {
             self.swap_apply_outgoing(online, &offer.swap_id, &txid)?;
@@ -2551,7 +2551,7 @@ impl Wallet {
                 assignments: vec![],
             };
             self.update_backup_info(&txn, false)?;
-            txn.commit()?;
+            self.persist_and_commit(txn)?;
             swap_save_state(
                 self.wallet_dir(),
                 &offer.swap_id,
@@ -2590,7 +2590,7 @@ impl Wallet {
         }
         let result = OnchainSwapReceiveResult { assignments };
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         swap_save_state(
             self.wallet_dir(),
             &offer.swap_id,
