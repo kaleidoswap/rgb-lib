@@ -3,8 +3,12 @@
 //! This module defines additional utility methods that are not exposed via FFI.
 //!
 //! It also includes the submarine / HTLC helpers (`color_psbt_for_outpoints*`,
-//! `psbt_op_prepare` / `psbt_op_apply` / `psbt_op_abort` / `psbt_op_reconcile`) that operate on
-//! escrow outpoints without treating them as wallet UTXOs.
+//! `psbt_op_prepare` / `psbt_op_apply` / `psbt_op_abort` / `psbt_op_reconcile`,
+//! `fetch_and_accept_transfer_by_recipient_id`, `contract_assignments_for_outpoints`) that
+//! operate on escrow outpoints without treating them as wallet UTXOs. Of these, UniFFI exports
+//! the `psbt_op_*` methods, [`Wallet::fetch_and_accept_transfer_by_recipient_id`] and
+//! [`Wallet::contract_assignments_for_outpoints`]; the low-level `color_psbt_*` /
+//! `consume_transfer_fascia` and the unchecked fetch/accept halves stay Rust-only.
 
 use super::*;
 
@@ -202,6 +206,21 @@ pub struct PsbtOperation {
     pub txid: String,
 }
 
+/// Caller intent for HTLC / special accept paths.
+///
+/// Acceptance rejects consignments that do not match these fields, including an empty
+/// assignment result for the witness seal.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedTransfer {
+    /// Expected contract / asset ID
+    pub asset_id: String,
+    /// Expected RGB schema
+    pub asset_schema: AssetSchema,
+    /// Expected assignment type and amount (`Any` is rejected)
+    pub assignment: Assignment,
+}
+
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PsbtOpPayloadHashes {
@@ -279,6 +298,101 @@ fn psbt_has_input_signatures(psbt: &Psbt) -> bool {
             || input.final_script_sig.is_some()
             || input.final_script_witness.is_some()
     })
+}
+
+/// Pin a witness UTXO to `witness_recipient_id` by checking that `output[vout]`'s
+/// script matches the recipient ID, and that the witness meets `min_confirmations`.
+///
+/// Errors (actionable for HTLC callers):
+/// - [`Error::InvalidRecipientID`]: blinded ID (no script to pin)
+/// - [`Error::InvalidRecipientNetwork`]: recipient ID network ≠ wallet chain
+/// - [`Error::WitnessOutputMismatch`]: wrong script / bad vout / Ignored|Archived
+/// - [`Error::InsufficientConfirmations`]: Tentative or too few confs (retry/wait)
+///
+/// Confirmation policy:
+/// - `0`: allow a mempool-only / [`WitnessOrd::Tentative`] witness. Intentional for HTLC
+///   claim/refund paths that must race on first sight of the witness; the caller accepts
+///   reorg/RBF exposure.
+/// - `>= 1`: require [`WitnessOrd::Mined`] and at least that many confirmations, derived as
+///   `tip_height - mined_height + 1` (same tip query as the indexer height API). Avoids a second
+///   `get_tx_confirmations` round trip that can disagree with `resolve_witness` across a block
+///   boundary.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn pin_witness_output_to_recipient_id(
+    resolver: &AnyResolver,
+    indexer: &Indexer,
+    chain_net: ChainNet,
+    witness_recipient_id: &str,
+    txid: &str,
+    vout: u32,
+    min_confirmations: u8,
+) -> Result<(), Error> {
+    let xchainnet_beneficiary = XChainNet::<Beneficiary>::from_str(witness_recipient_id)
+        .map_err(|_| Error::InvalidRecipientID)?;
+    if xchainnet_beneficiary.chain_network() != chain_net {
+        return Err(Error::InvalidRecipientNetwork);
+    }
+    let expected_script = match xchainnet_beneficiary.into_inner() {
+        Beneficiary::WitnessVout(pay_2_vout, _) => pay_2_vout.to_script(),
+        Beneficiary::BlindedSeal(_) => return Err(Error::InvalidRecipientID),
+    };
+    let witness_id = RgbTxid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
+    let status = resolver
+        .resolve_witness(witness_id)
+        .map_err(|e| Error::Network {
+            details: e.to_string(),
+        })?;
+    let (tx, witness_ord) = match status {
+        WitnessStatus::Resolved(tx, ord) => (tx, ord),
+        _ => {
+            return Err(Error::Network {
+                details: s!("witness transaction not found on indexer"),
+            });
+        }
+    };
+    let Some(output) = tx.output.get(vout as usize) else {
+        return Err(Error::WitnessOutputMismatch {
+            details: format!("witness vout {vout} out of range for transaction"),
+        });
+    };
+    if output.script_pubkey != expected_script {
+        return Err(Error::WitnessOutputMismatch {
+            details: s!("witness output script does not match witness_recipient_id"),
+        });
+    }
+
+    match witness_ord {
+        WitnessOrd::Ignored | WitnessOrd::Archived => {
+            return Err(Error::WitnessOutputMismatch {
+                details: format!(
+                    "witness TX {txid} has non-spendable WitnessOrd status ({witness_ord})"
+                ),
+            });
+        }
+        WitnessOrd::Tentative | WitnessOrd::Mined(_) => {}
+    }
+
+    if min_confirmations == 0 {
+        return Ok(());
+    }
+
+    let WitnessOrd::Mined(pos) = witness_ord else {
+        return Err(Error::InsufficientConfirmations {
+            needed: min_confirmations,
+            got: 0,
+        });
+    };
+
+    let tip_height = indexer.get_latest_block_height()?;
+    let tx_height = pos.height().get();
+    let confirmations = u64::from(tip_height.saturating_sub(tx_height)) + 1;
+    if confirmations < min_confirmations as u64 {
+        return Err(Error::InsufficientConfirmations {
+            needed: min_confirmations,
+            got: confirmations,
+        });
+    }
+    Ok(())
 }
 
 fn rebuild_psbt_preserving_maps(
@@ -724,6 +838,9 @@ impl Wallet {
     /// Returns the consignment, the received assignments and the hex-encoded digests of the media
     /// attachments defined in the consignment.
     ///
+    /// Fails with [`Error::UnsafeTransferHistory`] when the consignment history is not yet safe
+    /// from reorgs, since the transfer is accepted straight into the RGB stash.
+    ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -743,70 +860,58 @@ impl Wallet {
                 file_path: consignment_path.to_string_lossy().to_string(),
             })?;
 
-        let schema_id = consignment.schema_id().to_string();
-        let asset_schema: AssetSchema = schema_id.try_into()?;
-        self.check_schema_support(&asset_schema)?;
-        debug!(
-            self.logger(),
-            "Got consignment for asset with {} schema", asset_schema
-        );
+        self.accept_transfer_with_consignment(consignment, witness_id, vout, blinding, None)
+    }
 
-        let mut runtime = self.rgb_runtime()?;
+    /// Inspect arbitrary outpoints for assignments of a given contract.
+    ///
+    /// Results are returned in the same order as `outpoints`, including duplicate entries.
+    /// Fails with [`Error::AssetNotFound`] if the contract is not known to the wallet.
+    ///
+    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+    pub fn contract_assignments_for_outpoints(
+        &self,
+        contract_id: ContractId,
+        outpoints: Vec<Outpoint>,
+    ) -> Result<Vec<(Outpoint, Vec<Assignment>)>, Error> {
+        let parsed: Vec<(Outpoint, OutPoint)> = outpoints
+            .into_iter()
+            .map(|outpoint| {
+                let vout = outpoint.vout;
+                let txid = crate::bitcoin::Txid::from_str(&outpoint.txid)
+                    .map_err(|_| Error::InvalidTxid)?;
+                Ok((outpoint, OutPoint { txid, vout }))
+            })
+            .collect::<Result<_, Error>>()?;
 
-        let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
-        runtime.store_secret_seal(graph_seal)?;
+        let runtime = self.rgb_runtime()?;
+        runtime.genesis(contract_id)?;
+        let state = runtime
+            .contract_assignments_for(contract_id, parsed.iter().map(|(_, outpoint)| *outpoint))?;
 
-        let resolver = OffchainResolver {
-            witness_id,
-            consignment: &consignment,
-            fallback: self.blockchain_resolver(),
-        };
-
-        debug!(self.logger(), "Validating consignment...");
-        let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-        let trusted_typesystem = asset_schema.types();
-        let validation_config = ValidationConfig {
-            chain_net: self.chain_net(),
-            trusted_typesystem,
-            ..Default::default()
-        };
-        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
-            Ok(consignment) => consignment,
-            Err(ValidationError::InvalidConsignment(e)) => {
-                error!(self.logger(), "Consignment is invalid: {}", e);
-                return Err(Error::InvalidConsignment);
+        let mut by_outpoint: HashMap<OutPoint, Vec<Assignment>> = HashMap::new();
+        for (seal, opout_state_map) in state {
+            let btc_outpoint = OutPoint {
+                txid: crate::bitcoin::Txid::from_str(&seal.txid.to_string()).map_err(|_| {
+                    Error::Internal {
+                        details: s!("invalid seal txid in contract assignments"),
+                    }
+                })?,
+                vout: seal.vout.into_u32(),
+            };
+            let assignments = by_outpoint.entry(btc_outpoint).or_default();
+            for (opout, state) in opout_state_map {
+                assignments.push(Assignment::from_opout_and_state(opout, &state));
             }
-            Err(ValidationError::ResolverError(e)) => {
-                warn!(self.logger(), "Network error during consignment validation");
-                return Err(Error::Network {
-                    details: e.to_string(),
-                });
-            }
-        };
-        let validity = valid_consignment.validation_status().validity();
-        debug!(self.logger(), "Consignment validity: {:?}", validity);
+        }
 
-        let valid_contract = valid_consignment.clone().into_valid_contract();
-        let media_digests = self
-            .extract_attachments(&valid_contract, asset_schema)
-            .iter()
-            .map(|a| hex::encode(a.digest))
-            .collect::<HashSet<_>>();
-        runtime
-            .import_contract(valid_contract, self.blockchain_resolver())
-            .expect("failure importing validated contract");
-
-        let received_rgb_assignments =
-            self.extract_received_assignments(&consignment, witness_id, Some(vout), None);
-
-        runtime.accept_transfer(valid_consignment, &resolver)?;
-
-        info!(self.logger(), "Accept transfer completed");
-        Ok((
-            consignment,
-            received_rgb_assignments.into_values().collect(),
-            media_digests,
-        ))
+        Ok(parsed
+            .into_iter()
+            .map(|(outpoint, btc_outpoint)| {
+                let assignments = by_outpoint.get(&btc_outpoint).cloned().unwrap_or_default();
+                (outpoint, assignments)
+            })
+            .collect())
     }
 
     /// Consume an RGB fascia.
@@ -2744,6 +2849,269 @@ impl Wallet {
             }
         }
         Ok(meta.status)
+    }
+
+    /// Fetch an RGB consignment by recipient_id (proxy lookup key).
+    ///
+    /// **Unchecked:** the returned `txid` and `vout` come from the proxy and are **not**
+    /// validated here. Prefer [`Self::fetch_and_accept_transfer_by_recipient_id`], which pins
+    /// the witness output before accept. If you must use this with
+    /// [`Self::accept_transfer_from_consignment_unchecked`], pin first: for witness recipient
+    /// IDs, assert `output[vout].script_pubkey == script_buf_from_recipient_id(recipient_id)`.
+    /// A malicious proxy can otherwise steer acceptance to an attacker-chosen witness.
+    ///
+    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+    pub fn fetch_consignment_by_recipient_id_unchecked(
+        &self,
+        recipient_id: String,
+        consignment_endpoint: &str,
+    ) -> Result<(RgbTransfer, String, u32), Error> {
+        let proxy_url = TransportEndpoint::new(consignment_endpoint.to_string())?.endpoint;
+        let consignment_res = self.get_consignment(&proxy_url, recipient_id)?;
+        let vout = consignment_res.vout.ok_or_else(|| Error::Internal {
+            details: s!("missing vout in consignment response"),
+        })?;
+
+        let consignment_bytes = general_purpose::STANDARD
+            .decode(consignment_res.consignment)
+            .map_err(InternalError::from)?;
+        let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
+
+        Ok((consignment, consignment_res.txid, vout))
+    }
+
+    /// Fetch a consignment by proxy key, pin the witness output to `witness_recipient_id`, and
+    /// accept the transfer.
+    ///
+    /// `proxy_recipient_id` is the proxy lookup key (often the witness TXID). `witness_recipient_id`
+    /// must be a witness recipient ID (`bc:wvout:...`) whose script is checked against
+    /// `output[vout]` on the witness transaction before acceptance. Blinded recipient IDs cannot
+    /// be pinned here; use the Rust-only [`Self::fetch_consignment_by_recipient_id_unchecked`] /
+    /// [`Self::accept_transfer_from_consignment_unchecked`] pair with your own pin check.
+    ///
+    /// `expected` binds acceptance to the caller's intended contract, schema, assignment type, and
+    /// amount; mismatches and empty assignment results are rejected.
+    ///
+    /// `min_confirmations` controls whether an unconfirmed (mempool / Tentative) witness is
+    /// accepted: `0` allows it (reorg-exposed, useful for HTLC races); `>= 1` requires a mined
+    /// witness with at least that many confirmations (`tip - mined_height + 1`).
+    ///
+    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+    pub fn fetch_and_accept_transfer_by_recipient_id(
+        &mut self,
+        online: Online,
+        proxy_recipient_id: String,
+        witness_recipient_id: String,
+        consignment_endpoint: &str,
+        blinding: u64,
+        min_confirmations: u8,
+        expected: ExpectedTransfer,
+    ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
+        self.check_online(online)?;
+        let (consignment, txid, vout) = self.fetch_consignment_by_recipient_id_unchecked(
+            proxy_recipient_id,
+            consignment_endpoint,
+        )?;
+        pin_witness_output_to_recipient_id(
+            self.blockchain_resolver(),
+            self.indexer(),
+            self.chain_net(),
+            &witness_recipient_id,
+            &txid,
+            vout,
+            min_confirmations,
+        )?;
+        self.accept_transfer_from_consignment_unchecked(
+            online,
+            consignment,
+            txid,
+            vout,
+            blinding,
+            expected,
+        )
+    }
+
+    /// Accept an RGB transfer from a pre-fetched consignment.
+    ///
+    /// **Unchecked:** `txid` and `vout` define the witness anchor used for validation but are
+    /// not re-checked against a recipient ID or the blockchain. Prefer
+    /// [`Self::fetch_and_accept_transfer_by_recipient_id`]. If composing manually, pin first
+    /// (see [`Self::fetch_consignment_by_recipient_id_unchecked`]).
+    ///
+    /// `expected` must match the consignment contract, schema, and the single assignment revealed
+    /// for `(txid, vout, blinding)`; empty or mismatched assignments are rejected before the
+    /// transfer is accepted into the stash.
+    ///
+    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+    pub fn accept_transfer_from_consignment_unchecked(
+        &mut self,
+        online: Online,
+        consignment: RgbTransfer,
+        txid: String,
+        vout: u32,
+        blinding: u64,
+        expected: ExpectedTransfer,
+    ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
+        info!(self.logger(), "Accepting transfer...");
+        self.check_online(online)?;
+        let witness_id = RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;
+        let (consignment, assignments, _media_digests) = self.accept_transfer_with_consignment(
+            consignment,
+            witness_id,
+            vout,
+            blinding,
+            Some(expected),
+        )?;
+        Ok((consignment, assignments))
+    }
+
+    fn accept_transfer_with_consignment(
+        &mut self,
+        consignment: RgbTransfer,
+        witness_id: RgbTxid,
+        vout: u32,
+        blinding: u64,
+        expected: Option<ExpectedTransfer>,
+    ) -> Result<(RgbTransfer, Vec<Assignment>, HashSet<String>), Error> {
+        let schema_id = consignment.schema_id().to_string();
+        let asset_schema: AssetSchema = schema_id.try_into()?;
+        self.check_schema_support(&asset_schema)?;
+        debug!(
+            self.logger(),
+            "Got consignment for asset with {} schema", asset_schema
+        );
+
+        if let Some(ref expected) = expected {
+            Self::validate_expected_transfer_intent(&consignment, &asset_schema, expected)?;
+        }
+
+        let mut runtime = self.rgb_runtime()?;
+
+        let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
+        runtime.store_secret_seal(graph_seal)?;
+
+        let resolver = OffchainResolver {
+            witness_id,
+            consignment: &consignment,
+            fallback: self.blockchain_resolver(),
+        };
+
+        debug!(self.logger(), "Validating consignment...");
+        let trusted_typesystem = asset_schema.types();
+        let validation_config = ValidationConfig {
+            chain_net: self.chain_net(),
+            trusted_typesystem,
+            ..Default::default()
+        };
+        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
+            Ok(consignment) => consignment,
+            Err(ValidationError::InvalidConsignment(e)) => {
+                error!(self.logger(), "Consignment is invalid: {}", e);
+                return Err(Error::InvalidConsignment);
+            }
+            Err(ValidationError::ResolverError(e)) => {
+                warn!(self.logger(), "Network error during consignment validation");
+                return Err(Error::Network {
+                    details: e.to_string(),
+                });
+            }
+        };
+        let validation_status = valid_consignment.validation_status();
+        debug!(
+            self.logger(),
+            "Consignment validity: {:?}",
+            validation_status.validity()
+        );
+
+        // The send path parks such transfers in WaitingSafeHeight; this API accepts straight into
+        // the stash and has no batch to park, so refuse instead of accepting a reorgable history.
+        if validation_status.validity() == Validity::Warnings {
+            let unsafe_txids = Self::collect_unsafe_history_txids(
+                &validation_status.warnings,
+                &witness_id.to_string(),
+            );
+            if !unsafe_txids.is_empty() {
+                warn!(
+                    self.logger(),
+                    "Unsafe history detected in consignment: {unsafe_txids:?}"
+                );
+                let mut txids: Vec<String> = unsafe_txids.into_iter().collect();
+                txids.sort();
+                return Err(Error::UnsafeTransferHistory {
+                    details: format!("witness TXs not yet safe from reorgs: {}", txids.join(", ")),
+                });
+            }
+        }
+
+        let received_rgb_assignments =
+            self.extract_received_assignments(&consignment, witness_id, Some(vout), None);
+        let mut received: Vec<Assignment> = received_rgb_assignments.into_values().collect();
+        received.sort();
+
+        if let Some(ref expected) = expected {
+            Self::validate_expected_transfer_assignments(&received, expected)?;
+        }
+
+        let valid_contract = valid_consignment.clone().into_valid_contract();
+        let media_digests = self
+            .extract_attachments(&valid_contract, asset_schema)
+            .iter()
+            .map(|a| hex::encode(a.digest))
+            .collect::<HashSet<_>>();
+        runtime.import_contract(valid_contract, self.blockchain_resolver())?;
+
+        runtime.accept_transfer(valid_consignment, &resolver)?;
+
+        info!(self.logger(), "Accept transfer completed");
+        Ok((consignment, received, media_digests))
+    }
+
+    fn validate_expected_transfer_intent(
+        consignment: &RgbTransfer,
+        asset_schema: &AssetSchema,
+        expected: &ExpectedTransfer,
+    ) -> Result<(), Error> {
+        if matches!(expected.assignment, Assignment::Any) {
+            return Err(Error::InvalidAssignment);
+        }
+        let contract_id = consignment.contract_id().to_string();
+        if contract_id != expected.asset_id {
+            return Err(Error::UnexpectedTransfer {
+                details: format!(
+                    "contract id mismatch: got {contract_id}, expected {}",
+                    expected.asset_id
+                ),
+            });
+        }
+        if asset_schema != &expected.asset_schema {
+            return Err(Error::UnexpectedTransfer {
+                details: format!(
+                    "schema mismatch: got {asset_schema}, expected {}",
+                    expected.asset_schema
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_expected_transfer_assignments(
+        received: &[Assignment],
+        expected: &ExpectedTransfer,
+    ) -> Result<(), Error> {
+        if received.is_empty() {
+            return Err(Error::UnexpectedTransfer {
+                details: s!("no assignments for the given witness seal"),
+            });
+        }
+        if received != [expected.assignment.clone()] {
+            return Err(Error::UnexpectedTransfer {
+                details: format!(
+                    "assignment mismatch: got {received:?}, expected {:?}",
+                    expected.assignment
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
