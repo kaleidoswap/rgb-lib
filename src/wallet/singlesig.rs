@@ -2631,13 +2631,30 @@ impl Wallet {
     /// discover it with a colored sync, leaving their swap outputs unknown.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn swap_apply_witness_tx(&mut self, completion: &OnchainSwapCompletion) -> Result<(), Error> {
-        let finalized_psbt = completion
-            .finalized_psbt
-            .as_deref()
-            .ok_or_else(|| swap_invalid("swap completion is not finalized"))?;
-        let psbt = Psbt::from_str(finalized_psbt)?;
-        swap_validate_proposal_psbt(&completion.proposal, &psbt)?;
-        let tx = psbt.extract_tx().map_err(InternalError::from)?;
+        let tx = match completion.finalized_psbt.as_deref() {
+            Some(finalized_psbt) => {
+                let psbt = Psbt::from_str(finalized_psbt)?;
+                swap_validate_proposal_psbt(&completion.proposal, &psbt)?;
+                psbt.extract_tx().map_err(InternalError::from)?
+            }
+            // the maker broadcast the swap without sending back its finalized completion (e.g.
+            // after the taker stopped waiting): the taker only has the one it signed. Its PSBT
+            // must be the proposal's transaction, and the txid commits to everything in it but
+            // the witnesses, which the network has checked
+            None => {
+                let psbt = Psbt::from_str(&completion.psbt)?;
+                swap_validate_proposal_psbt(&completion.proposal, &psbt)?;
+                if psbt.unsigned_tx.compute_txid().to_string() != completion.txid {
+                    return Err(swap_invalid("swap completion txid mismatch"));
+                }
+                self.indexer().get_tx(&completion.txid)?.ok_or_else(|| {
+                    swap_invalid(
+                        "swap completion is not finalized and its transaction is not known to \
+                         the indexer",
+                    )
+                })?
+            }
+        };
         if tx.compute_txid().to_string() != completion.txid {
             return Err(swap_invalid("swap completion txid mismatch"));
         }
@@ -2865,7 +2882,9 @@ impl Wallet {
     ///
     /// Each party calls this method with their own `role` once the swap transaction has been
     /// broadcast (or confirmed, depending on `min_confirmations`). The consignments embedded in
-    /// the completion are validated and accepted into the wallet's RGB state.
+    /// the completion are validated and accepted into the wallet's RGB state. The taker may pass
+    /// the completion it signed itself when the maker broadcast without sending back its own: the
+    /// swap transaction is then taken from the indexer.
     ///
     /// Returns the list of [`Assignment`]s received, or an empty list if this party is receiving
     /// only BTC.
