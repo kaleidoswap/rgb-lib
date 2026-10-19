@@ -12,6 +12,7 @@ namespace rgb_lib {
 interface RgbLibError {
   AllocationsAlreadyAvailable();
   AssetNotFound(string asset_id);
+  BatchTransferAlreadyExists(string txid, i32 idx);
   BatchTransferNotFound(i32 idx);
   BitcoinNetworkMismatch();
   CannotAbortPendingVanillaTx();
