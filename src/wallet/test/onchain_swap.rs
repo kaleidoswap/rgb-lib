@@ -1166,6 +1166,160 @@ fn default_utxo_partial_sale_colors_change_with_smallest_top_up() {
     );
 }
 
+/// A coin reserved by an unbroadcast `send_btc_begin` is never used to top up a swap.
+#[test]
+#[parallel]
+fn swap_top_up_skips_reserved_coins() {
+    initialize();
+
+    const FREE_COIN: u64 = 50_000;
+
+    let (mut maker, _maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_default_utxo_swap_asset(
+        &mut taker,
+        taker_online,
+        "SDRS",
+        "Swap Default Reserved",
+        SWAP_RGB_AMOUNT,
+    );
+    // reserve the taker's only plain coin
+    let pending_psbt = taker
+        .send_btc_begin(
+            taker_online,
+            maker.get_address().unwrap(),
+            1_000,
+            FEE_RATE,
+            false,
+            false,
+        )
+        .unwrap();
+    let reserved = Psbt::from_str(&pending_psbt)
+        .unwrap()
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| Outpoint::from(i.previous_output))
+        .collect::<Vec<_>>();
+    assert!(!reserved.is_empty());
+
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let result = taker.accept_swap_offer(taker_online, offer.clone(), 0, false, vec![]);
+    assert!(
+        matches!(result, Err(Error::InsufficientBitcoins { .. })),
+        "{result:?}"
+    );
+
+    // a free coin is picked instead of the reserved one
+    send_sats_to_address(taker.get_address().unwrap(), Some(FREE_COIN));
+    mine(false);
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    assert!(
+        request
+            .taker_inputs
+            .iter()
+            .all(|i| !reserved.contains(&i.outpoint)),
+        "the swap should not spend a reserved coin"
+    );
+    assert!(
+        request
+            .taker_inputs
+            .iter()
+            .any(|i| i.amount_sat == FREE_COIN)
+    );
+    assert_eq!(taker.list_pending_vanilla_txs().unwrap().len(), 1);
+}
+
+/// A coin reserved by an unbroadcast `send_btc_begin` is never used to pay a swap's BTC leg.
+#[test]
+#[parallel]
+fn swap_btc_leg_skips_reserved_coins() {
+    initialize();
+
+    const FREE_COIN: u64 = 500_000;
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SBRS",
+        "Swap BTC Reserved",
+        SWAP_RGB_AMOUNT,
+    );
+    // reserve the taker's only plain coin
+    let pending_psbt = taker
+        .send_btc_begin(
+            taker_online,
+            maker.get_address().unwrap(),
+            1_000,
+            FEE_RATE,
+            false,
+            false,
+        )
+        .unwrap();
+    let reserved = Psbt::from_str(&pending_psbt)
+        .unwrap()
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| Outpoint::from(i.previous_output))
+        .collect::<Vec<_>>();
+    assert!(!reserved.is_empty());
+
+    let offer = maker
+        .create_swap_offer(
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            btc(SWAP_BTC_PRICE),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let result = taker.accept_swap_offer(taker_online, offer.clone(), 0, false, vec![]);
+    assert!(
+        matches!(result, Err(Error::InsufficientBitcoins { .. })),
+        "{result:?}"
+    );
+
+    // a free coin is picked instead of the reserved one
+    send_sats_to_address(taker.get_address().unwrap(), Some(FREE_COIN));
+    mine(false);
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    assert_eq!(
+        request
+            .taker_inputs
+            .iter()
+            .map(|i| i.amount_sat)
+            .collect::<Vec<_>>(),
+        vec![FREE_COIN],
+        "the swap should only spend the free coin"
+    );
+    assert!(
+        request
+            .taker_inputs
+            .iter()
+            .all(|i| !reserved.contains(&i.outpoint))
+    );
+    assert_eq!(taker.list_pending_vanilla_txs().unwrap().len(), 1);
+}
+
 #[test]
 #[parallel]
 fn second_asset_on_swap_input_survives() {
