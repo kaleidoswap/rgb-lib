@@ -38,6 +38,10 @@ const PSBT_OP_FOREIGN_INPUTS_FILE: &str = "foreign_inputs.json";
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 const PSBT_OP_COLORED_PSBT_FILE: &str = "colored.psbt";
 #[cfg(any(feature = "electrum", feature = "esplora"))]
+const PSBT_OP_STAGED_PSBT_FILE: &str = "staged.psbt";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const PSBT_OP_STAGED_MANIFEST_FILE: &str = "staged.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 const PSBT_OP_CONSIGNMENTS_DIR: &str = "consignments";
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 const PSBT_OP_CONSIGNMENT_FILE: &str = CONSIGNMENT_FILE;
@@ -112,6 +116,13 @@ fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     sha256::Hash::hash(bytes.as_ref()).to_string()
 }
 
+/// Version of `meta.json`. Deliberately still 1 after `psbt_op_stage` added the `staged` status
+/// and the optional `hashes.staged` and `completing_txid` fields: every journal an older binary
+/// wrote still parses, and a Prepared one written by this binary still parses in an older one.
+/// Going back to an older binary is not supported while a Staged operation exists (it can't parse
+/// `"staged"`, so its `psbt_op_scan` errors): complete or abort them first. A bump would not
+/// change that, since an older binary refuses an unknown version the same way, but it would make
+/// every journal, Prepared ones included, unreadable to it.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 const PSBT_OP_META_SCHEMA_VERSION: u32 = 1;
 
@@ -208,6 +219,9 @@ pub struct ColorPrepareResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PsbtOperationStatus {
+    /// This wallet's transitions are staged on a PSBT other parties may still stage on, and its
+    /// inputs are reserved; the RGB commitment is not final yet (see [`Wallet::psbt_op_stage`]).
+    Staged,
     /// Colored PSBT + payloads on disk; RGB stash not updated.
     Prepared,
     /// Fascia consumed into the RGB stash after broadcast.
@@ -245,6 +259,21 @@ pub struct PsbtOpPrepareResult {
     /// Wallet-relative directory containing file-backed payloads.
     pub operation_dir: String,
     /// What the operation's RGB transitions assign, read back from the committed fascia.
+    pub allocations: Vec<PsbtOpAllocation>,
+}
+
+/// Result of [`Wallet::psbt_op_stage`].
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone)]
+pub struct PsbtOpStageResult {
+    /// Opaque operation ID (directory name under `psbt_ops/`).
+    pub operation_id: String,
+    /// The PSBT with this wallet's transitions staged on it, for the next party to stage on or
+    /// for the single party calling [`Wallet::psbt_op_finalize`].
+    pub staged_psbt: String,
+    /// Wallet-relative directory containing file-backed payloads.
+    pub operation_dir: String,
+    /// What this wallet's staged transitions assign, read back from the staged PSBT.
     pub allocations: Vec<PsbtOpAllocation>,
 }
 
@@ -326,12 +355,20 @@ pub fn fetch_consignment_by_recipient_id_unchecked(
 /// reported; any other is an error rather than left out.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 fn fascia_allocations(fascia: &Fascia) -> Result<Vec<PsbtOpAllocation>, Error> {
+    bundle_allocations(fascia.bundles().iter())
+}
+
+/// What `bundles`' transitions assign, as [`fascia_allocations`] reports it.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn bundle_allocations<'a>(
+    bundles: impl IntoIterator<Item = (&'a ContractId, &'a rgbstd::TransitionBundle)>,
+) -> Result<Vec<PsbtOpAllocation>, Error> {
     fn witness_vout(seal: Option<GraphSeal>) -> Option<u32> {
         seal.filter(|seal| seal.txid == TxPtr::WitnessTx)
             .map(|seal| seal.vout.into_u32())
     }
     let mut allocations = vec![];
-    for (contract_id, bundle) in fascia.bundles() {
+    for (contract_id, bundle) in bundles {
         let asset_id = contract_id.to_string();
         let unknown = |ass_type: &AssignmentType| Error::Inconsistency {
             details: format!("fascia for {asset_id} assigns unknown owned state {ass_type}"),
@@ -379,7 +416,7 @@ fn fascia_allocations(fascia: &Fascia) -> Result<Vec<PsbtOpAllocation>, Error> {
 pub struct PsbtOperation {
     /// Opaque operation ID (directory name under `psbt_ops/`).
     pub operation_id: String,
-    /// Colored unsigned PSBT.
+    /// Colored unsigned PSBT; for an operation staged and never completed, the staged PSBT.
     pub colored_psbt: String,
     /// Wallet-relative directory containing file-backed payloads.
     pub operation_dir: String,
@@ -387,9 +424,11 @@ pub struct PsbtOperation {
     pub status: PsbtOperationStatus,
     /// Broadcast lifecycle.
     pub broadcast: PsbtBroadcastState,
-    /// Witness txid committed at prepare.
+    /// Witness txid committed at prepare; for an operation staged and never completed, the txid
+    /// of the staged PSBT, which changes once the commitment is finalized.
     pub txid: String,
-    /// What the operation's RGB transitions assign, read back from the committed fascia.
+    /// What the operation's RGB transitions assign, read back from the committed fascia (from
+    /// the staged PSBT for an operation staged and never completed).
     pub allocations: Vec<PsbtOpAllocation>,
 }
 
@@ -405,16 +444,30 @@ pub struct ExpectedTransfer {
     pub assignment: Assignment,
 }
 
+/// Hashes binding an operation's payload files to its manifest. `fascia` and `colored_psbt` are
+/// set once the commitment is final (by `psbt_op_prepare` or `psbt_op_complete`); `staged` is
+/// set for an operation created by `psbt_op_stage` and kept after it completes.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PsbtOpPayloadHashes {
-    fascia: String,
-    colored_psbt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fascia: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    colored_psbt: Option<String>,
     foreign_inputs: String,
     consignments: BTreeMap<String, String>,
     txid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     batch_transfer_idx: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staged: Option<PsbtOpStagedHashes>,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PsbtOpStagedHashes {
+    psbt: String,
+    manifest: String,
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -428,12 +481,33 @@ impl PsbtOpPayloadHashes {
         batch_transfer_idx: Option<i32>,
     ) -> Self {
         Self {
-            fascia: sha256_hex(fascia),
-            colored_psbt: sha256_hex(colored_psbt),
+            fascia: Some(sha256_hex(fascia)),
+            colored_psbt: Some(sha256_hex(colored_psbt)),
             foreign_inputs: sha256_hex(foreign_inputs),
             consignments,
             txid: sha256_hex(txid.as_bytes()),
             batch_transfer_idx: batch_transfer_idx.map(psbt_op_batch_identity_hash),
+            staged: None,
+        }
+    }
+
+    fn new_staged(
+        staged_psbt: &[u8],
+        manifest: &[u8],
+        foreign_inputs: &[u8],
+        staged_txid: &str,
+    ) -> Self {
+        Self {
+            fascia: None,
+            colored_psbt: None,
+            foreign_inputs: sha256_hex(foreign_inputs),
+            consignments: BTreeMap::new(),
+            txid: sha256_hex(staged_txid.as_bytes()),
+            batch_transfer_idx: None,
+            staged: Some(PsbtOpStagedHashes {
+                psbt: sha256_hex(staged_psbt),
+                manifest: sha256_hex(manifest),
+            }),
         }
     }
 }
@@ -455,6 +529,238 @@ struct PsbtOpMeta {
     #[serde(default)]
     broadcast: PsbtBroadcastState,
     hashes: PsbtOpPayloadHashes,
+    /// Write-ahead record of a Staged operation's `psbt_op_complete`: the final witness txid
+    /// whose batch transfer replaces the staged one. Set before that SQL commit, cleared when
+    /// the operation is published as Prepared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completing_txid: Option<String>,
+}
+
+/// What `psbt_op_stage` needs to rebuild after a restart: the coloring request, the inputs it
+/// reserved and the batch transfer parameters. The staged transitions live in `staged.psbt`.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PsbtOpStagedManifest {
+    input_outpoints: Vec<Outpoint>,
+    assets: BTreeMap<String, PsbtOpStagedAssetColoring>,
+    static_blinding: Option<u64>,
+    nonce: Option<u64>,
+    min_confirmations: u8,
+    expiration_timestamp: Option<u64>,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PsbtOpStagedAssetColoring {
+    /// Keyed by final vout, as [`Wallet::psbt_op_stage`] takes it.
+    output_map: BTreeMap<u32, u64>,
+    static_blinding: Option<u64>,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl PsbtOpStagedManifest {
+    fn new(
+        coloring_info: &ColoringInfo,
+        input_outpoints: &HashSet<OutPoint>,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+    ) -> Self {
+        let mut inputs: Vec<OutPoint> = input_outpoints.iter().copied().collect();
+        inputs.sort();
+        Self {
+            input_outpoints: inputs.into_iter().map(Outpoint::from).collect(),
+            assets: coloring_info
+                .asset_info_map
+                .iter()
+                .map(|(contract_id, info)| {
+                    (
+                        contract_id.to_string(),
+                        PsbtOpStagedAssetColoring {
+                            output_map: info.output_map.iter().map(|(k, v)| (*k, *v)).collect(),
+                            static_blinding: info.static_blinding,
+                        },
+                    )
+                })
+                .collect(),
+            static_blinding: coloring_info.static_blinding,
+            nonce: coloring_info.nonce,
+            min_confirmations,
+            expiration_timestamp,
+        }
+    }
+
+    fn coloring_info(&self) -> Result<ColoringInfo, Error> {
+        let mut asset_info_map = HashMap::new();
+        for (asset_id, info) in &self.assets {
+            let contract_id = ContractId::from_str(asset_id).map_err(|e| Error::Inconsistency {
+                details: format!("staged manifest has an invalid asset ID {asset_id}: {e}"),
+            })?;
+            asset_info_map.insert(
+                contract_id,
+                AssetColoringInfo {
+                    output_map: info.output_map.iter().map(|(k, v)| (*k, *v)).collect(),
+                    static_blinding: info.static_blinding,
+                },
+            );
+        }
+        Ok(ColoringInfo {
+            asset_info_map,
+            static_blinding: self.static_blinding,
+            nonce: self.nonce,
+        })
+    }
+
+    fn inputs(&self) -> Result<HashSet<OutPoint>, Error> {
+        self.input_outpoints
+            .iter()
+            .map(OutPoint::try_from)
+            .collect::<Result<_, _>>()
+    }
+}
+
+/// Check `finalized` is the transaction `staged` was built on with only the RGB commitment
+/// filled in: same version, lock time and inputs (in order), and the same outputs except for the
+/// OP_RETURN commitment host, which must stay an OP_RETURN at the same index. Returns that index.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn psbt_op_check_finalized_tx(
+    staged: &Transaction,
+    finalized: &Transaction,
+) -> Result<usize, Error> {
+    let invalid = |details: String| Error::InvalidColoringInfo {
+        details: format!("finalized PSBT does not match the staged one: {details}"),
+    };
+    let opret_idx = staged
+        .output
+        .iter()
+        .position(|o| o.script_pubkey.is_op_return())
+        .ok_or_else(|| Error::Inconsistency {
+            details: s!("staged PSBT has no OP_RETURN output"),
+        })?;
+    if staged.version != finalized.version || staged.lock_time != finalized.lock_time {
+        return Err(invalid(s!("version or lock time changed")));
+    }
+    if staged.input.len() != finalized.input.len()
+        || staged
+            .input
+            .iter()
+            .zip(&finalized.input)
+            .any(|(s, f)| s.previous_output != f.previous_output || s.sequence != f.sequence)
+    {
+        return Err(invalid(s!("inputs changed")));
+    }
+    if staged.output.len() != finalized.output.len() {
+        return Err(invalid(s!("outputs added or removed")));
+    }
+    for (vout, (s, f)) in staged.output.iter().zip(&finalized.output).enumerate() {
+        let script_ok = if vout == opret_idx {
+            f.script_pubkey.is_op_return()
+        } else {
+            s.script_pubkey == f.script_pubkey
+        };
+        if s.value != f.value || !script_ok {
+            return Err(invalid(format!("output {vout} changed")));
+        }
+    }
+    Ok(opret_idx)
+}
+
+/// Whether an output of `psbt` already carries MPC messages, i.e. the RGB commitment was
+/// finalized. `mpc_message_map` returns an empty map for outputs without any, so `is_ok` alone
+/// is true for every PSBT.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn psbt_rgb_commitment_finalized(psbt: &Psbt) -> bool {
+    psbt.outputs
+        .iter()
+        .any(|o| o.mpc_message_map().is_ok_and(|m| !m.is_empty()))
+}
+
+/// Rebuild the MPC tree committed by the OP_RETURN at `opret_idx` of `psbt` and check the output
+/// script carries exactly that commitment and that every `expected` message is in the tree.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn psbt_op_check_commitment(
+    psbt: &Psbt,
+    opret_idx: usize,
+    expected: &BTreeMap<mpc::ProtocolId, mpc::Message>,
+) -> Result<mpc::MerkleTree, Error> {
+    let invalid = |details: String| Error::InvalidColoringInfo {
+        details: format!("finalized PSBT {details}"),
+    };
+    let output = psbt
+        .outputs
+        .get(opret_idx)
+        .ok_or_else(|| invalid(s!("has no map for its OP_RETURN output")))?;
+    let messages = output.mpc_message_map().map_err(|e| {
+        invalid(format!(
+            "has no RGB commitment on its OP_RETURN output: {e}"
+        ))
+    })?;
+    if expected
+        .iter()
+        .any(|(protocol_id, message)| messages.get(protocol_id) != Some(message))
+    {
+        return Err(invalid(s!(
+            "does not commit this wallet's staged transitions"
+        )));
+    }
+    let merkle_tree =
+        bounded_mpc_tree(psbt_mpc_min_depth(output)?, messages, output.mpc_entropy())?;
+    let expected_script = ScriptBuf::new_op_return(merkle_tree.commit_id().to_byte_array());
+    if psbt.unsigned_tx.output[opret_idx].script_pubkey != expected_script {
+        return Err(invalid(s!(
+            "OP_RETURN output does not carry its RGB commitment"
+        )));
+    }
+    Ok(merkle_tree)
+}
+
+/// Verify `finalized` commits the bundles `staged` carries for `contracts` unchanged, on the same
+/// transaction, and build the fascia of those bundles alone: the other parties' contracts may be
+/// unknown to this wallet's stash, which `psbt_op_apply` consumes the fascia into.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn psbt_op_finalized_fascia(
+    staged: &Psbt,
+    finalized: &Psbt,
+    contracts: &BTreeSet<ContractId>,
+) -> Result<Fascia, Error> {
+    let opret_idx = psbt_op_check_finalized_tx(&staged.unsigned_tx, &finalized.unsigned_tx)?;
+    let staged_bundles = staged.rgb_bundles().map_err(InternalError::from)?;
+    let committed_bundles = finalized
+        .rgb_bundles()
+        .map_err(|e| Error::InvalidColoringInfo {
+            details: format!("finalized PSBT has invalid RGB data: {e}"),
+        })?;
+    let mut bundles = BTreeMap::new();
+    let mut expected = BTreeMap::new();
+    for contract_id in contracts {
+        let staged_bundle =
+            staged_bundles
+                .get(contract_id)
+                .ok_or_else(|| Error::Inconsistency {
+                    details: format!("staged PSBT has no bundle for contract {contract_id}"),
+                })?;
+        if committed_bundles.get(contract_id) != Some(staged_bundle) {
+            return Err(Error::InvalidColoringInfo {
+                details: format!(
+                    "finalized PSBT does not carry this wallet's staged transitions for {contract_id} unchanged"
+                ),
+            });
+        }
+        expected.insert(
+            mpc::ProtocolId::from(*contract_id),
+            mpc::Message::from(staged_bundle.bundle_id()),
+        );
+        bundles.insert(*contract_id, staged_bundle.clone());
+    }
+    let merkle_tree = psbt_op_check_commitment(finalized, opret_idx, &expected)?;
+    let bundles = Confined::try_from(bundles).map_err(|_| Error::Inconsistency {
+        details: s!("staged operation has no contract"),
+    })?;
+    let seal_witness = SealWitness::new(
+        PubWitness::with(finalized.unsigned_tx.clone()),
+        mpc::MerkleBlock::from(merkle_tree),
+        OpretProof::default().into(),
+    );
+    Ok(Fascia::new(seal_witness, bundles))
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -1495,6 +1801,7 @@ impl Wallet {
         psbt: &mut Psbt,
         coloring_info: &ColoringInfo,
         input_outpoints: Vec<OutPoint>,
+        omitted_own_only: bool,
     ) -> Result<(RgbRuntime, HashSet<OutPoint>), Error> {
         let override_set: HashSet<OutPoint> = input_outpoints.into_iter().collect();
         if override_set.is_empty() {
@@ -1520,6 +1827,7 @@ impl Wallet {
             &override_set,
             &psbt_inputs,
             coloring_info,
+            omitted_own_only,
         )?;
         // Signed-PSBT check; OP_RETURN is already required. Ignore the legacy P2TR shift flag —
         // this API always uses final vout indices.
@@ -1560,7 +1868,7 @@ impl Wallet {
     ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
         info!(self.logger(), "Coloring PSBT...");
         let (runtime, override_set) =
-            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
+            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints, false)?;
         let result = self.color_psbt_with_prevouts_runtime(
             &runtime,
             psbt,
@@ -1609,8 +1917,22 @@ impl Wallet {
         override_set: &HashSet<OutPoint>,
         psbt_inputs: &HashSet<OutPoint>,
         coloring_info: &ColoringInfo,
+        omitted_own_only: bool,
     ) -> Result<(), Error> {
-        let omitted: Vec<OutPoint> = psbt_inputs.difference(override_set).copied().collect();
+        let mut omitted: Vec<OutPoint> = psbt_inputs.difference(override_set).copied().collect();
+        if omitted_own_only {
+            // other parties' inputs may legitimately carry their own allocations, which this
+            // wallet may know (e.g. after importing their history); only this wallet's coins
+            // must never be spent with their allocations left uncolored
+            let txn = self.database().begin_transaction()?;
+            let mut own = Vec::new();
+            for outpoint in omitted {
+                if txn.get_txo(&outpoint.into())?.is_some() {
+                    own.push(outpoint);
+                }
+            }
+            omitted = own;
+        }
         if !omitted.is_empty() {
             let assigning = runtime.contracts_assigning(omitted)?;
             if !assigning.is_empty() {
@@ -1664,7 +1986,7 @@ impl Wallet {
     ) -> Result<ColorPrepareResult, Error> {
         info!(self.logger(), "Coloring PSBT and preparing consume...");
         let (mut runtime, override_set) =
-            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
+            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints, false)?;
         let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(
             &runtime,
             psbt,
@@ -1943,18 +2265,27 @@ impl Wallet {
             }
         }
 
+        let (Some(fascia_hash), Some(colored_psbt_hash)) =
+            (&meta.hashes.fascia, &meta.hashes.colored_psbt)
+        else {
+            return Err(Error::Inconsistency {
+                details: format!(
+                    "HTLC operation {operation_id} has no committed payloads: it was staged and never completed"
+                ),
+            });
+        };
         let op_dir = self.psbt_op_dir(operation_id)?;
         let fascia_bytes = Self::psbt_op_require_file_hash(
             operation_id,
             "fascia",
             &op_dir.join(FASCIA_FILE),
-            &meta.hashes.fascia,
+            fascia_hash,
         )?;
         let psbt_bytes = Self::psbt_op_require_file_hash(
             operation_id,
             "colored PSBT",
             &op_dir.join(PSBT_OP_COLORED_PSBT_FILE),
-            &meta.hashes.colored_psbt,
+            colored_psbt_hash,
         )?;
         Self::psbt_op_require_file_hash(
             operation_id,
@@ -2059,20 +2390,135 @@ impl Wallet {
 
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn psbt_op_from_meta(&self, meta: &PsbtOpMeta) -> Result<PsbtOperation, Error> {
-        let (psbt, fascia) = self.psbt_op_verify_committed_payloads(meta)?;
-        let operation_dir = PathBuf::from(PSBT_OPS_DIR)
-            .join(&meta.operation_id)
-            .to_string_lossy()
-            .into_owned();
+        let (psbt, allocations) = if Self::psbt_op_never_completed(meta) {
+            let (psbt, manifest, _) = self.psbt_op_verify_staged_payloads(meta)?;
+            let allocations = Self::psbt_op_staged_allocations(&psbt, &manifest)?;
+            (psbt, allocations)
+        } else {
+            let (psbt, fascia) = self.psbt_op_verify_committed_payloads(meta)?;
+            (psbt, fascia_allocations(&fascia)?)
+        };
         Ok(PsbtOperation {
             operation_id: meta.operation_id.clone(),
             colored_psbt: psbt.to_string(),
-            operation_dir,
+            operation_dir: Self::psbt_op_relative_dir(&meta.operation_id),
             status: meta.status,
             broadcast: meta.broadcast,
             txid: meta.txid.clone(),
-            allocations: fascia_allocations(&fascia)?,
+            allocations,
         })
+    }
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn psbt_op_relative_dir(operation_id: &str) -> String {
+        PathBuf::from(PSBT_OPS_DIR)
+            .join(operation_id)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Whether `meta` belongs to an operation `psbt_op_stage` created and `psbt_op_complete` never
+    /// committed, so that its only PSBT is the staged one.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn psbt_op_never_completed(meta: &PsbtOpMeta) -> bool {
+        meta.hashes.staged.is_some() && meta.hashes.colored_psbt.is_none()
+    }
+
+    /// Load and hash-check the payloads `psbt_op_stage` wrote: the staged PSBT, the staged
+    /// manifest and the raw foreign inputs file.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn psbt_op_verify_staged_payloads(
+        &self,
+        meta: &PsbtOpMeta,
+    ) -> Result<(Psbt, PsbtOpStagedManifest, Vec<u8>), Error> {
+        let operation_id = &meta.operation_id;
+        let staged =
+            meta.hashes
+                .staged
+                .as_ref()
+                .ok_or_else(|| Error::InvalidPsbtOperationStatus {
+                    details: format!("operation {operation_id} was not created by psbt_op_stage"),
+                })?;
+        let op_dir = self.psbt_op_dir(operation_id)?;
+        let psbt_bytes = Self::psbt_op_require_file_hash(
+            operation_id,
+            "staged PSBT",
+            &op_dir.join(PSBT_OP_STAGED_PSBT_FILE),
+            &staged.psbt,
+        )?;
+        let manifest_bytes = Self::psbt_op_require_file_hash(
+            operation_id,
+            "staged manifest",
+            &op_dir.join(PSBT_OP_STAGED_MANIFEST_FILE),
+            &staged.manifest,
+        )?;
+        let foreign_inputs = Self::psbt_op_require_file_hash(
+            operation_id,
+            "foreign inputs",
+            &op_dir.join(PSBT_OP_FOREIGN_INPUTS_FILE),
+            &meta.hashes.foreign_inputs,
+        )?;
+        let staged_psbt = String::from_utf8(psbt_bytes).map_err(|_| Error::Inconsistency {
+            details: format!("HTLC operation {operation_id} staged PSBT is not valid UTF-8"),
+        })?;
+        let psbt = Psbt::from_str(&staged_psbt)?;
+        // once completed, the manifest txid is the final one, which the staged PSBT predates
+        if Self::psbt_op_never_completed(meta) {
+            if sha256_hex(meta.txid.as_bytes()) != meta.hashes.txid {
+                return Err(Error::Inconsistency {
+                    details: format!(
+                        "HTLC operation {operation_id} txid is not bound by the manifest"
+                    ),
+                });
+            }
+            let psbt_txid = psbt.unsigned_tx.compute_txid().to_string();
+            if psbt_txid != meta.txid {
+                return Err(Error::Inconsistency {
+                    details: format!(
+                        "HTLC operation {operation_id} staged PSBT txid {psbt_txid} does not match manifest {}",
+                        meta.txid
+                    ),
+                });
+            }
+        }
+        let manifest: PsbtOpStagedManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|e| Error::Inconsistency {
+                details: format!(
+                    "HTLC operation {operation_id} has an invalid staged manifest: {e}"
+                ),
+            })?;
+        Ok((psbt, manifest, foreign_inputs))
+    }
+
+    /// What the bundles this wallet staged assign, read back from the staged PSBT.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn psbt_op_staged_allocations(
+        psbt: &Psbt,
+        manifest: &PsbtOpStagedManifest,
+    ) -> Result<Vec<PsbtOpAllocation>, Error> {
+        let contracts = manifest
+            .coloring_info()?
+            .asset_info_map
+            .into_keys()
+            .collect();
+        let bundles = Self::psbt_op_own_bundles(psbt, &contracts)?;
+        bundle_allocations(bundles.iter())
+    }
+
+    /// The bundles `psbt` carries for `contracts`, all of which must be there.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn psbt_op_own_bundles(
+        psbt: &Psbt,
+        contracts: &BTreeSet<ContractId>,
+    ) -> Result<BTreeMap<ContractId, rgbstd::TransitionBundle>, Error> {
+        let mut bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
+        bundles.retain(|contract_id, _| contracts.contains(contract_id));
+        if bundles.len() != contracts.len() {
+            return Err(Error::Inconsistency {
+                details: s!("staged PSBT lacks a bundle for a staged contract"),
+            });
+        }
+        Ok(bundles)
     }
 
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -2145,15 +2591,9 @@ impl Wallet {
         expiry: PsbtOpExpiry,
     ) -> Result<PsbtOpPrepareResult, Error> {
         info!(self.logger(), "Preparing HTLC color operation...");
-        let expiration_timestamp = match expiry {
-            PsbtOpExpiry::Default => {
-                Some(now().unix_timestamp() as u64 + PSBT_OP_DEFAULT_EXPIRATION_SECS)
-            }
-            PsbtOpExpiry::At(timestamp) => Some(timestamp),
-            PsbtOpExpiry::Never => None,
-        };
+        let expiration_timestamp = Self::psbt_op_expiration_timestamp(expiry);
         let (runtime, override_set) =
-            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
+            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints, false)?;
         let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(
             &runtime,
             psbt,
@@ -2165,23 +2605,13 @@ impl Wallet {
 
         let witness_txid = psbt.get_txid();
         let mut transfers = vec![];
-        let mut spent: HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>> = HashMap::new();
+        let spent = Self::psbt_op_spent_by_contract(
+            &runtime,
+            asset_beneficiaries.keys().copied(),
+            &override_set,
+        )?;
 
         for (contract_id, beneficiaries) in &asset_beneficiaries {
-            let mut by_outpoint: HashMap<OutPoint, Vec<Assignment>> = HashMap::new();
-            for (explicit_seal, opout_state_map) in
-                runtime.contract_assignments_for(*contract_id, override_set.iter().copied())?
-            {
-                let outpoint = explicit_seal.to_outpoint();
-                for (opout, state) in opout_state_map {
-                    by_outpoint
-                        .entry(outpoint)
-                        .or_default()
-                        .push(Assignment::from_opout_and_state(opout, &state));
-                }
-            }
-            spent.insert(*contract_id, by_outpoint);
-
             let mut beneficiaries_witness = vec![];
             let mut beneficiaries_blinded = vec![];
             for builder_seal in beneficiaries {
@@ -2220,19 +2650,7 @@ impl Wallet {
 
         persist_durable_replace(&op_dir.join(FASCIA_FILE), &serialized_fascia)?;
         persist_durable_replace(&op_dir.join(PSBT_OP_COLORED_PSBT_FILE), &colored_psbt)?;
-
-        let mut consignment_hashes = BTreeMap::new();
-        for transfer in &transfers {
-            let asset_id = transfer.contract_id().to_string();
-            let path = psbt_op_consignment_path(&op_dir, &asset_id);
-            if let Some(parent) = path.parent() {
-                persist_durable_create_dir(parent)?;
-            }
-            let mut consignment_bytes = Vec::new();
-            transfer.save(&mut consignment_bytes)?;
-            persist_durable_replace(&path, &consignment_bytes)?;
-            consignment_hashes.insert(asset_id, sha256_hex(&consignment_bytes));
-        }
+        let consignment_hashes = Self::psbt_op_persist_consignments(&op_dir, &transfers)?;
 
         persist_durable_replace(
             &op_dir.join(PSBT_OP_FOREIGN_INPUTS_FILE),
@@ -2255,6 +2673,7 @@ impl Wallet {
                 &txid,
                 None,
             ),
+            completing_txid: None,
         };
         self.psbt_op_write_meta(&operation_id, &meta)?;
 
@@ -2281,19 +2700,532 @@ impl Wallet {
         self.psbt_op_bind_batch_identity(&operation_id, &mut meta, batch_transfer_idx)?;
         self.trigger_auto_backup();
 
-        let operation_dir = PathBuf::from(PSBT_OPS_DIR)
-            .join(&operation_id)
-            .to_string_lossy()
-            .into_owned();
         info!(
             self.logger(),
             "HTLC prepare completed (operation_id={operation_id})"
         );
         Ok(PsbtOpPrepareResult {
+            operation_dir: Self::psbt_op_relative_dir(&operation_id),
             operation_id,
             colored_psbt: psbt.to_string(),
-            operation_dir,
             allocations,
+        })
+    }
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn psbt_op_expiration_timestamp(expiry: PsbtOpExpiry) -> Option<u64> {
+        match expiry {
+            PsbtOpExpiry::Default => {
+                Some(now().unix_timestamp() as u64 + PSBT_OP_DEFAULT_EXPIRATION_SECS)
+            }
+            PsbtOpExpiry::At(timestamp) => Some(timestamp),
+            PsbtOpExpiry::Never => None,
+        }
+    }
+
+    /// The known allocations of `contracts` that spending `inputs` consumes.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn psbt_op_spent_by_contract(
+        runtime: &RgbRuntime,
+        contracts: impl IntoIterator<Item = ContractId>,
+        inputs: &HashSet<OutPoint>,
+    ) -> Result<SpentByContract, Error> {
+        let mut spent: SpentByContract = HashMap::new();
+        for contract_id in contracts {
+            let by_outpoint = spent.entry(contract_id).or_default();
+            for (explicit_seal, opout_state_map) in
+                runtime.contract_assignments_for(contract_id, inputs.iter().copied())?
+            {
+                let outpoint = explicit_seal.to_outpoint();
+                for (opout, state) in opout_state_map {
+                    by_outpoint
+                        .entry(outpoint)
+                        .or_default()
+                        .push(Assignment::from_opout_and_state(opout, &state));
+                }
+            }
+        }
+        Ok(spent)
+    }
+
+    /// Durably write one consignment per transfer under `op_dir`, returning their hashes.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn psbt_op_persist_consignments(
+        op_dir: &Path,
+        transfers: &[RgbTransfer],
+    ) -> Result<BTreeMap<String, String>, Error> {
+        let mut consignment_hashes = BTreeMap::new();
+        for transfer in transfers {
+            let asset_id = transfer.contract_id().to_string();
+            let path = psbt_op_consignment_path(op_dir, &asset_id);
+            if let Some(parent) = path.parent() {
+                persist_durable_create_dir(parent)?;
+            }
+            let mut consignment_bytes = Vec::new();
+            transfer.save(&mut consignment_bytes)?;
+            persist_durable_replace(&path, &consignment_bytes)?;
+            consignment_hashes.insert(asset_id, sha256_hex(&consignment_bytes));
+        }
+        Ok(consignment_hashes)
+    }
+
+    /// The live (not Failed) outgoing batch transfer recorded for `txid`, if any.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn psbt_op_live_outgoing_batch(&self, txid: &str) -> Result<Option<DbBatchTransfer>, Error> {
+        let txn = self.database().begin_transaction()?;
+        Ok(txn
+            .get_batch_transfers_by_txid(txid)?
+            .into_iter()
+            .find(|b| !b.incoming && b.status != TransferStatus::Failed))
+    }
+
+    /// Stage this wallet's RGB transitions on a PSBT other parties also stage on, reserve its
+    /// inputs and journal the operation as [`PsbtOperationStatus::Staged`].
+    ///
+    /// This is the durable form of [`Self::color_psbt_stage`] for a transaction several wallets
+    /// color together (e.g. an RGB-for-RGB swap built outside rgb-lib):
+    /// 1. each party calls `psbt_op_stage` on the same PSBT, in turn, for its own contracts;
+    /// 2. exactly one party calls [`Self::psbt_op_finalize`] on the result;
+    /// 3. each party calls [`Self::psbt_op_complete`] with the finalized PSBT, which checks its
+    ///    staged transitions are committed unchanged and moves the operation to
+    ///    [`PsbtOperationStatus::Prepared`];
+    /// 4. from there the operation is a prepared one: sign, [`Self::psbt_op_mark_broadcast`],
+    ///    broadcast, [`Self::psbt_op_apply`], [`Self::psbt_op_reconcile`].
+    ///
+    /// [`Self::psbt_op_abort`] releases the inputs of a Staged operation. The journal under
+    /// `psbt_ops/{operation_id}/` survives restarts between any of these steps.
+    ///
+    /// Each contract must be staged by exactly one party: a PSBT already carrying transitions
+    /// for a contract in `coloring_info` is rejected, as is a PSBT whose commitment is final.
+    ///
+    /// # `output_map` index convention
+    ///
+    /// As for [`Self::psbt_op_prepare`] and [`Self::color_psbt_for_outpoints`], keys are **final
+    /// PSBT vout indices**: the PSBT must already contain its OP_RETURN output (vout 0 when any
+    /// output is P2TR), no output is ever inserted and keys are never shifted. This differs from
+    /// [`Self::color_psbt_stage`], which follows [`Self::color_psbt`].
+    ///
+    /// `input_outpoints` and the full-allocation rule are as for [`Self::psbt_op_prepare`]. PSBT
+    /// inputs outside `input_outpoints` belong to the other parties; only those that are this
+    /// wallet's own coins must carry no allocations. Signing every input is still the caller's
+    /// job.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn psbt_op_stage(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        input_outpoints: Vec<OutPoint>,
+        min_confirmations: u8,
+        expiry: PsbtOpExpiry,
+    ) -> Result<PsbtOpStageResult, Error> {
+        info!(self.logger(), "Staging PSBT operation...");
+        let expiration_timestamp = Self::psbt_op_expiration_timestamp(expiry);
+        let contracts: BTreeSet<ContractId> =
+            coloring_info.asset_info_map.keys().copied().collect();
+        if contracts.is_empty() {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("coloring_info lists no contract"),
+            });
+        }
+        // checked before anything touches the caller's PSBT
+        if psbt_rgb_commitment_finalized(psbt) {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("the PSBT's RGB commitment is already finalized"),
+            });
+        }
+        let already_staged = psbt
+            .rgb_contract_ids()
+            .map_err(|e| Error::InvalidColoringInfo {
+                details: format!("PSBT has invalid RGB data: {e}"),
+            })?;
+        if let Some(contract_id) = already_staged.intersection(&contracts).next() {
+            return Err(Error::InvalidColoringInfo {
+                details: format!(
+                    "PSBT already carries transitions for contract {contract_id}: each contract must be staged by exactly one party"
+                ),
+            });
+        }
+        let (runtime, override_set) =
+            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints, true)?;
+        self.color_psbt_stage_runtime(
+            &runtime,
+            psbt,
+            coloring_info.clone(),
+            override_set.clone(),
+            true,
+            false,
+        )?;
+
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let spent =
+            Self::psbt_op_spent_by_contract(&runtime, contracts.iter().copied(), &override_set)?;
+        let foreign_inputs = self.collect_foreign_input_entries(&spent)?;
+        let manifest = PsbtOpStagedManifest::new(
+            &coloring_info,
+            &override_set,
+            min_confirmations,
+            expiration_timestamp,
+        );
+        let allocations = Self::psbt_op_staged_allocations(psbt, &manifest)?;
+
+        let operation_id = Self::new_psbt_op_id();
+        let op_dir = self.psbt_op_dir(&operation_id)?;
+        persist_durable_create_dir(&op_dir)?;
+        let staged_psbt = psbt.to_string();
+        let manifest_raw = serde_json::to_string_pretty(&manifest).map_err(InternalError::from)?;
+        let foreign_inputs_raw = serde_json::to_string_pretty(&ForeignInputsFile {
+            entries: foreign_inputs,
+        })
+        .map_err(InternalError::from)?;
+        persist_durable_replace(&op_dir.join(PSBT_OP_STAGED_PSBT_FILE), &staged_psbt)?;
+        persist_durable_replace(&op_dir.join(PSBT_OP_STAGED_MANIFEST_FILE), &manifest_raw)?;
+        persist_durable_replace(
+            &op_dir.join(PSBT_OP_FOREIGN_INPUTS_FILE),
+            &foreign_inputs_raw,
+        )?;
+
+        let mut meta = PsbtOpMeta {
+            schema_version: PSBT_OP_META_SCHEMA_VERSION,
+            operation_id: operation_id.clone(),
+            status: PsbtOperationStatus::Staged,
+            txid: txid.clone(),
+            created_at: now().unix_timestamp(),
+            batch_transfer_idx: None,
+            broadcast: PsbtBroadcastState::NotAttempted,
+            hashes: PsbtOpPayloadHashes::new_staged(
+                staged_psbt.as_bytes(),
+                manifest_raw.as_bytes(),
+                foreign_inputs_raw.as_bytes(),
+                &txid,
+            ),
+            completing_txid: None,
+        };
+        self.psbt_op_write_meta(&operation_id, &meta)?;
+
+        // reserve the inputs as psbt_op_prepare does, with an Initiated batch for the staged
+        // txid; psbt_op_complete replaces it with the batch for the final txid
+        let reserve = || -> Result<i32, Error> {
+            let txn = self.database().begin_transaction()?;
+            let batch_transfer_idx = self.persist_color_prepare_batch_txn(
+                &txn,
+                psbt,
+                &txid,
+                &spent,
+                &coloring_info,
+                false,
+                min_confirmations,
+                expiration_timestamp,
+                &runtime,
+            )?;
+            self.update_backup_info(&txn, false)?;
+            txn.commit()?;
+            Ok(batch_transfer_idx)
+        };
+        let batch_transfer_idx = match reserve() {
+            Ok(idx) => idx,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&op_dir);
+                return Err(e);
+            }
+        };
+        drop(runtime);
+
+        self.psbt_op_bind_batch_identity(&operation_id, &mut meta, batch_transfer_idx)?;
+        self.trigger_auto_backup();
+
+        info!(
+            self.logger(),
+            "Stage PSBT operation completed (operation_id={operation_id})"
+        );
+        Ok(PsbtOpStageResult {
+            operation_dir: Self::psbt_op_relative_dir(&operation_id),
+            operation_id,
+            staged_psbt,
+            allocations,
+        })
+    }
+
+    /// Finalize the RGB commitment of a PSBT every party has staged on with
+    /// [`Self::psbt_op_stage`]. Exactly one party calls this, once all staging is done, and hands
+    /// the finalized PSBT to every party for [`Self::psbt_op_complete`].
+    ///
+    /// This journals nothing: each party's [`Self::psbt_op_complete`] checks the result against
+    /// its own journal. `static_entropy` is the MPC entropy, as `static_blinding` is for
+    /// [`Self::color_psbt_finalize`]. The returned fascia covers every party's contracts.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn psbt_op_finalize(
+        &self,
+        psbt: &mut Psbt,
+        static_entropy: Option<u64>,
+    ) -> Result<Fascia, Error> {
+        if psbt_has_input_signatures(psbt) {
+            return Err(Error::InvalidColoringInfo {
+                details: s!(
+                    "cannot finalize a signed PSBT: RGB commitment rewrites the OP_RETURN output"
+                ),
+            });
+        }
+        if psbt_rgb_commitment_finalized(psbt) {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("the PSBT's RGB commitment is already finalized"),
+            });
+        }
+        let staged = psbt
+            .rgb_contract_ids()
+            .map_err(|e| Error::InvalidColoringInfo {
+                details: format!("PSBT has invalid RGB data: {e}"),
+            })?;
+        if staged.is_empty() {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("PSBT has no staged RGB transitions"),
+            });
+        }
+        // final-vout family: the OP_RETURN must already be there, never inserted here
+        if !psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .any(|o| o.script_pubkey.is_op_return())
+        {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("PSBT must include an OP_RETURN output"),
+            });
+        }
+        self.color_psbt_finalize(psbt, static_entropy)
+    }
+
+    /// Complete a [`PsbtOperationStatus::Staged`] operation with the PSBT another party finalized
+    /// via [`Self::psbt_op_finalize`], moving it to [`PsbtOperationStatus::Prepared`].
+    ///
+    /// The finalized PSBT is refused unless it is the staged transaction with only the RGB
+    /// commitment filled in, carries this wallet's staged bundles unchanged, and its OP_RETURN
+    /// commits to them. This wallet's consignments are then built and the input reservation
+    /// moves to a batch transfer for the final txid, exactly as [`Self::psbt_op_prepare`] leaves
+    /// it, so [`Self::psbt_op_mark_broadcast`], [`Self::psbt_op_apply`], [`Self::psbt_op_abort`]
+    /// and [`Self::psbt_op_reconcile`] apply unchanged. Retrying with the same PSBT after a crash
+    /// or a lost response is safe and returns the same result.
+    ///
+    /// The operation keeps the expiry given to [`Self::psbt_op_stage`]. Once it has passed, this
+    /// refuses to complete the operation, which must then be aborted with [`Self::psbt_op_abort`]
+    /// and staged again: a batch published already expired could be failed by the expiry sweep
+    /// after the transaction is signed and broadcast.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn psbt_op_complete(
+        &self,
+        operation_id: &str,
+        finalized_psbt: &Psbt,
+    ) -> Result<PsbtOpPrepareResult, Error> {
+        info!(self.logger(), "Completing PSBT operation {operation_id}...");
+        let mut meta = self.psbt_op_read_meta(operation_id)?;
+        let final_txid = finalized_psbt.unsigned_tx.compute_txid().to_string();
+        if meta.status != PsbtOperationStatus::Staged {
+            if meta.hashes.staged.is_some()
+                && meta.status != PsbtOperationStatus::Failed
+                && meta.txid == final_txid
+            {
+                // an earlier call already completed it with this PSBT
+                let op = self.psbt_op_from_meta(&meta)?;
+                return Ok(PsbtOpPrepareResult {
+                    operation_id: op.operation_id,
+                    colored_psbt: op.colored_psbt,
+                    operation_dir: op.operation_dir,
+                    allocations: op.allocations,
+                });
+            }
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "operation {operation_id} is {:?}, expected Staged",
+                    meta.status
+                ),
+            });
+        }
+        let (staged_psbt, manifest, foreign_inputs_raw) =
+            self.psbt_op_verify_staged_payloads(&meta)?;
+        let coloring_info = manifest.coloring_info()?;
+        let contracts: BTreeSet<ContractId> =
+            coloring_info.asset_info_map.keys().copied().collect();
+        let fascia = psbt_op_finalized_fascia(&staged_psbt, finalized_psbt, &contracts)?;
+
+        // a batch for the final txid only exists if an earlier call committed it and crashed
+        // before publishing the operation as Prepared
+        let completed_batch = match self.psbt_op_live_outgoing_batch(&final_txid)? {
+            Some(batch) if meta.completing_txid.as_deref() == Some(final_txid.as_str()) => {
+                Some(batch.idx)
+            }
+            Some(batch) => {
+                return Err(Error::BatchTransferAlreadyExists {
+                    txid: final_txid,
+                    idx: batch.idx,
+                });
+            }
+            None => {
+                if let Some(other) = meta.completing_txid.as_deref()
+                    && other != final_txid
+                    && self.psbt_op_live_outgoing_batch(other)?.is_some()
+                {
+                    return Err(Error::InvalidPsbtOperationStatus {
+                        details: format!(
+                            "operation {operation_id} is already being completed with txid {other}"
+                        ),
+                    });
+                }
+                None
+            }
+        };
+        let staged_batch_idx = self.psbt_op_resolve_batch_idx(&meta)?;
+        if completed_batch.is_none() {
+            match staged_batch_idx
+                .map(|idx| self.psbt_op_batch_status(idx))
+                .transpose()?
+            {
+                Some(Some(TransferStatus::Initiated)) => {}
+                Some(Some(TransferStatus::Failed)) => {
+                    self.psbt_op_journal_failed(&mut meta, staged_batch_idx)?;
+                    return Err(Error::InvalidPsbtOperationStatus {
+                        details: format!(
+                            "operation {operation_id} batch transfer was failed (expired?); its inputs are no longer reserved"
+                        ),
+                    });
+                }
+                _ => {
+                    return Err(Error::InvalidPsbtOperationStatus {
+                        details: format!(
+                            "operation {operation_id} has no Initiated batch transfer reserving its inputs; abort it"
+                        ),
+                    });
+                }
+            }
+        }
+        // the final-txid batch inherits the stage-time expiry: published past it, the expiry sweep
+        // could fail the batch and release the inputs after the parties signed and broadcast.
+        // Restarting the clock here would let the counterparty, who controls when finalize ends,
+        // stretch the reservation, so the operation must be aborted and staged again instead.
+        if let Some(expiration) = manifest.expiration_timestamp
+            && i64::try_from(expiration).unwrap_or(i64::MAX) <= now().unix_timestamp()
+        {
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "operation {operation_id} expired at {expiration} before it was completed; \
+                     abort it with psbt_op_abort and stage a new one"
+                ),
+            });
+        }
+
+        let runtime = self.rgb_runtime()?;
+        let witness_txid = finalized_psbt.get_txid();
+        let mut transfers = vec![];
+        for (contract_id, info) in &coloring_info.asset_info_map {
+            let mut vouts: Vec<u32> = info
+                .output_map
+                .iter()
+                .filter(|(_, amount)| **amount > 0)
+                .map(|(vout, _)| *vout)
+                .collect();
+            vouts.sort();
+            let beneficiaries: Vec<_> = vouts
+                .into_iter()
+                .map(|vout| ExplicitSeal::with(witness_txid, vout))
+                .collect();
+            transfers.push(runtime.transfer_from_fascia(
+                *contract_id,
+                beneficiaries,
+                vec![],
+                &fascia,
+            )?);
+        }
+
+        let op_dir = self.psbt_op_dir(operation_id)?;
+        let serialized_fascia = serde_json::to_string(&fascia).map_err(InternalError::from)?;
+        let colored_psbt = finalized_psbt.to_string();
+        persist_durable_create_dir(&op_dir.join(PSBT_OP_CONSIGNMENTS_DIR))?;
+        persist_durable_replace(&op_dir.join(FASCIA_FILE), &serialized_fascia)?;
+        persist_durable_replace(&op_dir.join(PSBT_OP_COLORED_PSBT_FILE), &colored_psbt)?;
+        let consignment_hashes = Self::psbt_op_persist_consignments(&op_dir, &transfers)?;
+        self.write_color_prepare_files(finalized_psbt, &final_txid, &fascia, false)?;
+
+        let batch_transfer_idx = match completed_batch {
+            Some(idx) => idx,
+            None => {
+                if meta.completing_txid.as_deref() != Some(final_txid.as_str()) {
+                    meta.completing_txid = Some(final_txid.clone());
+                    self.psbt_op_write_meta(operation_id, &meta)?;
+                }
+                let spent = Self::psbt_op_spent_by_contract(
+                    &runtime,
+                    contracts.iter().copied(),
+                    &manifest.inputs()?,
+                )?;
+                let txn = self.database().begin_transaction()?;
+                // the new batch reserves the same inputs before the staged one is dropped, in
+                // the same SQL transaction
+                let idx = self.persist_color_prepare_batch_txn(
+                    &txn,
+                    finalized_psbt,
+                    &final_txid,
+                    &spent,
+                    &coloring_info,
+                    false,
+                    manifest.min_confirmations,
+                    manifest.expiration_timestamp,
+                    &runtime,
+                )?;
+                if let Some(staged_idx) = staged_batch_idx {
+                    let db_data = txn.get_db_data(false)?;
+                    let staged_batch =
+                        txn.get_batch_transfer_or_fail(staged_idx, &db_data.batch_transfers)?;
+                    let asset_transfers =
+                        staged_batch.get_asset_transfers(&db_data.asset_transfers);
+                    self.delete_batch_transfer(
+                        &txn,
+                        &staged_batch,
+                        &asset_transfers,
+                        &db_data.colorings,
+                        &db_data.txos,
+                    )?;
+                }
+                self.update_backup_info(&txn, false)?;
+                txn.commit()?;
+                idx
+            }
+        };
+        drop(runtime);
+
+        let staged_hashes = meta.hashes.staged.take();
+        meta.status = PsbtOperationStatus::Prepared;
+        meta.txid = final_txid;
+        meta.batch_transfer_idx = None;
+        meta.completing_txid = None;
+        meta.hashes = PsbtOpPayloadHashes::new(
+            serialized_fascia.as_bytes(),
+            colored_psbt.as_bytes(),
+            &foreign_inputs_raw,
+            consignment_hashes,
+            &meta.txid,
+            None,
+        );
+        meta.hashes.staged = staged_hashes;
+        Self::psbt_op_set_batch_identity(&mut meta, batch_transfer_idx)?;
+        self.psbt_op_write_meta(operation_id, &meta)?;
+        self.trigger_auto_backup();
+
+        info!(
+            self.logger(),
+            "Complete PSBT operation completed (operation_id={operation_id})"
+        );
+        Ok(PsbtOpPrepareResult {
+            operation_id: operation_id.to_string(),
+            colored_psbt,
+            operation_dir: Self::psbt_op_relative_dir(operation_id),
+            allocations: fascia_allocations(&fascia)?,
         })
     }
 
@@ -2448,6 +3380,11 @@ impl Wallet {
     /// After a broadcast attempt rollback is refused until the batch transfer expires; past that
     /// the indexer decides, as for [`TransferStatus::WaitingBroadcast`].
     ///
+    /// A [`PsbtOperationStatus::Staged`] operation is aborted the same way, releasing the inputs
+    /// it reserved, unless one of this wallet's staged inputs is already spent (a transaction
+    /// built from the staged PSBT may have been signed and broadcast without
+    /// [`Self::psbt_op_complete`]).
+    ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -2460,7 +3397,13 @@ impl Wallet {
             if let Some(idx) = batch_transfer_idx {
                 self.psbt_op_fail_batch_if_initiated(online, idx)?;
             }
+            self.psbt_op_fail_completing_batch(online, &meta)?;
             self.psbt_op_backup_after_coherent_failure()?;
+            info!(self.logger(), "HTLC abort completed");
+            return Ok(());
+        }
+        if meta.status == PsbtOperationStatus::Staged {
+            self.psbt_op_abort_staged(online, &mut meta, batch_transfer_idx)?;
             info!(self.logger(), "HTLC abort completed");
             return Ok(());
         }
@@ -2533,6 +3476,72 @@ impl Wallet {
     }
 
     #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn psbt_op_abort_staged(
+        &mut self,
+        online: Online,
+        meta: &mut PsbtOpMeta,
+        batch_transfer_idx: Option<i32>,
+    ) -> Result<(), Error> {
+        let operation_id = meta.operation_id.clone();
+        let (_, manifest, _) = self.psbt_op_verify_staged_payloads(meta)?;
+        // the final txid is unknown until psbt_op_complete, so look at the inputs instead: once
+        // one of this wallet's is spent, the transaction may carry the staged transitions
+        let txn = self.database().begin_transaction()?;
+        self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
+        for outpoint in &manifest.input_outpoints {
+            if txn.get_txo(outpoint)?.is_some()
+                && self
+                    .bdk_wallet()
+                    .get_utxo(OutPoint::try_from(outpoint)?)
+                    .is_none()
+            {
+                return Err(Error::InvalidPsbtOperationStatus {
+                    details: format!(
+                        "operation {operation_id} staged input {outpoint} is already spent; \
+                         complete the operation with psbt_op_complete instead"
+                    ),
+                });
+            }
+        }
+        txn.commit()?;
+        if let Some(txid) = meta.completing_txid.as_deref()
+            && self.indexer().get_tx_confirmations(txid)?.is_some()
+        {
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!("witness tx {txid} is known to the indexer; refuse abort"),
+            });
+        }
+        if let Some(idx) = batch_transfer_idx {
+            self.psbt_op_fail_batch_if_initiated(online, idx)?;
+        }
+        self.psbt_op_fail_completing_batch(online, meta)?;
+        #[cfg(test)]
+        if MOCK_FAIL_AFTER_PSBT_OP_SQL_FAIL.with(|f| f.replace(false)) {
+            return Err(Error::Internal {
+                details: s!("mock failure after HTLC SQL fail"),
+            });
+        }
+        self.psbt_op_journal_failed(meta, batch_transfer_idx)?;
+        self.psbt_op_backup_after_coherent_failure()
+    }
+
+    /// Fail the batch a crashed `psbt_op_complete` committed for a Staged operation, if any.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn psbt_op_fail_completing_batch(
+        &mut self,
+        online: Online,
+        meta: &PsbtOpMeta,
+    ) -> Result<(), Error> {
+        let Some(txid) = meta.completing_txid.as_deref() else {
+            return Ok(());
+        };
+        match self.psbt_op_live_outgoing_batch(txid)? {
+            Some(batch) => self.psbt_op_fail_batch_if_initiated(online, batch.idx),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn psbt_op_journal_failed(
         &self,
         meta: &mut PsbtOpMeta,
@@ -2582,7 +3591,10 @@ impl Wallet {
     pub(crate) fn psbt_op_heal_failed(&self) -> Result<bool, Error> {
         let mut healed = false;
         for mut meta in self.psbt_op_scan()? {
-            if meta.status != PsbtOperationStatus::Prepared {
+            if !matches!(
+                meta.status,
+                PsbtOperationStatus::Staged | PsbtOperationStatus::Prepared
+            ) {
                 continue;
             }
             let Some(idx) = self.psbt_op_resolve_batch_idx(&meta)? else {
@@ -2753,9 +3765,12 @@ impl Wallet {
         for meta in metas {
             // Cheap filter on the PSBT alone; matches are fully verified below. An unreadable
             // PSBT is an error: skipping it could hide an operation spending `outpoint`.
-            let path = self
-                .psbt_op_dir(&meta.operation_id)?
-                .join(PSBT_OP_COLORED_PSBT_FILE);
+            let file = if Self::psbt_op_never_completed(&meta) {
+                PSBT_OP_STAGED_PSBT_FILE
+            } else {
+                PSBT_OP_COLORED_PSBT_FILE
+            };
+            let path = self.psbt_op_dir(&meta.operation_id)?.join(file);
             let psbt =
                 Psbt::from_str(&fs::read_to_string(&path)?).map_err(|e| Error::Inconsistency {
                     details: format!(
@@ -2836,7 +3851,8 @@ impl Wallet {
         Ok(res)
     }
 
-    /// Read HTLC operation status; marks Settled when a linked batch has settled.
+    /// Read HTLC operation status; marks Settled when a linked batch has settled, and Failed when
+    /// the batch of a Staged or Prepared operation was failed (e.g. by `fail_transfers`).
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
@@ -2851,8 +3867,10 @@ impl Wallet {
                 .iter()
                 .find(|b| b.idx == batch_transfer_idx)
             {
-                if meta.status == PsbtOperationStatus::Prepared
-                    && batch.status == TransferStatus::Failed
+                if matches!(
+                    meta.status,
+                    PsbtOperationStatus::Staged | PsbtOperationStatus::Prepared
+                ) && batch.status == TransferStatus::Failed
                 {
                     self.psbt_op_journal_failed(&mut meta, Some(batch_transfer_idx))?;
                 } else if meta.status == PsbtOperationStatus::Applied
@@ -4191,8 +5209,8 @@ mod tests {
             "txid-1",
             Some(7),
         );
-        assert_eq!(hashes.fascia, sha256_hex(b"fascia"));
-        assert_eq!(hashes.colored_psbt, sha256_hex(b"psbt"));
+        assert_eq!(hashes.fascia, Some(sha256_hex(b"fascia")));
+        assert_eq!(hashes.colored_psbt, Some(sha256_hex(b"psbt")));
         assert_eq!(hashes.foreign_inputs, sha256_hex(b"foreign_inputs"));
         assert_eq!(hashes.txid, sha256_hex(b"txid-1"));
         assert_eq!(
@@ -4201,6 +5219,421 @@ mod tests {
         );
         assert_ne!(hashes.fascia, hashes.colored_psbt);
         assert_ne!(hashes.txid, psbt_op_batch_identity_hash(7));
+    }
+
+    const ASSET_1: &str = "rgb:Ar4ouaLv-b7f7Dc_-z5EMvtu-FA5KNh1-nlae~jk-8xMBo7E";
+    const ASSET_2: &str = "rgb:4bBH~Lrb-rx8sB_n-WAJLPcn-X5tFL9q-dFDGbSz-8yApPws";
+    const TXID_1: &str = "e5a3e577309df31bd606f48049049d2e1e02b048206ba232944fcc053a176ccb";
+    const TXID_2: &str = "5ad4a4fcb7d76de88b7a0d79d0d20f0ec9f9bd77e25a2b03a0f1d68d5b0d2c11";
+
+    fn staged_tx() -> Transaction {
+        let input = |txid: &str, vout| bdk_wallet::bitcoin::TxIn {
+            previous_output: OutPoint {
+                txid: bdk_wallet::bitcoin::Txid::from_str(txid).unwrap(),
+                vout,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: bdk_wallet::bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Default::default(),
+        };
+        let output = |sats, script: ScriptBuf| TxOut {
+            value: BdkAmount::from_sat(sats),
+            script_pubkey: script,
+        };
+        Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![input(TXID_1, 0), input(TXID_2, 1)],
+            output: vec![
+                output(0, ScriptBuf::new_op_return([])),
+                output(
+                    600,
+                    ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x11; 20]].concat()),
+                ),
+                output(
+                    700,
+                    ScriptBuf::from_bytes([&[0x51, 0x20][..], &[0x22; 32]].concat()),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn psbt_op_finalized_tx_must_only_fill_the_commitment() {
+        let staged = staged_tx();
+        let mut finalized = staged.clone();
+        finalized.output[0].script_pubkey = ScriptBuf::new_op_return([7u8; 32]);
+        assert_eq!(psbt_op_check_finalized_tx(&staged, &finalized).unwrap(), 0);
+        assert_eq!(psbt_op_check_finalized_tx(&staged, &staged).unwrap(), 0);
+
+        let refused = |mutate: &dyn Fn(&mut Transaction)| {
+            let mut tx = finalized.clone();
+            mutate(&mut tx);
+            matches!(
+                psbt_op_check_finalized_tx(&staged, &tx),
+                Err(Error::InvalidColoringInfo { .. })
+            )
+        };
+        assert!(refused(&|tx| tx.input.swap(0, 1)));
+        assert!(refused(&|tx| tx.input[1].previous_output.vout = 2));
+        assert!(refused(&|tx| {
+            tx.input[0].sequence = bdk_wallet::bitcoin::Sequence::MAX;
+        }));
+        assert!(refused(&|tx| {
+            tx.input.pop();
+        }));
+        assert!(refused(&|tx| tx.output[1].value = BdkAmount::from_sat(601)));
+        assert!(refused(&|tx| tx.output[1].script_pubkey = ScriptBuf::new()));
+        assert!(refused(&|tx| tx.output[0].script_pubkey = ScriptBuf::new()));
+        assert!(refused(&|tx| tx.output[0].value = BdkAmount::from_sat(1)));
+        assert!(refused(&|tx| tx.output.swap(1, 2)));
+        assert!(refused(&|tx| {
+            tx.output.push(tx.output[1].clone());
+        }));
+        assert!(refused(&|tx| {
+            tx.version = bdk_wallet::bitcoin::transaction::Version::ONE;
+        }));
+        assert!(refused(&|tx| {
+            tx.lock_time = bdk_wallet::bitcoin::absolute::LockTime::from_consensus(1);
+        }));
+
+        let mut no_opret = staged.clone();
+        no_opret.output.remove(0);
+        assert!(matches!(
+            psbt_op_check_finalized_tx(&no_opret, &no_opret),
+            Err(Error::Inconsistency { .. })
+        ));
+    }
+
+    /// Commit `messages` on the OP_RETURN (vout 0) of `staged_tx()` the way `rgb_commit` does.
+    fn committed_psbt(messages: &[(mpc::ProtocolId, mpc::Message)]) -> Psbt {
+        use psrgbt::DbcPsbtProof;
+        let mut psbt = Psbt::from_unsigned_tx(staged_tx()).unwrap();
+        let output = &mut psbt.outputs[0];
+        output.set_opret_host();
+        output.set_mpc_entropy(42).unwrap();
+        for (protocol_id, message) in messages {
+            output.set_mpc_message(*protocol_id, *message).unwrap();
+        }
+        OpretProof::dbc_commit(&mut psbt).unwrap();
+        psbt
+    }
+
+    #[test]
+    fn only_a_committed_psbt_counts_as_finalized() {
+        // outputs without MPC messages still give an (empty) message map
+        let unfinalized = Psbt::from_unsigned_tx(staged_tx()).unwrap();
+        assert!(unfinalized.outputs[0].mpc_message_map().is_ok());
+        assert!(!psbt_rgb_commitment_finalized(&unfinalized));
+        let finalized = committed_psbt(&[(
+            mpc::ProtocolId::from([1u8; 32]),
+            mpc::Message::from([2u8; 32]),
+        )]);
+        assert!(psbt_rgb_commitment_finalized(&finalized));
+    }
+
+    #[test]
+    fn psbt_op_commitment_check_binds_messages_and_op_return() {
+        let ours = (
+            mpc::ProtocolId::from([1u8; 32]),
+            mpc::Message::from([2u8; 32]),
+        );
+        let theirs = (
+            mpc::ProtocolId::from([3u8; 32]),
+            mpc::Message::from([4u8; 32]),
+        );
+        let psbt = committed_psbt(&[ours, theirs]);
+        let expected = BTreeMap::from([ours]);
+        let tree = psbt_op_check_commitment(&psbt, 0, &expected).unwrap();
+        assert_eq!(
+            psbt.unsigned_tx.output[0].script_pubkey,
+            ScriptBuf::new_op_return(tree.commit_id().to_byte_array())
+        );
+
+        // a changed message for this wallet's contract, or a missing one
+        let altered = BTreeMap::from([(ours.0, mpc::Message::from([9u8; 32]))]);
+        assert!(matches!(
+            psbt_op_check_commitment(&psbt, 0, &altered),
+            Err(Error::InvalidColoringInfo { .. })
+        ));
+        let dropped = committed_psbt(&[theirs]);
+        assert!(matches!(
+            psbt_op_check_commitment(&dropped, 0, &expected),
+            Err(Error::InvalidColoringInfo { .. })
+        ));
+
+        // an OP_RETURN that does not carry the tree's commitment
+        let mut tampered = psbt.clone();
+        tampered.unsigned_tx.output[0].script_pubkey = ScriptBuf::new_op_return([5u8; 32]);
+        assert!(matches!(
+            psbt_op_check_commitment(&tampered, 0, &expected),
+            Err(Error::InvalidColoringInfo { .. })
+        ));
+
+        // no commitment at all on that output
+        assert!(matches!(
+            psbt_op_check_commitment(&Psbt::from_unsigned_tx(staged_tx()).unwrap(), 0, &expected),
+            Err(Error::InvalidColoringInfo { .. })
+        ));
+    }
+
+    /// `psbt` with its OP_RETURN (vout 0) carrying `depth` as the MPC minimum tree depth key.
+    fn with_mpc_min_depth(mut psbt: Psbt, depth: u8) -> Psbt {
+        use psrgbt::RgbPropKeyExt;
+        psbt.outputs[0].proprietary.insert(
+            bdk_wallet::bitcoin::psbt::raw::ProprietaryKey::mpc_min_tree_depth(),
+            vec![depth],
+        );
+        psbt
+    }
+
+    /// A counterparty-chosen MPC depth must be refused, never panic (`u5::with` asserts <= 31) nor
+    /// walk a 2^depth tree.
+    fn assert_mpc_depth_refused(depth: u8) {
+        let ours = (
+            mpc::ProtocolId::from([1u8; 32]),
+            mpc::Message::from([2u8; 32]),
+        );
+        let psbt = with_mpc_min_depth(committed_psbt(&[ours]), depth);
+        let result = psbt_op_check_commitment(&psbt, 0, &BTreeMap::from([ours]));
+        assert!(
+            matches!(result, Err(Error::InvalidColoringInfo { ref details }) if details.contains("depth")),
+            "MPC depth {depth} must be refused; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn psbt_op_commitment_check_refuses_mpc_depth_32() {
+        assert_mpc_depth_refused(32);
+    }
+
+    #[test]
+    fn psbt_op_commitment_check_refuses_mpc_depth_255() {
+        assert_mpc_depth_refused(255);
+    }
+
+    #[test]
+    fn psbt_op_commitment_check_refuses_mpc_depth_over_cap() {
+        assert_mpc_depth_refused(MAX_PSBT_MPC_TREE_DEPTH + 1);
+        assert_mpc_depth_refused(28);
+    }
+
+    #[test]
+    fn psbt_mpc_min_depth_bounds_the_psbt_key() {
+        // every output, as the finalize path (`check_psbt_mpc_commit_bounds`) checks them
+        let psbt_check_mpc_min_depths = |psbt: &Psbt| {
+            psbt.outputs
+                .iter()
+                .try_for_each(|output| psbt_mpc_min_depth(output).map(|_| ()))
+        };
+        let psbt = Psbt::from_unsigned_tx(staged_tx()).unwrap();
+        // absent key: the rgb-std default
+        assert_eq!(
+            psbt_mpc_min_depth(&psbt.outputs[0]).unwrap(),
+            MPC_MINIMAL_DEPTH
+        );
+        psbt_check_mpc_min_depths(&psbt).unwrap();
+        for depth in [0, 3, MAX_PSBT_MPC_TREE_DEPTH] {
+            let planted = with_mpc_min_depth(psbt.clone(), depth);
+            assert_eq!(
+                psbt_mpc_min_depth(&planted.outputs[0]).unwrap(),
+                u5::with(depth)
+            );
+            psbt_check_mpc_min_depths(&planted).unwrap();
+        }
+        for depth in [MAX_PSBT_MPC_TREE_DEPTH + 1, 31, 32, 255] {
+            let planted = with_mpc_min_depth(psbt.clone(), depth);
+            assert!(matches!(
+                psbt_mpc_min_depth(&planted.outputs[0]),
+                Err(Error::InvalidColoringInfo { .. })
+            ));
+            assert!(matches!(
+                psbt_check_mpc_min_depths(&planted),
+                Err(Error::InvalidColoringInfo { .. })
+            ));
+        }
+        // any output, not only the OP_RETURN one
+        let mut planted = psbt.clone();
+        planted.outputs[2] = with_mpc_min_depth(psbt, 32).outputs[0].clone();
+        assert!(matches!(
+            psbt_check_mpc_min_depths(&planted),
+            Err(Error::InvalidColoringInfo { .. })
+        ));
+    }
+
+    #[test]
+    fn psbt_op_commitment_check_honors_an_in_bounds_mpc_depth() {
+        use psrgbt::DbcPsbtProof;
+        let ours = (
+            mpc::ProtocolId::from([1u8; 32]),
+            mpc::Message::from([2u8; 32]),
+        );
+        // committed at depth 5 by the finalizer: the check must rebuild the same tree
+        let mut psbt = with_mpc_min_depth(Psbt::from_unsigned_tx(staged_tx()).unwrap(), 5);
+        let output = &mut psbt.outputs[0];
+        output.set_opret_host();
+        output.set_mpc_entropy(42).unwrap();
+        output.set_mpc_message(ours.0, ours.1).unwrap();
+        OpretProof::dbc_commit(&mut psbt).unwrap();
+        let tree = psbt_op_check_commitment(&psbt, 0, &BTreeMap::from([ours])).unwrap();
+        assert_eq!(tree.depth(), u5::with(5));
+        // the same commitment rebuilt at another depth no longer matches the OP_RETURN
+        let relabeled = with_mpc_min_depth(psbt, 4);
+        assert!(matches!(
+            psbt_op_check_commitment(&relabeled, 0, &BTreeMap::from([ours])),
+            Err(Error::InvalidColoringInfo { .. })
+        ));
+    }
+
+    #[test]
+    fn psbt_op_staged_manifest_round_trips_coloring_info() {
+        let coloring_info = ColoringInfo {
+            asset_info_map: HashMap::from([
+                (
+                    ContractId::from_str(ASSET_1).unwrap(),
+                    AssetColoringInfo {
+                        output_map: HashMap::from([(1, 40), (3, 0)]),
+                        static_blinding: Some(7),
+                    },
+                ),
+                (
+                    ContractId::from_str(ASSET_2).unwrap(),
+                    AssetColoringInfo {
+                        output_map: HashMap::from([(2, 5)]),
+                        static_blinding: None,
+                    },
+                ),
+            ]),
+            static_blinding: Some(11),
+            nonce: Some(3),
+        };
+        let inputs = HashSet::from([
+            OutPoint::from_str(&format!("{TXID_2}:1")).unwrap(),
+            OutPoint::from_str(&format!("{TXID_1}:0")).unwrap(),
+        ]);
+        let manifest = PsbtOpStagedManifest::new(&coloring_info, &inputs, 2, Some(1_700_000_000));
+        let raw = serde_json::to_string_pretty(&manifest).unwrap();
+        let parsed: PsbtOpStagedManifest = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed, manifest);
+        // deterministic bytes: the manifest hash must not depend on HashMap order
+        assert_eq!(
+            raw,
+            serde_json::to_string_pretty(&PsbtOpStagedManifest::new(
+                &coloring_info,
+                &inputs,
+                2,
+                Some(1_700_000_000)
+            ))
+            .unwrap()
+        );
+        assert_eq!(parsed.inputs().unwrap(), inputs);
+        assert_eq!(parsed.min_confirmations, 2);
+        assert_eq!(parsed.expiration_timestamp, Some(1_700_000_000));
+
+        let rebuilt = parsed.coloring_info().unwrap();
+        assert_eq!(rebuilt.static_blinding, coloring_info.static_blinding);
+        assert_eq!(rebuilt.nonce, coloring_info.nonce);
+        assert_eq!(
+            rebuilt.asset_info_map.len(),
+            coloring_info.asset_info_map.len()
+        );
+        for (contract_id, info) in &coloring_info.asset_info_map {
+            let got = &rebuilt.asset_info_map[contract_id];
+            assert_eq!(got.output_map, info.output_map);
+            assert_eq!(got.static_blinding, info.static_blinding);
+        }
+
+        let mut corrupt = parsed.clone();
+        let entry = corrupt.assets.pop_first().unwrap().1;
+        corrupt.assets.insert(s!("not-an-asset-id"), entry);
+        assert!(matches!(
+            corrupt.coloring_info(),
+            Err(Error::Inconsistency { .. })
+        ));
+    }
+
+    fn meta_json(status: &str, hashes: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": PSBT_OP_META_SCHEMA_VERSION,
+            "operation_id": "0123456789abcdef0123456789abcdef",
+            "status": status,
+            "txid": TXID_1,
+            "created_at": 1,
+            "batch_transfer_idx": 4,
+            "broadcast": "not_attempted",
+            "hashes": hashes,
+        })
+    }
+
+    #[test]
+    fn psbt_op_meta_reads_prepared_journals_and_round_trips_staged() {
+        // a meta.json psbt_op_prepare wrote before Staged existed still parses unchanged
+        let legacy = meta_json(
+            "prepared",
+            serde_json::json!({
+                "fascia": "f",
+                "colored_psbt": "c",
+                "foreign_inputs": "i",
+                "consignments": {"rgb:asset": "a"},
+                "txid": "t",
+                "batch_transfer_idx": "b",
+            }),
+        );
+        let meta: PsbtOpMeta = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(meta.status, PsbtOperationStatus::Prepared);
+        assert_eq!(meta.hashes.fascia.as_deref(), Some("f"));
+        assert_eq!(meta.hashes.colored_psbt.as_deref(), Some("c"));
+        assert!(meta.hashes.staged.is_none());
+        assert!(meta.completing_txid.is_none());
+        assert!(!Wallet::psbt_op_never_completed(&meta));
+        // and is written back byte-for-byte in the same shape
+        assert_eq!(serde_json::to_value(&meta).unwrap(), legacy);
+
+        let staged = meta_json(
+            "staged",
+            serde_json::to_value(PsbtOpPayloadHashes::new_staged(
+                b"psbt",
+                b"manifest",
+                b"in",
+                TXID_1,
+            ))
+            .unwrap(),
+        );
+        let mut meta: PsbtOpMeta = serde_json::from_value(staged).unwrap();
+        assert_eq!(meta.status, PsbtOperationStatus::Staged);
+        assert!(meta.hashes.fascia.is_none());
+        assert!(meta.hashes.colored_psbt.is_none());
+        assert!(meta.hashes.consignments.is_empty());
+        assert_eq!(
+            meta.hashes.staged,
+            Some(PsbtOpStagedHashes {
+                psbt: sha256_hex(b"psbt"),
+                manifest: sha256_hex(b"manifest"),
+            })
+        );
+        assert!(Wallet::psbt_op_never_completed(&meta));
+
+        meta.completing_txid = Some(TXID_2.to_string());
+        let raw = serde_json::to_value(&meta).unwrap();
+        assert_eq!(raw["completing_txid"], TXID_2);
+        assert!(raw["hashes"].get("fascia").is_none());
+        let back: PsbtOpMeta = serde_json::from_value(raw).unwrap();
+        assert_eq!(back.completing_txid.as_deref(), Some(TXID_2));
+        assert_eq!(back.hashes, meta.hashes);
+
+        // completed: committed payloads bound, staged hashes kept for the audit trail
+        let mut completed = back.clone();
+        let staged_hashes = completed.hashes.staged.take();
+        completed.hashes = PsbtOpPayloadHashes::new(
+            b"fascia",
+            b"colored",
+            b"in",
+            BTreeMap::new(),
+            TXID_2,
+            Some(4),
+        );
+        completed.hashes.staged = staged_hashes;
+        assert!(!Wallet::psbt_op_never_completed(&completed));
     }
 
     /// A PSBT with an empty OP_RETURN host at vout 0 and one staged (placeholder) RGB transition.
