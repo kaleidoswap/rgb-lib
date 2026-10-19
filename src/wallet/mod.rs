@@ -35,7 +35,10 @@ pub use objects::{
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub use objects::{
-    BurnBeginResult, BurnDetails, InflateBeginResult, InflateDetails, OnlineOptions,
+    BurnBeginResult, BurnDetails, InflateBeginResult, InflateDetails, OnchainSwapAssetHistory,
+    OnchainSwapCompletion, OnchainSwapConsignment, OnchainSwapInput, OnchainSwapLeg,
+    OnchainSwapLegKind, OnchainSwapOffer, OnchainSwapProposal, OnchainSwapReceiveResult,
+    OnchainSwapRequest, OnchainSwapRole, OnchainSwapStage, OnchainSwapSummary, OnlineOptions,
     OperationResult, RefreshFilter, RefreshResult, RefreshTransferStatus, RefreshedTransfer,
     SendBeginResult, SendDetails,
 };
