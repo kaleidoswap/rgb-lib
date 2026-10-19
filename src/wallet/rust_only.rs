@@ -1,9 +1,25 @@
 //! Rust-only functionality.
 //!
 //! This module defines additional utility methods that are not exposed via FFI.
+//!
+//! It also includes the submarine / HTLC helpers (`color_psbt_for_outpoints*`,
+//! `psbt_op_prepare` / `psbt_op_apply` / `psbt_op_abort` / `psbt_op_reconcile`) that operate on
+//! escrow outpoints without treating them as wallet UTXOs.
 
 use super::*;
 
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const PSBT_OPS_DIR: &str = "psbt_ops";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const PSBT_OP_META_FILE: &str = "meta.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const PSBT_OP_FOREIGN_INPUTS_FILE: &str = "foreign_inputs.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const PSBT_OP_COLORED_PSBT_FILE: &str = "colored.psbt";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const PSBT_OP_CONSIGNMENTS_DIR: &str = "consignments";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const PSBT_OP_CONSIGNMENT_FILE: &str = CONSIGNMENT_FILE;
 /// Marker left in the transfer dir once a prepared fascia has been consumed into the RGB stash,
 /// until the related SQL update is committed.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -55,11 +71,35 @@ fn persist_durable_create_dir(path: &Path) -> Result<(), Error> {
     fsync_parent_dir(path)
 }
 
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    <sha256::Hash as Sha256Hash>::hash(bytes.as_ref()).to_string()
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const PSBT_OP_META_SCHEMA_VERSION: u32 = 1;
+
+/// Windows-safe path: `consignments/{sha256(asset_id)}/consignment_out` (`:` is invalid on Windows).
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn psbt_op_consignment_path(op_dir: &Path, asset_id: &str) -> PathBuf {
+    let digest = <sha256::Hash as Sha256Hash>::hash(asset_id.as_bytes());
+    op_dir
+        .join(PSBT_OP_CONSIGNMENTS_DIR)
+        .join(digest.to_string())
+        .join(PSBT_OP_CONSIGNMENT_FILE)
+}
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const PSBT_OP_ID_LEN: usize = 32;
+/// Expiration applied by `psbt_op_prepare` when the caller gives none.
+pub const PSBT_OP_DEFAULT_EXPIRATION_SECS: u64 = 24 * 60 * 60;
+
 #[cfg(all(test, any(feature = "electrum", feature = "esplora")))]
 thread_local! {
     pub(crate) static MOCK_FAIL_AFTER_STASH_CONSUME: std::cell::RefCell<bool> =
         const { std::cell::RefCell::new(false) };
     pub(crate) static MOCK_FAIL_AFTER_STOCK_PERSIST: std::cell::RefCell<bool> =
+        const { std::cell::RefCell::new(false) };
+    pub(crate) static MOCK_FAIL_AFTER_PSBT_OP_SQL_FAIL: std::cell::RefCell<bool> =
         const { std::cell::RefCell::new(false) };
 }
 
@@ -99,6 +139,136 @@ pub struct ColorPrepareResult {
     pub transfers: Vec<RgbTransfer>,
     /// Recoverable batch transfer.
     pub batch_transfer_idx: i32,
+}
+
+/// Status of a file-backed HTLC coloring operation.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PsbtOperationStatus {
+    /// Colored PSBT + payloads on disk; RGB stash not updated.
+    Prepared,
+    /// Fascia consumed into the RGB stash after broadcast.
+    Applied,
+    /// Aborted before apply (never broadcast).
+    Failed,
+    /// Reconciled as settled against wallet/batch state.
+    Settled,
+}
+
+/// Caller-reported / indexer-observed broadcast lifecycle for an HTLC operation.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PsbtBroadcastState {
+    /// Caller has not reported a broadcast attempt.
+    #[default]
+    NotAttempted,
+    /// Caller reported a broadcast attempt; indexer has not confirmed the tx.
+    Attempted,
+    /// Indexer has seen the witness tx.
+    Observed,
+    /// Broadcast was attempted and the indexer currently does not see the tx.
+    Ambiguous,
+}
+
+/// Result of [`Wallet::psbt_op_prepare`].
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone)]
+pub struct PsbtOpPrepareResult {
+    /// Opaque operation ID (directory name under `psbt_ops/`).
+    pub operation_id: String,
+    /// Colored unsigned PSBT (caller signs and broadcasts).
+    pub colored_psbt: String,
+    /// Wallet-relative directory containing file-backed payloads.
+    pub operation_dir: String,
+}
+
+/// Recovered HTLC operation (lookup after a lost `psbt_op_prepare` response).
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone)]
+pub struct PsbtOperation {
+    /// Opaque operation ID (directory name under `psbt_ops/`).
+    pub operation_id: String,
+    /// Colored unsigned PSBT.
+    pub colored_psbt: String,
+    /// Wallet-relative directory containing file-backed payloads.
+    pub operation_dir: String,
+    /// High-level operation status.
+    pub status: PsbtOperationStatus,
+    /// Broadcast lifecycle.
+    pub broadcast: PsbtBroadcastState,
+    /// Witness txid committed at prepare.
+    pub txid: String,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PsbtOpPayloadHashes {
+    fascia: String,
+    colored_psbt: String,
+    foreign_inputs: String,
+    consignments: BTreeMap<String, String>,
+    txid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    batch_transfer_idx: Option<String>,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl PsbtOpPayloadHashes {
+    fn new(
+        fascia: &[u8],
+        colored_psbt: &[u8],
+        foreign_inputs: &[u8],
+        consignments: BTreeMap<String, String>,
+        txid: &str,
+        batch_transfer_idx: Option<i32>,
+    ) -> Self {
+        Self {
+            fascia: sha256_hex(fascia),
+            colored_psbt: sha256_hex(colored_psbt),
+            foreign_inputs: sha256_hex(foreign_inputs),
+            consignments,
+            txid: sha256_hex(txid.as_bytes()),
+            batch_transfer_idx: batch_transfer_idx.map(psbt_op_batch_identity_hash),
+        }
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn psbt_op_batch_identity_hash(batch_transfer_idx: i32) -> String {
+    sha256_hex(batch_transfer_idx.to_string().as_bytes())
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PsbtOpMeta {
+    schema_version: u32,
+    operation_id: String,
+    status: PsbtOperationStatus,
+    txid: String,
+    created_at: i64,
+    batch_transfer_idx: Option<i32>,
+    #[serde(default)]
+    broadcast: PsbtBroadcastState,
+    hashes: PsbtOpPayloadHashes,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ForeignInputEntry {
+    asset_id: String,
+    outpoint: Outpoint,
+    assignments: Vec<Assignment>,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+type SpentByContract = HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>>;
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ForeignInputsFile {
+    entries: Vec<ForeignInputEntry>,
 }
 
 fn psbt_has_input_signatures(psbt: &Psbt) -> bool {
@@ -1508,6 +1678,1075 @@ impl Wallet {
     }
 }
 
+/// Submarine / HTLC APIs of the wallet.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl Wallet {
+    /// Shared setup for [`Self::color_psbt_for_outpoints`] and
+    /// [`Self::color_psbt_for_outpoints_and_prepare_consume`]: empty/subset checks, validate allocations,
+    /// prepare PSBT. Returns `(runtime, override_set)`.
+    fn prepare_color_psbt_for_outpoints(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: &ColoringInfo,
+        input_outpoints: Vec<OutPoint>,
+    ) -> Result<(RgbRuntime, HashSet<OutPoint>), Error> {
+        let override_set: HashSet<OutPoint> = input_outpoints.into_iter().collect();
+        if override_set.is_empty() {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("input_outpoints is empty"),
+            });
+        }
+        let psbt_inputs: HashSet<OutPoint> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|txin| txin.previous_output)
+            .collect();
+        if !override_set.is_subset(&psbt_inputs) {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("input_outpoints must be a subset of PSBT inputs"),
+            });
+        }
+        let runtime = self.rgb_runtime()?;
+        self.validate_color_psbt_for_outpoints_inputs(
+            &runtime,
+            psbt,
+            &override_set,
+            &psbt_inputs,
+            coloring_info,
+        )?;
+        // Signed-PSBT check; OP_RETURN is already required. Ignore the legacy P2TR shift flag —
+        // this API always uses final vout indices.
+        let _ = self.prepare_psbt_for_coloring(psbt)?;
+        Ok((runtime, override_set))
+    }
+
+    /// Color a PSBT using a provided set of input outpoints.
+    ///
+    /// `input_outpoints` must be a non-empty subset of the PSBT inputs. Any PSBT input that
+    /// still carries RGB allocations is rejected: omitted inputs must not carry allocations,
+    /// and included inputs must have every allocated contract listed in `coloring_info`.
+    ///
+    /// The PSBT must already contain an OP_RETURN output. If any output is P2TR (RGB
+    /// `OpretFirst`), that OP_RETURN must be output 0 so the fascia commitment precedes taproot
+    /// outputs. This entry point is meant for externally constructed (HTLC) transactions whose
+    /// output layout must not be rewritten.
+    ///
+    /// # `output_map` index convention (differs from [`Self::color_psbt`])
+    ///
+    /// Keys are always **final PSBT vout indices**. This method never inserts outputs and never
+    /// shifts keys. Do **not** pass the pre-OP_RETURN indices used by [`Self::color_psbt`] when
+    /// that method applies the P2TR / `OpretFirst` +1 shift — using the wrong base silently seals
+    /// the wrong output.
+    ///
+    /// Coloring must happen **before** any input is signed (same rule as [`Self::color_psbt`]).
+    ///
+    /// Every contract listed in `coloring_info` must allocate the full available amount from the
+    /// selected inputs; under-allocation is rejected (no implicit burn).
+    ///
+    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+    pub fn color_psbt_for_outpoints(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        input_outpoints: Vec<OutPoint>,
+    ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
+        info!(self.logger(), "Coloring PSBT...");
+        let (runtime, override_set) =
+            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
+        let result = self.color_psbt_with_prevouts_runtime(
+            &runtime,
+            psbt,
+            coloring_info,
+            override_set,
+            true,
+            false,
+        );
+        info!(self.logger(), "Color PSBT completed");
+        result
+    }
+
+    fn validate_color_psbt_for_outpoints_inputs(
+        &self,
+        runtime: &RgbRuntime,
+        psbt: &Psbt,
+        override_set: &HashSet<OutPoint>,
+        psbt_inputs: &HashSet<OutPoint>,
+        coloring_info: &ColoringInfo,
+    ) -> Result<(), Error> {
+        let omitted: Vec<OutPoint> = psbt_inputs.difference(override_set).copied().collect();
+        if !omitted.is_empty() {
+            let assigning = runtime.contracts_assigning(omitted)?;
+            if !assigning.is_empty() {
+                let contracts = assigning
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::InvalidColoringInfo {
+                    details: format!(
+                        "PSBT inputs omitted from input_outpoints carry RGB allocations for {contracts}"
+                    ),
+                });
+            }
+        }
+        self.reject_uncolored_input_contracts(runtime, override_set, coloring_info)?;
+        let outputs = &psbt.unsigned_tx.output;
+        let has_p2tr = outputs.iter().any(|o| o.script_pubkey.is_p2tr());
+        match outputs.iter().position(|o| o.script_pubkey.is_op_return()) {
+            None => {
+                return Err(Error::InvalidColoringInfo {
+                    details: s!("PSBT must include an OP_RETURN output"),
+                });
+            }
+            Some(0) => {}
+            Some(_) if has_p2tr => {
+                return Err(Error::InvalidColoringInfo {
+                    details: s!("OP_RETURN must be the first PSBT output"),
+                });
+            }
+            Some(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Color a PSBT for explicit input outpoints, build consignments and register a fallible
+    /// batch transfer.
+    ///
+    /// `output_map` keys are **final** PSBT vouts (same as [`Self::color_psbt_for_outpoints`]).
+    /// Same recovery model as [`Self::color_psbt_and_prepare_consume`]: the RGB stash is updated
+    /// only by [`Self::consume_transfer_fascia`] after broadcast; use `fail_transfers` if the TX is
+    /// dropped.
+    ///
+    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+    pub fn color_psbt_for_outpoints_and_prepare_consume(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        input_outpoints: Vec<OutPoint>,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<ColorPrepareResult, Error> {
+        info!(self.logger(), "Coloring PSBT and preparing consume...");
+        let (mut runtime, override_set) =
+            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
+        let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(
+            &runtime,
+            psbt,
+            coloring_info.clone(),
+            override_set.clone(),
+            true,
+            false,
+        )?;
+        let result = self.prepare_color_and_transfer_runtime(
+            &mut runtime,
+            psbt,
+            fascia,
+            asset_beneficiaries,
+            &override_set,
+            &coloring_info,
+            false,
+            min_confirmations,
+            expiration_timestamp,
+        )?;
+        info!(self.logger(), "Color PSBT prepare-consume completed");
+        runtime.persist()?;
+        Ok(result)
+    }
+
+    fn psbt_ops_root(&self) -> PathBuf {
+        self.wallet_dir().join(PSBT_OPS_DIR)
+    }
+
+    fn validate_psbt_op_id(operation_id: &str) -> Result<(), Error> {
+        let valid = operation_id.len() == PSBT_OP_ID_LEN
+            && operation_id
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !valid {
+            return Err(Error::PsbtOperationNotFound {
+                operation_id: operation_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn psbt_op_dir(&self, operation_id: &str) -> Result<PathBuf, Error> {
+        Self::validate_psbt_op_id(operation_id)?;
+        Ok(self.psbt_ops_root().join(operation_id))
+    }
+
+    fn psbt_op_read_meta(&self, operation_id: &str) -> Result<PsbtOpMeta, Error> {
+        let path = self.psbt_op_dir(operation_id)?.join(PSBT_OP_META_FILE);
+        if !path.exists() {
+            return Err(Error::PsbtOperationNotFound {
+                operation_id: operation_id.to_string(),
+            });
+        }
+        let raw = fs::read_to_string(&path)?;
+        let meta: PsbtOpMeta = serde_json::from_str(&raw).map_err(|e| Error::Inconsistency {
+            details: format!("HTLC operation {operation_id} has invalid meta.json: {e}"),
+        })?;
+        if meta.operation_id != operation_id {
+            return Err(Error::Internal {
+                details: format!(
+                    "HTLC meta operation_id '{}' does not match requested '{}'",
+                    meta.operation_id, operation_id
+                ),
+            });
+        }
+        if meta.schema_version != PSBT_OP_META_SCHEMA_VERSION {
+            return Err(Error::Inconsistency {
+                details: format!(
+                    "HTLC operation {operation_id} has unsupported schema version {}",
+                    meta.schema_version
+                ),
+            });
+        }
+        Ok(meta)
+    }
+
+    fn psbt_op_write_meta(&self, operation_id: &str, meta: &PsbtOpMeta) -> Result<(), Error> {
+        Self::validate_psbt_op_id(operation_id)?;
+        if meta.operation_id != operation_id {
+            return Err(Error::Internal {
+                details: format!(
+                    "HTLC meta operation_id '{}' does not match requested '{}'",
+                    meta.operation_id, operation_id
+                ),
+            });
+        }
+        let path = self.psbt_op_dir(operation_id)?.join(PSBT_OP_META_FILE);
+        let raw = serde_json::to_string_pretty(meta).map_err(InternalError::from)?;
+        persist_durable_replace(&path, raw)
+    }
+
+    fn psbt_op_set_batch_identity(
+        meta: &mut PsbtOpMeta,
+        batch_transfer_idx: i32,
+    ) -> Result<(), Error> {
+        let expected = psbt_op_batch_identity_hash(batch_transfer_idx);
+        match &meta.hashes.batch_transfer_idx {
+            Some(hash) if hash == &expected => {}
+            Some(_) => {
+                return Err(Error::Inconsistency {
+                    details: format!(
+                        "HTLC operation {} batch identity does not match the manifest",
+                        meta.operation_id
+                    ),
+                });
+            }
+            None => meta.hashes.batch_transfer_idx = Some(expected),
+        }
+        meta.batch_transfer_idx = Some(batch_transfer_idx);
+        Ok(())
+    }
+
+    fn psbt_op_bind_batch_identity(
+        &self,
+        operation_id: &str,
+        meta: &mut PsbtOpMeta,
+        batch_transfer_idx: i32,
+    ) -> Result<(), Error> {
+        let already_bound = meta.batch_transfer_idx == Some(batch_transfer_idx)
+            && meta.hashes.batch_transfer_idx.is_some();
+        Self::psbt_op_set_batch_identity(meta, batch_transfer_idx)?;
+        if already_bound {
+            return Ok(());
+        }
+        self.psbt_op_write_meta(operation_id, meta)
+    }
+
+    fn psbt_op_require_file_hash(
+        operation_id: &str,
+        label: &str,
+        path: &Path,
+        expected: &str,
+    ) -> Result<Vec<u8>, Error> {
+        let bytes = fs::read(path).map_err(|e| Error::Inconsistency {
+            details: format!("HTLC operation {operation_id} missing required {label}: {e}"),
+        })?;
+        let actual = sha256_hex(&bytes);
+        if actual != expected {
+            return Err(Error::Inconsistency {
+                details: format!("HTLC operation {operation_id} {label} hash mismatch"),
+            });
+        }
+        Ok(bytes)
+    }
+
+    fn psbt_op_verify_committed_payloads(
+        &self,
+        meta: &PsbtOpMeta,
+    ) -> Result<(Psbt, Fascia), Error> {
+        let operation_id = &meta.operation_id;
+        if sha256_hex(meta.txid.as_bytes()) != meta.hashes.txid {
+            return Err(Error::Inconsistency {
+                details: format!("HTLC operation {operation_id} txid is not bound by the manifest"),
+            });
+        }
+        if let Some(idx) = meta.batch_transfer_idx {
+            match &meta.hashes.batch_transfer_idx {
+                Some(hash) if hash == &psbt_op_batch_identity_hash(idx) => {}
+                _ => {
+                    return Err(Error::Inconsistency {
+                        details: format!(
+                            "HTLC operation {operation_id} batch identity is not bound by the manifest"
+                        ),
+                    });
+                }
+            }
+        }
+
+        let op_dir = self.psbt_op_dir(operation_id)?;
+        let fascia_bytes = Self::psbt_op_require_file_hash(
+            operation_id,
+            "fascia",
+            &op_dir.join(FASCIA_FILE),
+            &meta.hashes.fascia,
+        )?;
+        let psbt_bytes = Self::psbt_op_require_file_hash(
+            operation_id,
+            "colored PSBT",
+            &op_dir.join(PSBT_OP_COLORED_PSBT_FILE),
+            &meta.hashes.colored_psbt,
+        )?;
+        Self::psbt_op_require_file_hash(
+            operation_id,
+            "foreign inputs",
+            &op_dir.join(PSBT_OP_FOREIGN_INPUTS_FILE),
+            &meta.hashes.foreign_inputs,
+        )?;
+        for (asset_id, expected) in &meta.hashes.consignments {
+            Self::psbt_op_require_file_hash(
+                operation_id,
+                &format!("consignment {asset_id}"),
+                &psbt_op_consignment_path(&op_dir, asset_id),
+                expected,
+            )?;
+        }
+
+        let colored_psbt = String::from_utf8(psbt_bytes).map_err(|_| Error::Inconsistency {
+            details: format!("HTLC operation {operation_id} colored PSBT is not valid UTF-8"),
+        })?;
+        let psbt = Psbt::from_str(&colored_psbt)?;
+        let psbt_txid = psbt.unsigned_tx.compute_txid().to_string();
+        if psbt_txid != meta.txid {
+            return Err(Error::Inconsistency {
+                details: format!(
+                    "HTLC operation {operation_id} colored PSBT txid {psbt_txid} does not match manifest {}",
+                    meta.txid
+                ),
+            });
+        }
+        let fascia_str = String::from_utf8(fascia_bytes).map_err(|_| Error::Inconsistency {
+            details: format!("HTLC operation {operation_id} fascia is not valid UTF-8"),
+        })?;
+        let fascia: Fascia = serde_json::from_str(&fascia_str).map_err(InternalError::from)?;
+        Ok((psbt, fascia))
+    }
+
+    fn psbt_op_scan(&self) -> Result<Vec<PsbtOpMeta>, Error> {
+        let root = self.psbt_ops_root();
+        if !root.exists() {
+            return Ok(vec![]);
+        }
+        let mut ops = vec![];
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if Self::validate_psbt_op_id(&name).is_err() {
+                continue;
+            }
+            match self.psbt_op_read_meta(&name) {
+                Ok(meta) => ops.push(meta),
+                // Meta is written before the SQL batch: a recognized dir without meta.json is an
+                // unpublished prepare, not a committed operation.
+                Err(Error::PsbtOperationNotFound { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(ops)
+    }
+
+    fn psbt_op_from_meta(&self, meta: &PsbtOpMeta) -> Result<PsbtOperation, Error> {
+        let (psbt, _) = self.psbt_op_verify_committed_payloads(meta)?;
+        let operation_dir = PathBuf::from(PSBT_OPS_DIR)
+            .join(&meta.operation_id)
+            .to_string_lossy()
+            .into_owned();
+        Ok(PsbtOperation {
+            operation_id: meta.operation_id.clone(),
+            colored_psbt: psbt.to_string(),
+            operation_dir,
+            status: meta.status,
+            broadcast: meta.broadcast,
+            txid: meta.txid.clone(),
+        })
+    }
+
+    fn psbt_op_resolve_batch_idx(&self, meta: &PsbtOpMeta) -> Result<Option<i32>, Error> {
+        if let Some(idx) = meta.batch_transfer_idx {
+            return Ok(Some(idx));
+        }
+        let txn = self.database().begin_transaction()?;
+        let outgoing: Vec<_> = txn
+            .iter_batch_transfers()?
+            .into_iter()
+            .filter(|b| b.txid.as_deref() == Some(meta.txid.as_str()) && !b.incoming)
+            .collect();
+        let live: Vec<_> = outgoing
+            .iter()
+            .filter(|b| b.status != TransferStatus::Failed)
+            .collect();
+        match (live.as_slice(), outgoing.as_slice()) {
+            ([b], _) => Ok(Some(b.idx)),
+            ([], [b]) => Ok(Some(b.idx)),
+            _ => Ok(None),
+        }
+    }
+
+    fn new_psbt_op_id() -> String {
+        format!(
+            "{:016x}{:016x}",
+            rand::rng().random::<u64>(),
+            rand::rng().random::<u64>()
+        )
+    }
+
+    /// Color an HTLC (or other external) PSBT for explicit input outpoints, write file-backed
+    /// payloads under `psbt_ops/{operation_id}/`, and persist SQL accounting for colored contracts.
+    /// `expiration_timestamp` defaults to [`PSBT_OP_DEFAULT_EXPIRATION_SECS`] from now.
+    ///
+    /// `output_map` keys are **final** PSBT vouts (same as [`Self::color_psbt_for_outpoints`]).
+    /// Foreign escrow outpoints are listed in `foreign_inputs.json` (audit log for integrators; the
+    /// library only checks its hash) and are **not** inserted as wallet TXOs / Input colorings.
+    /// Wallet-owned destinations in `output_map` still get Change/Send rows so
+    /// `get_asset_balance` / `list_unspents` stay consistent after claim.
+    /// RGB stash is unchanged until [`Self::psbt_op_apply`].
+    ///
+    /// Other files under the op dir (`colored.psbt`, `consignments/{sha256(asset_id)}/...`) are
+    /// artifacts for the caller; later HTLC methods verify every payload against the hashes bound
+    /// in `meta.json` and read back only the fascia and the colored PSBT.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn psbt_op_prepare(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        input_outpoints: Vec<OutPoint>,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<PsbtOpPrepareResult, Error> {
+        info!(self.logger(), "Preparing HTLC color operation...");
+        let expiration_timestamp =
+            Some(expiration_timestamp.unwrap_or_else(|| {
+                now().unix_timestamp() as u64 + PSBT_OP_DEFAULT_EXPIRATION_SECS
+            }));
+        let (runtime, override_set) =
+            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
+        let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(
+            &runtime,
+            psbt,
+            coloring_info.clone(),
+            override_set.clone(),
+            true,
+            false,
+        )?;
+
+        let witness_txid = psbt.get_txid();
+        let mut transfers = vec![];
+        let mut spent: HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>> = HashMap::new();
+
+        for (contract_id, beneficiaries) in &asset_beneficiaries {
+            let mut by_outpoint: HashMap<OutPoint, Vec<Assignment>> = HashMap::new();
+            for (explicit_seal, opout_state_map) in
+                runtime.contract_assignments_for(*contract_id, override_set.iter().copied())?
+            {
+                let outpoint = explicit_seal.to_outpoint();
+                for (opout, state) in opout_state_map {
+                    by_outpoint
+                        .entry(outpoint)
+                        .or_default()
+                        .push(Assignment::from_opout_and_state(opout, &state));
+                }
+            }
+            spent.insert(*contract_id, by_outpoint);
+
+            let mut beneficiaries_witness = vec![];
+            let mut beneficiaries_blinded = vec![];
+            for builder_seal in beneficiaries {
+                match builder_seal {
+                    BuilderSeal::Revealed(seal) => {
+                        let explicit_seal = ExplicitSeal::with(witness_txid, seal.vout);
+                        beneficiaries_witness.push(explicit_seal);
+                    }
+                    BuilderSeal::Concealed(secret_seal) => {
+                        beneficiaries_blinded.push(*secret_seal);
+                    }
+                };
+            }
+            transfers.push(runtime.transfer_from_fascia(
+                *contract_id,
+                beneficiaries_witness,
+                beneficiaries_blinded,
+                &fascia,
+            )?);
+        }
+
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let foreign_inputs = self.collect_foreign_input_entries(&spent)?;
+
+        let operation_id = Self::new_psbt_op_id();
+        let op_dir = self.psbt_op_dir(&operation_id)?;
+        persist_durable_create_dir(&op_dir.join(PSBT_OP_CONSIGNMENTS_DIR))?;
+
+        let serialized_fascia = serde_json::to_string(&fascia).map_err(InternalError::from)?;
+        let colored_psbt = psbt.to_string();
+        let foreign_inputs_raw = serde_json::to_string_pretty(&ForeignInputsFile {
+            entries: foreign_inputs,
+        })
+        .map_err(InternalError::from)?;
+
+        persist_durable_replace(&op_dir.join(FASCIA_FILE), &serialized_fascia)?;
+        persist_durable_replace(&op_dir.join(PSBT_OP_COLORED_PSBT_FILE), &colored_psbt)?;
+
+        let mut consignment_hashes = BTreeMap::new();
+        for transfer in &transfers {
+            let asset_id = transfer.contract_id().to_string();
+            let path = psbt_op_consignment_path(&op_dir, &asset_id);
+            if let Some(parent) = path.parent() {
+                persist_durable_create_dir(parent)?;
+            }
+            let mut consignment_bytes = Vec::new();
+            transfer.save(&mut consignment_bytes)?;
+            persist_durable_replace(&path, &consignment_bytes)?;
+            consignment_hashes.insert(asset_id, sha256_hex(&consignment_bytes));
+        }
+
+        persist_durable_replace(
+            &op_dir.join(PSBT_OP_FOREIGN_INPUTS_FILE),
+            &foreign_inputs_raw,
+        )?;
+
+        let mut meta = PsbtOpMeta {
+            schema_version: PSBT_OP_META_SCHEMA_VERSION,
+            operation_id: operation_id.clone(),
+            status: PsbtOperationStatus::Prepared,
+            txid: txid.clone(),
+            created_at: now().unix_timestamp(),
+            batch_transfer_idx: None,
+            broadcast: PsbtBroadcastState::NotAttempted,
+            hashes: PsbtOpPayloadHashes::new(
+                serialized_fascia.as_bytes(),
+                colored_psbt.as_bytes(),
+                foreign_inputs_raw.as_bytes(),
+                consignment_hashes,
+                &txid,
+                None,
+            ),
+        };
+        self.psbt_op_write_meta(&operation_id, &meta)?;
+
+        let batch_transfer_idx = match self.persist_color_prepare_batch(
+            psbt,
+            &txid,
+            &spent,
+            &fascia,
+            &coloring_info,
+            false,
+            min_confirmations,
+            expiration_timestamp,
+            false,
+            &runtime,
+        ) {
+            Ok(idx) => idx,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&op_dir);
+                return Err(e);
+            }
+        };
+        drop(runtime);
+
+        self.psbt_op_bind_batch_identity(&operation_id, &mut meta, batch_transfer_idx)?;
+
+        let operation_dir = PathBuf::from(PSBT_OPS_DIR)
+            .join(&operation_id)
+            .to_string_lossy()
+            .into_owned();
+        info!(
+            self.logger(),
+            "HTLC prepare completed (operation_id={operation_id})"
+        );
+        Ok(PsbtOpPrepareResult {
+            operation_id,
+            colored_psbt: psbt.to_string(),
+            operation_dir,
+        })
+    }
+
+    fn collect_foreign_input_entries(
+        &self,
+        spent: &SpentByContract,
+    ) -> Result<Vec<ForeignInputEntry>, Error> {
+        let txn = self.database().begin_transaction()?;
+        let mut foreign_inputs = Vec::new();
+        for (contract_id, by_outpoint) in spent {
+            for (outpoint, assignments) in by_outpoint {
+                let outpoint_obj: Outpoint = (*outpoint).into();
+                if txn.get_txo(&outpoint_obj)?.is_none() {
+                    foreign_inputs.push(ForeignInputEntry {
+                        asset_id: contract_id.to_string(),
+                        outpoint: outpoint_obj,
+                        assignments: assignments.clone(),
+                    });
+                }
+            }
+        }
+        Ok(foreign_inputs)
+    }
+
+    /// Apply a prepared HTLC operation's fascia into the RGB stash after broadcast.
+    ///
+    /// Order: validate linked batch (if any) → `consume_fascia` → SQL status → `meta.json`.
+    /// Reordering cannot make stock+SQL crash-atomic; a durable journal is a follow-up. This
+    /// order at least fails closed before mutating the stash when the batch is not `Initiated`.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn psbt_op_apply(&mut self, online: Online, operation_id: &str) -> Result<(), Error> {
+        info!(self.logger(), "Applying HTLC operation {operation_id}...");
+        self.check_online(online)?;
+        let mut meta = self.psbt_op_read_meta(operation_id)?;
+        if meta.status != PsbtOperationStatus::Prepared {
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "operation {operation_id} is {:?}, expected Prepared",
+                    meta.status
+                ),
+            });
+        }
+
+        let batch_transfer_idx = self.psbt_op_resolve_batch_idx(&meta)?.ok_or_else(|| {
+            Error::Internal {
+                details: format!(
+                    "HTLC operation {operation_id} has no linked Initiated/WaitingConfirmations batch"
+                ),
+            }
+        })?;
+        self.psbt_op_bind_batch_identity(operation_id, &mut meta, batch_transfer_idx)?;
+        let (psbt, fascia) = self.psbt_op_verify_committed_payloads(&meta)?;
+
+        let op_dir = self.psbt_op_dir(operation_id)?;
+        let stash_marker = op_dir.join(STASH_CONSUMED_FILE);
+        let stash_consumed = stash_marker.exists();
+
+        {
+            let txn = self.database().begin_transaction()?;
+            let db_data = txn.get_db_data(false)?;
+            let batch_transfer =
+                txn.get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
+            match batch_transfer.status {
+                TransferStatus::WaitingConfirmations | TransferStatus::Settled
+                    if stash_consumed =>
+                {
+                    drop(txn);
+                    meta.status = PsbtOperationStatus::Applied;
+                    meta.batch_transfer_idx = Some(batch_transfer_idx);
+                    self.psbt_op_write_meta(operation_id, &meta)?;
+                    let _ = fs::remove_file(&stash_marker);
+                    let _ = fs::remove_file(
+                        self.get_transfer_dir(&meta.txid).join(STASH_CONSUMED_FILE),
+                    );
+                    info!(
+                        self.logger(),
+                        "HTLC apply healed meta after prior SQL commit"
+                    );
+                    return Ok(());
+                }
+                TransferStatus::Initiated => {}
+                other => {
+                    return Err(Error::InvalidPsbtOperationStatus {
+                        details: format!(
+                            "HTLC batch transfer {batch_transfer_idx} is {other:?}, expected Initiated"
+                        ),
+                    });
+                }
+            }
+        }
+
+        if !stash_consumed {
+            if self.indexer().get_tx_confirmations(&meta.txid)?.is_none() {
+                return Err(Error::InvalidPsbtOperationStatus {
+                    details: format!(
+                        "witness tx {} is not known to the indexer; broadcast it before psbt_op_apply",
+                        meta.txid
+                    ),
+                });
+            }
+            if meta.broadcast != PsbtBroadcastState::Observed {
+                meta.broadcast = PsbtBroadcastState::Observed;
+                self.psbt_op_write_meta(operation_id, &meta)?;
+            }
+            let transfer_marker = self.get_transfer_dir(&meta.txid).join(STASH_CONSUMED_FILE);
+            self.consume_fascia_persist_then_mark(fascia, &[&stash_marker, &transfer_marker])?;
+            #[cfg(test)]
+            if MOCK_FAIL_AFTER_STASH_CONSUME.with(|f| f.replace(false)) {
+                return Err(Error::Internal {
+                    details: s!("mock failure after HTLC stash consume"),
+                });
+            }
+        }
+
+        let txn = self.database().begin_transaction()?;
+        let db_data = txn.get_db_data(false)?;
+        let batch_transfer =
+            txn.get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
+        match batch_transfer.status {
+            TransferStatus::Initiated => {
+                let mut updated: DbBatchTransferActMod = batch_transfer.into();
+                updated.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
+                txn.update_batch_transfer(&mut updated)?;
+            }
+            TransferStatus::WaitingConfirmations | TransferStatus::Settled => {}
+            other => {
+                return Err(Error::InvalidPsbtOperationStatus {
+                    details: format!(
+                        "HTLC batch transfer {batch_transfer_idx} is {other:?}, expected Initiated"
+                    ),
+                });
+            }
+        }
+        self.update_db_colored_txos_from_bdk(&txn, false)?;
+        self.mark_psbt_inputs_spent(&txn, &psbt)?;
+        self.update_backup_info(&txn, false)?;
+        txn.commit()?;
+
+        meta.status = PsbtOperationStatus::Applied;
+        meta.batch_transfer_idx = Some(batch_transfer_idx);
+        self.psbt_op_write_meta(operation_id, &meta)?;
+        let _ = fs::remove_file(&stash_marker);
+        let _ = fs::remove_file(self.get_transfer_dir(&meta.txid).join(STASH_CONSUMED_FILE));
+        info!(self.logger(), "HTLC apply completed");
+        Ok(())
+    }
+
+    /// Abort a prepared HTLC operation whose witness TX did not reach the network.
+    ///
+    /// After a broadcast attempt rollback is refused until the batch transfer expires; past that
+    /// the indexer decides, as for [`TransferStatus::WaitingBroadcast`].
+    ///
+    /// Rolls back a linked Initiated batch via `fail_transfers` when present.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn psbt_op_abort(&mut self, online: Online, operation_id: &str) -> Result<(), Error> {
+        info!(self.logger(), "Aborting HTLC operation {operation_id}...");
+        self.check_online(online)?;
+        let mut meta = self.psbt_op_read_meta(operation_id)?;
+        let batch_transfer_idx = self.psbt_op_resolve_batch_idx(&meta)?;
+        if meta.status == PsbtOperationStatus::Failed {
+            if let Some(idx) = batch_transfer_idx {
+                self.psbt_op_fail_batch_if_initiated(online, idx)?;
+            }
+            self.psbt_op_backup_after_coherent_failure()?;
+            info!(self.logger(), "HTLC abort completed");
+            return Ok(());
+        }
+        if meta.status != PsbtOperationStatus::Prepared {
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "operation {operation_id} is {:?}, expected Prepared",
+                    meta.status
+                ),
+            });
+        }
+        if self
+            .psbt_op_dir(operation_id)?
+            .join(STASH_CONSUMED_FILE)
+            .exists()
+        {
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "operation {operation_id} already consumed its fascia into the RGB stash, \
+                     it can only be completed with psbt_op_apply"
+                ),
+            });
+        }
+
+        if self.indexer().get_tx_confirmations(&meta.txid)?.is_some() {
+            if meta.broadcast != PsbtBroadcastState::Observed {
+                meta.broadcast = PsbtBroadcastState::Observed;
+                self.psbt_op_write_meta(operation_id, &meta)?;
+            }
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "witness tx {} is known to the indexer; refuse abort",
+                    meta.txid
+                ),
+            });
+        }
+        if meta.broadcast != PsbtBroadcastState::NotAttempted {
+            let expired = match batch_transfer_idx {
+                Some(idx) => self.psbt_op_batch_expired(idx)?,
+                None => true,
+            };
+            if !expired {
+                if meta.broadcast == PsbtBroadcastState::Attempted {
+                    meta.broadcast = PsbtBroadcastState::Ambiguous;
+                    self.psbt_op_write_meta(operation_id, &meta)?;
+                }
+                return Err(Error::InvalidPsbtOperationStatus {
+                    details: format!(
+                        "operation {operation_id} broadcast is {:?}; automatic rollback is \
+                         refused until the batch transfer expires",
+                        meta.broadcast
+                    ),
+                });
+            }
+        }
+
+        if let Some(idx) = batch_transfer_idx {
+            self.psbt_op_fail_batch_if_initiated(online, idx)?;
+        }
+        #[cfg(test)]
+        if MOCK_FAIL_AFTER_PSBT_OP_SQL_FAIL.with(|f| f.replace(false)) {
+            return Err(Error::Internal {
+                details: s!("mock failure after HTLC SQL fail"),
+            });
+        }
+        self.psbt_op_journal_failed(&mut meta, batch_transfer_idx)?;
+        self.psbt_op_backup_after_coherent_failure()?;
+        info!(self.logger(), "HTLC abort completed");
+        Ok(())
+    }
+
+    fn psbt_op_journal_failed(
+        &self,
+        meta: &mut PsbtOpMeta,
+        batch_transfer_idx: Option<i32>,
+    ) -> Result<bool, Error> {
+        if meta.status == PsbtOperationStatus::Failed
+            && meta.batch_transfer_idx == batch_transfer_idx
+        {
+            return Ok(false);
+        }
+        if let Some(idx) = batch_transfer_idx {
+            Self::psbt_op_set_batch_identity(meta, idx)?;
+        }
+        meta.status = PsbtOperationStatus::Failed;
+        self.psbt_op_write_meta(&meta.operation_id, meta)?;
+        Ok(true)
+    }
+
+    fn psbt_op_batch(&self, batch_transfer_idx: i32) -> Result<Option<DbBatchTransfer>, Error> {
+        let txn = self.database().begin_transaction()?;
+        Ok(txn
+            .iter_batch_transfers()?
+            .into_iter()
+            .find(|b| b.idx == batch_transfer_idx))
+    }
+
+    fn psbt_op_batch_status(
+        &self,
+        batch_transfer_idx: i32,
+    ) -> Result<Option<TransferStatus>, Error> {
+        Ok(self.psbt_op_batch(batch_transfer_idx)?.map(|b| b.status))
+    }
+
+    fn psbt_op_batch_expired(&self, batch_transfer_idx: i32) -> Result<bool, Error> {
+        let now = now().unix_timestamp();
+        Ok(self
+            .psbt_op_batch(batch_transfer_idx)?
+            .and_then(|b| b.expiration)
+            .is_some_and(|expiration| expiration < now))
+    }
+
+    /// Align operation metas with batches `fail_transfers` marked Failed.
+    pub(crate) fn psbt_op_heal_failed(&self) -> Result<bool, Error> {
+        let mut healed = false;
+        for mut meta in self.psbt_op_scan()? {
+            if meta.status != PsbtOperationStatus::Prepared {
+                continue;
+            }
+            let Some(idx) = self.psbt_op_resolve_batch_idx(&meta)? else {
+                continue;
+            };
+            if self.psbt_op_batch_status(idx)? == Some(TransferStatus::Failed) {
+                healed |= self.psbt_op_journal_failed(&mut meta, Some(idx))?;
+            }
+        }
+        Ok(healed)
+    }
+
+    /// Whether a Prepared operation linked to this batch reported a broadcast attempt and the
+    /// batch has not expired yet.
+    pub(crate) fn psbt_op_has_live_broadcast(
+        &self,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<bool, Error> {
+        let now = now().unix_timestamp();
+        if batch_transfer
+            .expiration
+            .is_some_and(|expiration| expiration < now)
+        {
+            return Ok(false);
+        }
+        for meta in self.psbt_op_scan()? {
+            if meta.status != PsbtOperationStatus::Prepared {
+                continue;
+            }
+            if meta.broadcast == PsbtBroadcastState::NotAttempted {
+                continue;
+            }
+            let linked = match meta.batch_transfer_idx {
+                Some(idx) => idx == batch_transfer.idx,
+                None => batch_transfer
+                    .txid
+                    .as_deref()
+                    .is_some_and(|txid| meta.txid == txid),
+            };
+            if linked {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn psbt_op_backup_after_coherent_failure(&self) -> Result<(), Error> {
+        let txn = self.database().begin_transaction()?;
+        self.update_backup_info(&txn, false)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn psbt_op_fail_linked_batch(
+        &mut self,
+        online: Online,
+        batch_transfer_idx: i32,
+    ) -> Result<(), Error> {
+        let outcome = self.fail_transfers_commit(online, Some(batch_transfer_idx), false, true)?;
+        if outcome.cannot_fail {
+            return Err(Error::CannotFailBatchTransfer);
+        }
+        Ok(())
+    }
+
+    fn psbt_op_fail_batch_if_initiated(
+        &mut self,
+        online: Online,
+        batch_transfer_idx: i32,
+    ) -> Result<(), Error> {
+        match self.psbt_op_batch_status(batch_transfer_idx)? {
+            Some(TransferStatus::Initiated) => {
+                self.psbt_op_fail_linked_batch(online, batch_transfer_idx)
+            }
+            Some(TransferStatus::Failed) | None => Ok(()),
+            Some(other) => Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "HTLC batch transfer {batch_transfer_idx} is {other:?}, expected Initiated or Failed"
+                ),
+            }),
+        }
+    }
+
+    /// Record that the caller attempted to broadcast the prepared witness tx. Idempotent;
+    /// refused once the linked batch was rolled back.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn psbt_op_mark_broadcast(&self, operation_id: &str) -> Result<(), Error> {
+        let mut meta = self.psbt_op_read_meta(operation_id)?;
+        if meta.status != PsbtOperationStatus::Prepared {
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "operation {operation_id} is {:?}, expected Prepared",
+                    meta.status
+                ),
+            });
+        }
+        if let Some(idx) = self.psbt_op_resolve_batch_idx(&meta)?
+            && self.psbt_op_batch_status(idx)? == Some(TransferStatus::Failed)
+        {
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "operation {operation_id} batch transfer {idx} is Failed; it cannot be broadcast"
+                ),
+            });
+        }
+        match meta.broadcast {
+            PsbtBroadcastState::NotAttempted => {
+                meta.broadcast = PsbtBroadcastState::Attempted;
+                self.psbt_op_write_meta(operation_id, &meta)
+            }
+            PsbtBroadcastState::Attempted
+            | PsbtBroadcastState::Ambiguous
+            | PsbtBroadcastState::Observed => Ok(()),
+        }
+    }
+
+    /// Find a committed HTLC operation by witness txid (lost `operation_id` / retry).
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn psbt_op_by_txid(&self, txid: &str) -> Result<PsbtOperation, Error> {
+        let matches: Vec<PsbtOpMeta> = self
+            .psbt_op_scan()?
+            .into_iter()
+            .filter(|meta| meta.txid == txid)
+            .collect();
+        if matches.is_empty() {
+            return Err(Error::PsbtOperationNotFound {
+                operation_id: txid.to_string(),
+            });
+        }
+        let live: Vec<&PsbtOpMeta> = matches
+            .iter()
+            .filter(|meta| meta.status != PsbtOperationStatus::Failed)
+            .collect();
+        match (matches.as_slice(), live.as_slice()) {
+            ([meta], _) => self.psbt_op_from_meta(meta),
+            (_, [meta]) => self.psbt_op_from_meta(meta),
+            _ => Err(Error::Internal {
+                details: format!("multiple HTLC operations share txid {txid}"),
+            }),
+        }
+    }
+
+    /// Read HTLC operation status; marks Settled when a linked batch has settled.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn psbt_op_reconcile(&self, operation_id: &str) -> Result<PsbtOperationStatus, Error> {
+        let mut meta = self.psbt_op_read_meta(operation_id)?;
+        if let Some(batch_transfer_idx) = self.psbt_op_resolve_batch_idx(&meta)? {
+            let txn = self.database().begin_transaction()?;
+            let db_data = txn.get_db_data(false)?;
+            if let Some(batch) = db_data
+                .batch_transfers
+                .iter()
+                .find(|b| b.idx == batch_transfer_idx)
+            {
+                if meta.status == PsbtOperationStatus::Prepared
+                    && batch.status == TransferStatus::Failed
+                {
+                    self.psbt_op_journal_failed(&mut meta, Some(batch_transfer_idx))?;
+                } else if meta.status == PsbtOperationStatus::Applied
+                    && batch.status == TransferStatus::Settled
+                {
+                    meta.status = PsbtOperationStatus::Settled;
+                    self.psbt_op_write_meta(operation_id, &meta)?;
+                }
+            }
+        }
+        Ok(meta.status)
+    }
+}
+
 #[cfg(test)]
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 mod tests {
@@ -1571,6 +2810,29 @@ mod tests {
             value: BdkAmount::ZERO,
             script_pubkey: ScriptBuf::new_op_return([]),
         }
+    }
+
+    #[test]
+    fn psbt_op_payload_hashes_bind_files_txid_and_batch() {
+        let consignments = BTreeMap::from([(s!("rgb:asset"), sha256_hex(b"consignment"))]);
+        let hashes = PsbtOpPayloadHashes::new(
+            b"fascia",
+            b"psbt",
+            b"foreign_inputs",
+            consignments,
+            "txid-1",
+            Some(7),
+        );
+        assert_eq!(hashes.fascia, sha256_hex(b"fascia"));
+        assert_eq!(hashes.colored_psbt, sha256_hex(b"psbt"));
+        assert_eq!(hashes.foreign_inputs, sha256_hex(b"foreign_inputs"));
+        assert_eq!(hashes.txid, sha256_hex(b"txid-1"));
+        assert_eq!(
+            hashes.batch_transfer_idx,
+            Some(psbt_op_batch_identity_hash(7))
+        );
+        assert_ne!(hashes.fascia, hashes.colored_psbt);
+        assert_ne!(hashes.txid, psbt_op_batch_identity_hash(7));
     }
 
     #[test]
