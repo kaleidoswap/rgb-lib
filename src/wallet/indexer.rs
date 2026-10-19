@@ -194,6 +194,47 @@ impl Indexer {
         })
     }
 
+    /// The amount (in sats) of `outpoint` if it exists, locks `script` and is unspent, counting
+    /// mempool spends, `None` otherwise.
+    pub(crate) fn unspent_txo_amount(
+        &self,
+        outpoint: &OutPoint,
+        script: &ScriptBuf,
+    ) -> Result<Option<u64>, Error> {
+        Ok(match self {
+            #[cfg(feature = "electrum")]
+            Indexer::Electrum(client) => client
+                .inner
+                .script_list_unspent(script)
+                .map_err(IndexerError::from)?
+                .iter()
+                .find(|u| u.tx_hash == outpoint.txid && u.tx_pos == outpoint.vout as usize)
+                .map(|u| u.value),
+            #[cfg(feature = "esplora")]
+            Indexer::Esplora(client) => {
+                // the outspend endpoint reports an unknown outpoint as unspent, so check the
+                // funding tx first
+                let Some(tx) = client.get_tx(&outpoint.txid).map_err(IndexerError::from)? else {
+                    return Ok(None);
+                };
+                let Some(txout) = tx
+                    .output
+                    .get(outpoint.vout as usize)
+                    .filter(|o| &o.script_pubkey == script)
+                else {
+                    return Ok(None);
+                };
+                match client
+                    .get_output_status(&outpoint.txid, outpoint.vout as u64)
+                    .map_err(IndexerError::from)?
+                {
+                    Some(status) if !status.spent => Some(txout.value.to_sat()),
+                    _ => None,
+                }
+            }
+        })
+    }
+
     pub(crate) fn populate_tx_cache(
         &self,
         #[cfg_attr(feature = "esplora", allow(unused))] bdk_wallet: &PersistedWallet<
@@ -396,7 +437,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(50_000_000_000),
+                value: Amount::from_sat(TEST_TXO_AMOUNT),
                 script_pubkey: ScriptBuf::new(),
             }],
         };
@@ -450,6 +491,131 @@ mod tests {
         }
 
         result
+    }
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn test_outpoint(vout: u32) -> OutPoint {
+        OutPoint::new(
+            bdk_wallet::bitcoin::Txid::from_str(TEST_TXID).unwrap(),
+            vout,
+        )
+    }
+
+    /// The single output of `minimal_tx_raw_bytes`, and the one `test_outpoint(1)` points to in
+    /// the Electrum mock, locks this script with this amount.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    const TEST_TXO_AMOUNT: u64 = 50_000_000_000;
+
+    #[cfg(feature = "electrum")]
+    fn run_electrum_unspent_txo_amount_case(vout: u32, script: &ScriptBuf) -> Option<u64> {
+        // Electrum script hash: the reversed SHA256 of the script
+        let mut scripthash = <sha256::Hash as Sha256Hash>::hash(script.as_bytes()).to_byte_array();
+        scripthash.reverse();
+        let scripthash = bdk_wallet::bitcoin::hex::DisplayHex::to_lower_hex_string(&scripthash[..]);
+        let (url, handle) = start_electrum_mock(move |method, req| {
+            assert_eq!(method, "blockchain.scripthash.listunspent");
+            assert_eq!(req["params"][0].as_str(), Some(scripthash.as_str()));
+            electrum_tx_get_result(
+                req,
+                &format!(
+                    r#"[{{"height":0,"tx_hash":"{TEST_TXID}","tx_pos":1,"value":{TEST_TXO_AMOUNT}}}]"#
+                ),
+            )
+        });
+        let res = electrum_indexer(&url)
+            .unspent_txo_amount(&test_outpoint(vout), script)
+            .unwrap();
+        handle.join().expect("mock electrum thread");
+        res
+    }
+
+    /// The outspend endpoint is only mocked (and so only allowed to be called) when
+    /// `outspend_body` is set.
+    #[cfg(feature = "esplora")]
+    fn run_esplora_unspent_txo_amount_case(
+        raw_tx: Option<Vec<u8>>,
+        vout: u32,
+        script: &ScriptBuf,
+        outspend_body: Option<&str>,
+    ) -> Option<u64> {
+        let mut server = mockito::Server::new();
+        let mock_raw = server.mock("GET", format!("/tx/{TEST_TXID}/raw").as_str());
+        let mock_raw = match raw_tx {
+            Some(bytes) => mock_raw
+                .with_status(200)
+                .with_header("content-type", "application/octet-stream")
+                .with_body(bytes)
+                .create(),
+            None => mock_raw.with_status(404).create(),
+        };
+        let mock_outspend = outspend_body.map(|body| {
+            server
+                .mock("GET", format!("/tx/{TEST_TXID}/outspend/{vout}").as_str())
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create()
+        });
+
+        let res = esplora_indexer(&server.url())
+            .unspent_txo_amount(&test_outpoint(vout), script)
+            .unwrap();
+
+        mock_raw.assert();
+        if let Some(mock) = mock_outspend {
+            mock.assert();
+        }
+        res
+    }
+
+    #[cfg(feature = "electrum")]
+    #[test]
+    fn test_electrum_unspent_txo_amount() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        assert_eq!(
+            run_electrum_unspent_txo_amount_case(1, &script),
+            Some(TEST_TXO_AMOUNT)
+        );
+        // an outpoint missing from the script's unspents is spent, unknown or locks another script
+        assert_eq!(run_electrum_unspent_txo_amount_case(0, &script), None);
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn test_esplora_unspent_txo_amount() {
+        // minimal_tx_raw_bytes has a single output locking an empty script
+        let script = ScriptBuf::new();
+        let unspent = Some(r#"{"spent": false}"#);
+        assert_eq!(
+            run_esplora_unspent_txo_amount_case(Some(minimal_tx_raw_bytes()), 0, &script, unspent),
+            Some(TEST_TXO_AMOUNT)
+        );
+        let spent = Some(
+            r#"{"spent": true, "txid": "1111111111111111111111111111111111111111111111111111111111111111", "vin": 0}"#,
+        );
+        assert_eq!(
+            run_esplora_unspent_txo_amount_case(Some(minimal_tx_raw_bytes()), 0, &script, spent),
+            None
+        );
+        // outspend reports unknown outpoints as unspent: it must not be trusted alone
+        assert_eq!(
+            run_esplora_unspent_txo_amount_case(None, 0, &script, None),
+            None
+        );
+        assert_eq!(
+            run_esplora_unspent_txo_amount_case(Some(minimal_tx_raw_bytes()), 1, &script, None),
+            None
+        );
+        let other_script = ScriptBuf::from_bytes(vec![0x51]);
+        assert_eq!(
+            run_esplora_unspent_txo_amount_case(
+                Some(minimal_tx_raw_bytes()),
+                0,
+                &other_script,
+                None
+            ),
+            None
+        );
     }
 
     #[cfg(feature = "electrum")]
