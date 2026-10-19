@@ -4,6 +4,11 @@ namespace rgb_lib {
   [Throws=RgbLibError]
   Keys restore_keys(BitcoinNetwork bitcoin_network, string mnemonic, WitnessVersion witness_version);
 
+  // Decode a witness recipient_id (`bc:wvout:...`) to a scriptPubKey hex.
+  // Blinded recipient IDs are valid but have no script; those return null.
+  [Throws=RgbLibError]
+  string? script_hex_from_recipient_id(string recipient_id);
+
   [Throws=RgbLibError]
   void restore_backup(string backup_path, string password, string data_dir);
 };
@@ -40,6 +45,7 @@ interface RgbLibError {
   InsufficientAllocationSlots();
   InsufficientAssignments(string asset_id, AssignmentsCollection available);
   InsufficientBitcoins(u64 needed, u64 available);
+  InsufficientConfirmations(u8 needed, u64 got);
   Internal(string details);
   InvalidAddress(string details);
   InvalidAmountZero();
@@ -65,6 +71,7 @@ interface RgbLibError {
   InvalidPrecision(string details);
   InvalidProxyProtocol(string version);
   InvalidPsbt(string details);
+  InvalidPsbtOperationStatus(string details);
   InvalidPubkey(string details);
   InvalidRecipientData(string details);
   InvalidRecipientID();
@@ -102,6 +109,7 @@ interface RgbLibError {
   OutputBelowDustLimit();
   Proxy(string details);
   PsbtInspection(string details);
+  PsbtOperationNotFound(string operation_id);
   RecipientIDAlreadyUsed();
   RecipientIDDuplicated();
   RejectListService(string details);
@@ -111,8 +119,10 @@ interface RgbLibError {
   TooHighIssuanceAmounts();
   TooManyCosigners();
   TooManySignaturesInPsbt();
+  UnexpectedTransfer(string details);
   UnknownRgbSchema(string schema_id);
   UnknownTransfer(string txid);
+  UnsafeTransferHistory(string details);
   UnsupportedBackupVersion(string version);
   UnsupportedBurn(AssetSchema asset_schema);
   UnsupportedInflation(AssetSchema asset_schema);
@@ -123,6 +133,7 @@ interface RgbLibError {
   WalletDirAlreadyExists(string path);
   WalletSettingMismatch(string setting, string expected, string provided);
   WatchOnly();
+  WitnessOutputMismatch(string details);
   WrongPassword();
 };
 
@@ -248,6 +259,71 @@ dictionary ReceiveData {
   string recipient_id;
   u64 expiration_timestamp;
   i32 batch_transfer_idx;
+};
+
+dictionary AcceptTransferResult {
+  sequence<u8> consignment;
+  sequence<Assignment> assignments;
+};
+
+// Caller intent for fetch_and_accept: reject unintended but structurally valid consignments.
+dictionary ExpectedTransfer {
+  string asset_id;
+  AssetSchema asset_schema;
+  Assignment assignment;
+};
+
+// FFI-friendly coloring inputs for HTLC prepare (final PSBT vout indices only).
+// Maps to rgb_lib::wallet::rust_only::{AssetColoringInfo, ColoringInfo}.
+// Coloring must happen before any input is signed; signed PSBTs are rejected.
+// OP_RETURN must already be present; with P2TR it must be vout 0.
+dictionary AssetColoringInfo {
+  string asset_id;
+  record<u32, u64> output_map;
+  u64? static_blinding;
+};
+
+dictionary ColoringInfo {
+  sequence<AssetColoringInfo> assets;
+  u64? static_blinding;
+  u64? nonce;
+};
+
+[Enum]
+interface PsbtOperationStatus {
+  Prepared();
+  Applied();
+  Failed();
+  Settled();
+};
+
+[Enum]
+interface PsbtBroadcastState {
+  NotAttempted();
+  Attempted();
+  Observed();
+  Ambiguous();
+};
+
+dictionary PsbtOpPrepareResult {
+  string operation_id;
+  string colored_psbt;
+  // Wallet-relative directory with fascia, colored.psbt, consignments/, foreign_inputs.json, meta.json
+  string operation_dir;
+};
+
+dictionary PsbtOperation {
+  string operation_id;
+  string colored_psbt;
+  string operation_dir;
+  PsbtOperationStatus status;
+  PsbtBroadcastState broadcast;
+  string txid;
+};
+
+dictionary OutpointAssignments {
+  Outpoint outpoint;
+  sequence<Assignment> assignments;
 };
 
 interface RecipientInfo {
@@ -852,6 +928,49 @@ interface Wallet {
   ReceiveData witness_receive(
     string? asset_id, Assignment assignment, u64 expiration_timestamp,
     sequence<string> transport_endpoints, u8 min_confirmations);
+
+  // High-level HTLC color lifecycle (final vout output_map only).
+  // prepare → sign/broadcast → apply. abort if never broadcast. reconcile for status.
+  // Payloads are file-backed under operation_dir (not raw consignment bytes).
+  // psbt_op_mark_broadcast before broadcasting: abort/fail_transfers then wait for
+  // expiration_timestamp (null = 24h) before the indexer may release the batch.
+  [Throws=RgbLibError]
+  PsbtOpPrepareResult psbt_op_prepare(
+    string psbt, ColoringInfo coloring_info, sequence<Outpoint> input_outpoints,
+    u8 min_confirmations, u64? expiration_timestamp);
+
+  [Throws=RgbLibError]
+  void psbt_op_apply(Online online, string operation_id);
+
+  [Throws=RgbLibError]
+  void psbt_op_abort(Online online, string operation_id);
+
+  [Throws=RgbLibError]
+  PsbtOperationStatus psbt_op_reconcile(string operation_id);
+
+  [Throws=RgbLibError]
+  void psbt_op_mark_broadcast(string operation_id);
+
+  [Throws=RgbLibError]
+  PsbtOperation psbt_op_by_txid(string txid);
+
+  [Throws=RgbLibError]
+  sequence<OutpointAssignments> contract_assignments_for_outpoints(
+    string asset_id, sequence<Outpoint> outpoints);
+
+  // Fetches by proxy key, pins output[vout] to witness_recipient_id, then accepts.
+  // expected binds contract id, schema, assignment type and amount (empty/mismatch rejected).
+  // min_confirmations: 0 allows mempool/Tentative (reorg-exposed HTLC race); >=1 requires mined.
+  // Raw fetch/accept halves are Rust-only (`*_unchecked`) — do not re-export them here.
+  [Throws=RgbLibError]
+  AcceptTransferResult fetch_and_accept_transfer_by_recipient_id(
+    Online online,
+    string proxy_recipient_id,
+    string witness_recipient_id,
+    string consignment_endpoint,
+    u64 blinding,
+    u8 min_confirmations,
+    ExpectedTransfer expected);
 
   [Throws=RgbLibError]
   string finalize_psbt(string signed_psbt);
