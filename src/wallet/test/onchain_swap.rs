@@ -721,6 +721,525 @@ fn partial_rgb_for_rgb_keeps_change_on_both_sides() {
     assert_settled_balance(&maker, &taker_asset_id, TAKER_PARTIAL);
 }
 
+/// The taker sells RGB from a default-size colored UTXO, so plain BTC must pay its fees.
+#[test]
+#[parallel]
+fn default_utxo_btc_for_rgb_balances() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_default_utxo_swap_asset(
+        &mut taker,
+        taker_online,
+        "SDBR",
+        "Swap Default BTC For RGB",
+        SWAP_RGB_AMOUNT,
+    );
+    let maker_btc_before = total_btc(&mut maker, maker_online);
+    let taker_btc_before = total_btc(&mut taker, taker_online);
+
+    // the top-up never spends an excluded coin
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let uncolored = taker
+        .list_unspents(Some(taker_online), false, false)
+        .unwrap()
+        .into_iter()
+        .filter(|u| !u.utxo.colorable)
+        .map(|u| u.utxo.outpoint)
+        .collect::<Vec<_>>();
+    assert!(!uncolored.is_empty());
+    let result = taker.accept_swap_offer(taker_online, offer.clone(), 0, false, uncolored.clone());
+    assert!(
+        matches!(result, Err(Error::InsufficientBitcoins { .. })),
+        "{result:?}"
+    );
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    assert!(
+        request
+            .taker_inputs
+            .iter()
+            .any(|i| uncolored.contains(&i.outpoint)),
+        "the taker should add a plain BTC input"
+    );
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        btc(SWAP_BTC_PRICE),
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        PROXY_URL,
+    );
+
+    assert_btc_delta(
+        &mut maker,
+        maker_online,
+        maker_btc_before,
+        &mut taker,
+        taker_online,
+        taker_btc_before,
+        ExpectedBtcDelta {
+            maker: -(SWAP_BTC_PRICE as i64),
+            taker: (SWAP_BTC_PRICE as i64) - (SWAP_FEE as i64),
+        },
+    );
+    assert_asset_balances(
+        &maker,
+        &taker,
+        &[ExpectedAssetBalance {
+            asset_id: &asset_id,
+            maker: SWAP_RGB_AMOUNT,
+            taker: 0,
+        }],
+    );
+}
+
+#[test]
+#[parallel]
+fn default_utxo_rgb_for_btc_balances() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_default_utxo_swap_asset(
+        &mut maker,
+        maker_online,
+        "SDRB",
+        "Swap Default RGB For BTC",
+        SWAP_RGB_AMOUNT,
+    );
+    let maker_btc_before = total_btc(&mut maker, maker_online);
+    let taker_btc_before = total_btc(&mut taker, taker_online);
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+
+    assert_btc_delta(
+        &mut maker,
+        maker_online,
+        maker_btc_before,
+        &mut taker,
+        taker_online,
+        taker_btc_before,
+        ExpectedBtcDelta {
+            maker: SWAP_BTC_PRICE as i64,
+            taker: -((SWAP_BTC_PRICE + SWAP_FEE) as i64),
+        },
+    );
+    assert_asset_balances(
+        &maker,
+        &taker,
+        &[ExpectedAssetBalance {
+            asset_id: &asset_id,
+            maker: 0,
+            taker: SWAP_RGB_AMOUNT,
+        }],
+    );
+}
+
+#[test]
+#[parallel]
+fn default_utxo_rgb_for_rgb_balances() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let maker_asset_id = issue_default_utxo_swap_asset(
+        &mut maker,
+        maker_online,
+        "SDMA",
+        "Swap Default Maker",
+        SWAP_RGB_AMOUNT,
+    );
+    let taker_asset_id = issue_default_utxo_swap_asset(
+        &mut taker,
+        taker_online,
+        "SDTA",
+        "Swap Default Taker",
+        SWAP_RGB_AMOUNT,
+    );
+    let maker_btc_before = total_btc(&mut maker, maker_online);
+    let taker_btc_before = total_btc(&mut taker, taker_online);
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&maker_asset_id, SWAP_RGB_AMOUNT),
+        rgb(&taker_asset_id, SWAP_RGB_AMOUNT),
+        PROXY_URL,
+    );
+
+    assert_btc_delta(
+        &mut maker,
+        maker_online,
+        maker_btc_before,
+        &mut taker,
+        taker_online,
+        taker_btc_before,
+        ExpectedBtcDelta {
+            maker: 0,
+            taker: -(SWAP_FEE as i64),
+        },
+    );
+    assert_asset_balances(
+        &maker,
+        &taker,
+        &[
+            ExpectedAssetBalance {
+                asset_id: &maker_asset_id,
+                maker: 0,
+                taker: SWAP_RGB_AMOUNT,
+            },
+            ExpectedAssetBalance {
+                asset_id: &taker_asset_id,
+                maker: SWAP_RGB_AMOUNT,
+                taker: 0,
+            },
+        ],
+    );
+}
+
+/// The maker's default-size colored UTXO exactly pays for its RGB receive output, leaving no
+/// sats for the change output its RGB change needs. The taker's large UTXO isolates the maker.
+#[test]
+#[parallel]
+fn default_utxo_partial_rgb_for_rgb_keeps_maker_change() {
+    initialize();
+
+    const MAKER_PARTIAL: u64 = 300;
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let maker_asset_id = issue_default_utxo_swap_asset(
+        &mut maker,
+        maker_online,
+        "SDPM",
+        "Swap Default Partial Maker",
+        SWAP_RGB_AMOUNT,
+    );
+    let taker_asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SDPT",
+        "Swap Default Partial Taker",
+        SWAP_RGB_AMOUNT,
+    );
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&maker_asset_id, MAKER_PARTIAL),
+        rgb(&taker_asset_id, SWAP_RGB_AMOUNT),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &maker_asset_id, SWAP_RGB_AMOUNT - MAKER_PARTIAL);
+    assert_settled_balance(&taker, &maker_asset_id, MAKER_PARTIAL);
+    assert_settled_balance(&taker, &taker_asset_id, 0);
+    assert_settled_balance(&maker, &taker_asset_id, SWAP_RGB_AMOUNT);
+
+    // the maker's change is spendable in a second swap
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&maker_asset_id, SWAP_RGB_AMOUNT - MAKER_PARTIAL),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &maker_asset_id, 0);
+    assert_settled_balance(&taker, &maker_asset_id, SWAP_RGB_AMOUNT);
+}
+
+/// The taker sells all its RGB from a default-size colored UTXO, topped up by a large plain
+/// coin. With no RGB change the leftover goes back to the vanilla wallet, where `send_btc` can
+/// spend it, instead of being stranded on a colored UTXO.
+#[test]
+#[parallel]
+fn default_utxo_full_sale_returns_btc_change_to_vanilla() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_default_utxo_swap_asset(
+        &mut taker,
+        taker_online,
+        "SDFS",
+        "Swap Default Full Sale",
+        SWAP_RGB_AMOUNT,
+    );
+    // confirm the new colored UTXO so the balances below count it as settled
+    mine(false);
+    let before = taker.get_btc_balance(Some(taker_online), false).unwrap();
+
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let colored_input_sat = colored_input_sat(&mut taker, taker_online, &request.taker_inputs);
+    assert!(colored_input_sat > 0);
+    assert!(
+        request.taker_inputs.len() > 1,
+        "the taker should add a plain BTC input"
+    );
+    assert_eq!(
+        change_keychain(&taker, &request.taker_change_script_pubkey_hex),
+        KeychainKind::Internal,
+        "a side without RGB change should get a vanilla change"
+    );
+    swap_from_request(&mut maker, maker_online, &mut taker, taker_online, request);
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&taker, &asset_id, 0);
+    assert_settled_balance(&maker, &asset_id, SWAP_RGB_AMOUNT);
+
+    // vanilla and colored are checked apart: their sum would hide sats moved between them
+    let after = taker.get_btc_balance(Some(taker_online), false).unwrap();
+    assert_eq!(
+        after.colored.settled,
+        before.colored.settled - colored_input_sat,
+        "nothing should be left on the colored keychain"
+    );
+    assert_eq!(
+        after.vanilla.settled,
+        before.vanilla.settled + colored_input_sat + SWAP_BTC_PRICE - SWAP_FEE,
+        "the change should be vanilla"
+    );
+    assert_eq!(after.vanilla.spendable, after.vanilla.settled);
+
+    // the change is spendable by a plain BTC send: more than the swap paid in
+    let amount = after.vanilla.spendable - 10_000;
+    assert!(amount > SWAP_BTC_PRICE);
+    taker
+        .send_btc(
+            taker_online,
+            maker.get_address().unwrap(),
+            amount,
+            FEE_RATE,
+            false,
+            None,
+        )
+        .unwrap();
+}
+
+/// When the taker keeps RGB change, the change is colored, so its sats can only move with RGB:
+/// the top-up then picks the smallest plain coin that covers the shortfall.
+#[test]
+#[parallel]
+fn default_utxo_partial_sale_colors_change_with_smallest_top_up() {
+    initialize();
+
+    const PARTIAL: u64 = 400;
+    const SMALL_COIN: u64 = 5_000;
+    const MEDIUM_COIN: u64 = 50_000;
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_default_utxo_swap_asset(
+        &mut taker,
+        taker_online,
+        "SDPS",
+        "Swap Default Partial Sale",
+        SWAP_RGB_AMOUNT,
+    );
+    send_sats_to_address(taker.get_address().unwrap(), Some(MEDIUM_COIN));
+    send_sats_to_address(taker.get_address().unwrap(), Some(SMALL_COIN));
+    mine(false);
+    let plain_coins = taker
+        .list_unspents(Some(taker_online), false, false)
+        .unwrap()
+        .into_iter()
+        .filter(|u| !u.utxo.colorable)
+        .collect::<Vec<_>>();
+    assert!(plain_coins.len() >= 3, "a large, a medium and a small coin");
+    let small_coin = plain_coins
+        .iter()
+        .find(|u| u.utxo.btc_amount == SMALL_COIN)
+        .unwrap()
+        .utxo
+        .outpoint
+        .clone();
+    let before = taker.get_btc_balance(Some(taker_online), false).unwrap();
+
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, PARTIAL),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let colored_input_sat = colored_input_sat(&mut taker, taker_online, &request.taker_inputs);
+    let plain_inputs = request
+        .taker_inputs
+        .iter()
+        .filter(|i| plain_coins.iter().any(|u| u.utxo.outpoint == i.outpoint))
+        .map(|i| i.outpoint.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        plain_inputs,
+        vec![small_coin],
+        "the top-up should be the smallest coin covering the shortfall"
+    );
+    assert_eq!(
+        change_keychain(&taker, &request.taker_change_script_pubkey_hex),
+        KeychainKind::External,
+        "RGB change needs a colored change"
+    );
+    swap_from_request(&mut maker, maker_online, &mut taker, taker_online, request);
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&taker, &asset_id, SWAP_RGB_AMOUNT - PARTIAL);
+    assert_settled_balance(&maker, &asset_id, PARTIAL);
+
+    // the change carries the RGB change and only the leftover of the small coin
+    let change_sat = colored_input_sat + SMALL_COIN - SWAP_FEE;
+    let unspents = taker
+        .list_unspents(Some(taker_online), false, false)
+        .unwrap();
+    let change = unspents
+        .iter()
+        .find(|u| {
+            u.rgb_allocations
+                .iter()
+                .any(|a| a.asset_id.as_deref() == Some(asset_id.as_str()))
+        })
+        .expect("the RGB change sits on a colored UTXO");
+    assert!(change.utxo.colorable);
+    assert_eq!(change.utxo.btc_amount, change_sat);
+    let after = taker.get_btc_balance(Some(taker_online), false).unwrap();
+    assert_eq!(
+        after.colored.settled,
+        before.colored.settled - colored_input_sat + change_sat
+    );
+    assert_eq!(
+        after.vanilla.settled,
+        before.vanilla.settled - SMALL_COIN + SWAP_BTC_PRICE
+    );
+}
+
+/// A coin reserved by an unbroadcast `send_btc_begin` is never used to top up a swap.
+#[test]
+#[parallel]
+fn swap_top_up_skips_reserved_coins() {
+    initialize();
+
+    const FREE_COIN: u64 = 50_000;
+
+    let (mut maker, _maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_default_utxo_swap_asset(
+        &mut taker,
+        taker_online,
+        "SDRS",
+        "Swap Default Reserved",
+        SWAP_RGB_AMOUNT,
+    );
+    // reserve the taker's only plain coin
+    let pending_psbt = taker
+        .send_btc_begin(
+            taker_online,
+            maker.get_address().unwrap(),
+            1_000,
+            FEE_RATE,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    let reserved = Psbt::from_str(&pending_psbt)
+        .unwrap()
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| Outpoint::from(i.previous_output))
+        .collect::<Vec<_>>();
+    assert!(!reserved.is_empty());
+
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let result = taker.accept_swap_offer(taker_online, offer.clone(), 0, false, vec![]);
+    assert!(
+        matches!(result, Err(Error::InsufficientBitcoins { .. })),
+        "{result:?}"
+    );
+
+    // a free coin is picked instead of the reserved one
+    send_sats_to_address(taker.get_address().unwrap(), Some(FREE_COIN));
+    mine(false);
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    assert!(
+        request
+            .taker_inputs
+            .iter()
+            .all(|i| !reserved.contains(&i.outpoint)),
+        "the swap should not spend a reserved coin"
+    );
+    assert!(
+        request
+            .taker_inputs
+            .iter()
+            .any(|i| i.amount_sat == FREE_COIN)
+    );
+    assert_eq!(taker.list_pending_vanilla_txs().unwrap().len(), 1);
+}
+
 #[test]
 #[parallel]
 fn second_asset_on_swap_input_survives() {
@@ -1125,6 +1644,65 @@ fn exclude_outpoints_and_list_swaps() {
     assert_eq!(cancelled_summary.txid, None);
 }
 
+/// Run a swap from the taker's request to both sides accepting their transfers.
+fn swap_from_request(
+    maker: &mut Wallet,
+    maker_online: Online,
+    taker: &mut Wallet,
+    taker_online: Online,
+    request: OnchainSwapRequest,
+) {
+    let proposal = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap();
+    let completion = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap();
+    let completion = maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap();
+    maker
+        .broadcast_swap_completion(maker_online, completion.clone())
+        .unwrap();
+    mine(false);
+    maker
+        .accept_swap_transfers(
+            maker_online,
+            completion.clone(),
+            OnchainSwapRole::Maker,
+            false,
+        )
+        .unwrap();
+    taker
+        .accept_swap_transfers(taker_online, completion, OnchainSwapRole::Taker, false)
+        .unwrap();
+}
+
+/// Sats of the given swap inputs that sit on colored UTXOs.
+fn colored_input_sat(wallet: &mut Wallet, online: Online, inputs: &[OnchainSwapInput]) -> u64 {
+    let colored = wallet
+        .list_unspents(Some(online), false, false)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable)
+        .map(|u| u.utxo.outpoint)
+        .collect::<Vec<_>>();
+    inputs
+        .iter()
+        .filter(|i| colored.contains(&i.outpoint))
+        .map(|i| i.amount_sat)
+        .sum()
+}
+
+/// Keychain of one of the wallet's own change scripts.
+fn change_keychain(wallet: &Wallet, script_hex: &str) -> KeychainKind {
+    wallet
+        .bdk_wallet()
+        .derivation_of_spk(ScriptBuf::from_hex(script_hex).unwrap())
+        .expect("the change script belongs to the wallet")
+        .0
+}
+
 /// Run a swap up to the taker's completion, with the offer expiring at `expiration`.
 #[allow(clippy::too_many_arguments)]
 fn swap_to_completion(
@@ -1363,6 +1941,25 @@ fn issue_swap_asset(
 ) -> String {
     wallet
         .create_utxos(online, false, Some(1), Some(10_000), FEE_RATE, false)
+        .unwrap();
+    let asset = wallet
+        .issue_asset_nia(ticker.to_string(), name.to_string(), 0, vec![amount])
+        .unwrap();
+    assert_eq!(asset_amount(wallet, &asset.asset_id), amount);
+    asset.asset_id
+}
+
+/// Like [`issue_swap_asset`], on a colored UTXO of the default size, whose sats can't cover the
+/// swap fees on their own.
+fn issue_default_utxo_swap_asset(
+    wallet: &mut Wallet,
+    online: Online,
+    ticker: &str,
+    name: &str,
+    amount: u64,
+) -> String {
+    wallet
+        .create_utxos(online, false, Some(1), None, FEE_RATE, false)
         .unwrap();
     let asset = wallet
         .issue_asset_nia(ticker.to_string(), name.to_string(), 0, vec![amount])

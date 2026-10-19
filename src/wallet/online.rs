@@ -4867,7 +4867,9 @@ impl SwapRgbSend<'_> {
     ) -> Result<(ContractId, rust_only::ColoringInfo, bool), Error> {
         let available = swap_input_rgb_amounts(wallet, &self.input_outpoints())?;
         let change_script = swap_parse_script(self.change_script_hex)?;
-        // RGB change must land on the colored keychain, where the wallet tracks it
+        // RGB change must land on the colored keychain, where the wallet tracks it. A side
+        // without RGB change gets a vanilla change (see swap_select_inputs), so no change vout
+        // here, and coloring fails closed if RGB change turns up anyway.
         let colored_change = matches!(
             wallet.bdk_wallet().derivation_of_spk(change_script.clone()),
             Some((KeychainKind::External, _))
@@ -5644,49 +5646,118 @@ pub(crate) fn swap_fetch_asset_history_to_file(
     Ok(target_path)
 }
 
+/// Pick coins out of `values` that together cover `needed`, keeping the overshoot small: the
+/// smallest coin that covers what is still missing, else the largest coin, and repeat. Returns
+/// the indices of the picked coins, or `None` when all of them together fall short.
+pub(crate) fn swap_pick_smallest_covering(values: &[u64], needed: u64) -> Option<Vec<usize>> {
+    let mut order = (0..values.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&i| (values[i], i));
+    let mut picked = vec![];
+    let mut missing = needed;
+    while missing > 0 {
+        if let Some(pos) = order.iter().position(|&i| values[i] >= missing) {
+            picked.push(order.remove(pos));
+            return Some(picked);
+        }
+        // no single coin covers the rest, so every remaining coin is below `missing`
+        let largest = order.pop()?;
+        missing -= values[largest];
+        picked.push(largest);
+    }
+    Some(picked)
+}
+
+/// Select plain BTC inputs from the vanilla wallet worth at least `needed_sat`.
+///
+/// Coins in `excluded`, coins already spent and coins the wallet holds back from vanilla sends
+/// (DB-tracked TXOs and those reserved by an unbroadcast `send_btc_begin` / `create_utxos_begin`)
+/// are never picked. With `prefer_smallest` the coins are chosen to leave the smallest leftover,
+/// otherwise they are taken in wallet order until the amount is covered.
 pub(crate) fn swap_select_btc_inputs(
     wallet: &mut Wallet,
-    online: Online,
+    txn: &DbTxn,
     needed_sat: u64,
     min_confirmations: u8,
     excluded: &HashSet<(&str, u32)>,
+    prefer_smallest: bool,
 ) -> Result<Vec<OnchainSwapInput>, Error> {
     // The caller (swap_select_inputs) already synced via sync_if_requested; we use
     // internal_unspents() directly to avoid opening a second DB connection while the
     // caller's transaction is still live (pool size = 1).
+    let unspendable = wallet
+        .get_unspendable_bdk_outpoints(txn)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let candidates = wallet
+        .internal_unspents()
+        .filter(|o| {
+            let txid = o.outpoint.txid.to_string();
+            !o.is_spent
+                && !unspendable.contains(&o.outpoint)
+                && !excluded.contains(&(txid.as_str(), o.outpoint.vout))
+        })
+        .collect::<Vec<_>>();
+    let is_confirmed = |output: &LocalOutput| -> Result<bool, Error> {
+        if min_confirmations == 0 {
+            return Ok(true);
+        }
+        let confs = wallet
+            .indexer()
+            .get_tx_confirmations(&output.outpoint.txid.to_string())?
+            .unwrap_or_default();
+        Ok(confs >= min_confirmations as u64)
+    };
+    let insufficient = |available: u64| Error::InsufficientBitcoins {
+        needed: needed_sat,
+        available,
+    };
+    if prefer_smallest {
+        let mut eligible = vec![];
+        for output in candidates {
+            if is_confirmed(&output)? {
+                eligible.push(output);
+            }
+        }
+        let values = eligible
+            .iter()
+            .map(|o| o.txout.value.to_sat())
+            .collect::<Vec<_>>();
+        return match swap_pick_smallest_covering(&values, needed_sat) {
+            Some(picked) => Ok(picked
+                .into_iter()
+                .map(|i| swap_build_input(&eligible[i]))
+                .collect()),
+            None => Err(insufficient(
+                values.iter().fold(0u64, |acc, v| acc.saturating_add(*v)),
+            )),
+        };
+    }
     let mut selected = vec![];
     let mut total = 0u64;
-    for output in wallet.internal_unspents().filter(|o| {
-        let txid = o.outpoint.txid.to_string();
-        !o.is_spent && !excluded.contains(&(txid.as_str(), o.outpoint.vout))
-    }) {
-        if min_confirmations > 0 {
-            let confs = wallet
-                .indexer()
-                .get_tx_confirmations(&output.outpoint.txid.to_string())?
-                .unwrap_or_default();
-            if confs < min_confirmations as u64 {
-                continue;
-            }
+    for output in candidates {
+        if total >= needed_sat {
+            break;
+        }
+        if !is_confirmed(&output)? {
+            continue;
         }
         total = total
             .checked_add(output.txout.value.to_sat())
             .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
         selected.push(swap_build_input(&output));
-        if total >= needed_sat {
-            break;
-        }
     }
     if total < needed_sat {
-        return Err(Error::InsufficientBitcoins {
-            needed: needed_sat,
-            available: total,
-        });
+        return Err(insufficient(total));
     }
-    let _ = online; // consumed by the caller's sync; kept in signature for clarity
     Ok(selected)
 }
 
+/// Select this side's inputs for what it `gives` plus `extra_sat` of its own costs, and return
+/// them with the keychain its change output must use.
+///
+/// The change goes to the colored keychain only when the inputs carry RGB change (of the swapped
+/// asset or of others sharing the inputs), which coloring then assigns to it. Otherwise it goes
+/// to the vanilla keychain, so the sats of a plain BTC top-up stay spendable by `send_btc`.
 pub(crate) fn swap_select_inputs(
     wallet: &mut Wallet,
     txn: &DbTxn,
@@ -5696,7 +5767,7 @@ pub(crate) fn swap_select_inputs(
     min_confirmations: u8,
     skip_sync: bool,
     exclude_outpoints: &[Outpoint],
-) -> Result<Vec<OnchainSwapInput>, Error> {
+) -> Result<(Vec<OnchainSwapInput>, KeychainKind), Error> {
     wallet.sync_if_requested(txn, Some(online), skip_sync, KeychainKind::Internal)?;
     wallet.sync_if_requested(txn, Some(online), skip_sync, KeychainKind::External)?;
     let excluded = exclude_outpoints
@@ -5704,18 +5775,24 @@ pub(crate) fn swap_select_inputs(
         .map(|o| (o.txid.as_str(), o.vout))
         .collect::<HashSet<_>>();
     match gives.kind {
-        OnchainSwapLegKind::Btc => swap_select_btc_inputs(
-            wallet,
-            online,
-            gives
-                .amount
-                .checked_add(extra_sat)
-                .ok_or_else(|| swap_invalid("swap amounts overflow"))?,
-            min_confirmations,
-            &excluded,
-        ),
+        OnchainSwapLegKind::Btc => {
+            let inputs = swap_select_btc_inputs(
+                wallet,
+                txn,
+                gives
+                    .amount
+                    .checked_add(extra_sat)
+                    .ok_or_else(|| swap_invalid("swap amounts overflow"))?,
+                min_confirmations,
+                &excluded,
+                false,
+            )?;
+            Ok((inputs, KeychainKind::Internal))
+        }
         OnchainSwapLegKind::Rgb => {
             let asset_id = gives.asset_id.clone().expect("RGB leg has asset ID");
+            let contract_id = ContractId::from_str(&asset_id)
+                .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
             txn.check_asset_exists(asset_id.clone())?;
             let assignments = AssignmentsCollection {
                 fungible: gives.amount,
@@ -5731,25 +5808,77 @@ pub(crate) fn swap_select_inputs(
                 .map(BdkOutPoint::from)
                 .collect::<HashSet<_>>();
             let bdk_outputs = wallet.bdk_wallet().list_unspent().collect::<Vec<_>>();
-            let mut swap_inputs = vec![];
+            let mut colored_inputs = vec![];
             for output in bdk_outputs {
                 if selected_outpoints.contains(&output.outpoint) {
-                    swap_inputs.push(swap_build_input(&output));
+                    colored_inputs.push(swap_build_input(&output));
                 }
             }
-            if swap_inputs.is_empty() {
+            if colored_inputs.is_empty() {
                 return Err(swap_invalid("could not resolve selected RGB inputs"));
             }
-            let total = swap_selected_inputs_total(&swap_inputs);
-            let needed = extra_sat;
-            if total < needed {
-                return Err(Error::InsufficientBitcoins {
-                    needed,
-                    available: total,
-                });
+            swap_ensure_inputs_confirmed(wallet, &colored_inputs, min_confirmations)?;
+            // coloring assigns everything the declared inputs carry, so the RGB change is
+            // computed on the same (final) input set
+            let carries_rgb_change = |wallet: &Wallet, inputs: &[OnchainSwapInput]| {
+                let outpoints = inputs.iter().map(swap_input_to_outpoint).collect();
+                Ok::<_, Error>(swap_input_rgb_amounts(wallet, &outpoints)?.into_iter().any(
+                    |(cid, amount)| amount > if cid == contract_id { gives.amount } else { 0 },
+                ))
+            };
+            let dust = wallet
+                .bdk_wallet()
+                .public_descriptor(KeychainKind::External)
+                .dust_value()
+                .to_sat();
+            let colored_total = swap_selected_inputs_total(&colored_inputs);
+            let mut reserve_change = carries_rgb_change(wallet, &colored_inputs)?;
+            loop {
+                // RGB change rides on this side's change output, which then has to be above dust
+                let needed = if reserve_change {
+                    extra_sat
+                        .checked_add(dust)
+                        .ok_or_else(|| swap_invalid("swap amounts overflow"))?
+                } else {
+                    extra_sat
+                };
+                let mut inputs = colored_inputs.clone();
+                if colored_total < needed {
+                    // colored UTXOs usually hold too few sats to pay for this side, so top them
+                    // up with plain BTC inputs. When the change is colored its sats can only be
+                    // spent with RGB, so pick the coins that leave the least behind.
+                    let btc_inputs = swap_select_btc_inputs(
+                        wallet,
+                        txn,
+                        needed - colored_total,
+                        min_confirmations,
+                        &excluded,
+                        reserve_change,
+                    )
+                    .map_err(|e| match e {
+                        Error::InsufficientBitcoins { available, .. } => {
+                            Error::InsufficientBitcoins {
+                                needed,
+                                available: colored_total.saturating_add(available),
+                            }
+                        }
+                        e => e,
+                    })?;
+                    inputs.extend(btc_inputs);
+                }
+                let rgb_change = carries_rgb_change(wallet, &inputs)?;
+                if rgb_change && !reserve_change {
+                    // a plain coin turned out to carry RGB, so make room for a colored change
+                    reserve_change = true;
+                    continue;
+                }
+                let change_keychain = if rgb_change {
+                    KeychainKind::External
+                } else {
+                    KeychainKind::Internal
+                };
+                return Ok((inputs, change_keychain));
             }
-            swap_ensure_inputs_confirmed(wallet, &swap_inputs, min_confirmations)?;
-            Ok(swap_inputs)
         }
     }
 }
@@ -5852,5 +5981,60 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
         }
         info!(self.logger(), "Refresh completed");
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod swap_select_unit_tests {
+    use super::*;
+
+    #[test]
+    fn smallest_covering_coin_is_preferred() {
+        // a single coin covers the amount: the smallest such coin, whatever the order
+        assert_eq!(
+            swap_pick_smallest_covering(&[100_000_000, 5_000, 50_000, 1_500], 1_330),
+            Some(vec![3])
+        );
+        assert_eq!(
+            swap_pick_smallest_covering(&[100_000_000, 5_000, 50_000], 1_330),
+            Some(vec![1])
+        );
+        assert_eq!(
+            swap_pick_smallest_covering(&[100_000_000, 5_000, 50_000], 5_000),
+            Some(vec![1])
+        );
+        assert_eq!(
+            swap_pick_smallest_covering(&[100_000_000, 5_000, 50_000], 5_001),
+            Some(vec![2])
+        );
+    }
+
+    #[test]
+    fn smallest_covering_combines_coins_when_none_is_enough() {
+        // the largest coin first, then the smallest one covering the rest
+        assert_eq!(
+            swap_pick_smallest_covering(&[1_000, 3_000, 2_000, 600], 3_500),
+            Some(vec![1, 3])
+        );
+        assert_eq!(
+            swap_pick_smallest_covering(&[1_000, 3_000, 2_000], 6_000),
+            Some(vec![1, 2, 0])
+        );
+    }
+
+    #[test]
+    fn smallest_covering_edge_cases() {
+        assert_eq!(
+            swap_pick_smallest_covering(&[1_000, 2_000], 0),
+            Some(vec![])
+        );
+        assert_eq!(swap_pick_smallest_covering(&[1_000, 2_000], 3_001), None);
+        assert_eq!(swap_pick_smallest_covering(&[], 1), None);
+        assert_eq!(swap_pick_smallest_covering(&[0, 0], 1), None);
+        // ties go to the earlier coin
+        assert_eq!(
+            swap_pick_smallest_covering(&[2_000, 2_000], 1_500),
+            Some(vec![0])
+        );
     }
 }
