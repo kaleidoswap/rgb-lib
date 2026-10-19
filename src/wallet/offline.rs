@@ -3596,3 +3596,323 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
         Ok(inspection)
     }
 }
+
+#[cfg(test)]
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+mod swap_unit_tests {
+    use super::*;
+
+    fn btc(amount: u64) -> OnchainSwapLeg {
+        OnchainSwapLeg {
+            kind: OnchainSwapLegKind::Btc,
+            asset_id: None,
+            amount,
+        }
+    }
+
+    fn rgb(asset_id: &str, amount: u64) -> OnchainSwapLeg {
+        OnchainSwapLeg {
+            kind: OnchainSwapLegKind::Rgb,
+            asset_id: Some(asset_id.to_string()),
+            amount,
+        }
+    }
+
+    const ASSET_1: &str = "rgb:Ar4ouaLv-b7f7Dc_-z5EMvtu-FA5KNh1-nlae~jk-8xMBo7E";
+    const ASSET_2: &str = "rgb:4bBH~Lrb-rx8sB_n-WAJLPcn-X5tFL9q-dFDGbSz-8yApPws";
+
+    fn swap_input(txid: &str, vout: u32, amount_sat: u64) -> OnchainSwapInput {
+        OnchainSwapInput {
+            outpoint: Outpoint {
+                txid: txid.to_string(),
+                vout,
+            },
+            amount_sat,
+            script_pubkey_hex: "51".to_string(),
+        }
+    }
+
+    fn rgb_rgb_proposal() -> OnchainSwapProposal {
+        let offer = OnchainSwapOffer {
+            swap_id: "test-swap".to_string(),
+            maker_gives: rgb(ASSET_1, 10),
+            maker_receives: rgb(ASSET_2, 20),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            network_fee_sat: 100,
+            rgb_output_sat: SWAP_DEFAULT_RGB_OUTPUT_SAT,
+            expiration_timestamp: None,
+            maker_btc_address: None,
+            maker_rgb_recipient_id: Some("maker-rgb-recipient".to_string()),
+            maker_rgb_script_pubkey_hex: Some("51".to_string()),
+            maker_rgb_blinding: Some(1),
+            proxy_url: Some("rpc://127.0.0.1:3000".to_string()),
+            platform_fee_sat: 0,
+            fee_recipient_script_pubkey_hex: None,
+        };
+        OnchainSwapProposal {
+            request: OnchainSwapRequest {
+                offer,
+                taker_inputs: vec![swap_input(
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                    0,
+                    2_100,
+                )],
+                taker_btc_address: None,
+                taker_rgb_recipient_id: Some("taker-rgb-recipient".to_string()),
+                taker_rgb_script_pubkey_hex: Some("51".to_string()),
+                taker_rgb_blinding: Some(2),
+                taker_change_script_pubkey_hex: "51".to_string(),
+            },
+            maker_inputs: vec![swap_input(
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                0,
+                1_000,
+            )],
+            maker_change_script_pubkey_hex: "51".to_string(),
+            psbt: String::new(),
+            txid: String::new(),
+            consignments: vec![],
+            maker_history: None,
+        }
+    }
+
+    #[test]
+    fn side_change_below_dust_goes_to_the_fee() {
+        // P2TR: dust below 330 sat at the default dust relay fee
+        let p2tr = format!("5120{}", "11".repeat(32));
+        let dust = swap_parse_script(&p2tr)
+            .unwrap()
+            .minimal_non_dust()
+            .to_sat();
+        assert_eq!(dust, 330);
+        let gives = btc(1_000);
+        let receives = rgb(ASSET_1, 1);
+        let rgb_output_sat = 500;
+        let fee_sat = 100;
+        let required = 1_000 + rgb_output_sat + fee_sat;
+        let change_outputs = |input_sat: u64| {
+            let mut outputs = vec![];
+            swap_append_side_change(
+                &mut outputs,
+                &[swap_input(
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                    0,
+                    input_sat,
+                )],
+                &gives,
+                &receives,
+                rgb_output_sat,
+                fee_sat,
+                &p2tr,
+            )
+            .unwrap();
+            outputs.iter().map(|o| o.value.to_sat()).collect::<Vec<_>>()
+        };
+        assert_eq!(change_outputs(required), Vec::<u64>::new());
+        assert_eq!(change_outputs(required + 2), Vec::<u64>::new());
+        assert_eq!(change_outputs(required + dust - 1), Vec::<u64>::new());
+        assert_eq!(change_outputs(required + dust), vec![dust]);
+        let result = swap_append_side_change(
+            &mut vec![],
+            &[swap_input(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                0,
+                required - 1,
+            )],
+            &gives,
+            &receives,
+            rgb_output_sat,
+            fee_sat,
+            &p2tr,
+        );
+        assert!(matches!(result, Err(Error::InsufficientBitcoins { .. })));
+    }
+
+    #[test]
+    fn validates_supported_leg_pairs() {
+        assert_eq!(
+            swap_validate_legs(&rgb(ASSET_1, 1), &btc(1_000)).unwrap(),
+            SwapDirection::RgbForBtc
+        );
+        assert_eq!(
+            swap_validate_legs(&btc(1_000), &rgb(ASSET_1, 1)).unwrap(),
+            SwapDirection::BtcForRgb
+        );
+        assert_eq!(
+            swap_validate_legs(&rgb(ASSET_1, 1), &rgb(ASSET_2, 1)).unwrap(),
+            SwapDirection::RgbForRgb
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_leg_pairs() {
+        assert!(matches!(
+            swap_validate_legs(&btc(0), &rgb(ASSET_1, 1)),
+            Err(Error::InvalidAmountZero)
+        ));
+        assert!(swap_validate_legs(&btc(1), &btc(2)).is_err());
+        assert!(swap_validate_legs(&rgb(ASSET_1, 1), &rgb(ASSET_1, 2)).is_err());
+        assert!(swap_validate_legs(&rgb("invalid", 1), &btc(1)).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_or_extra_asset_ids() {
+        assert!(
+            swap_validate_legs(
+                &OnchainSwapLeg {
+                    kind: OnchainSwapLegKind::Rgb,
+                    asset_id: None,
+                    amount: 1,
+                },
+                &btc(1_000),
+            )
+            .is_err()
+        );
+        assert!(
+            swap_validate_legs(
+                &OnchainSwapLeg {
+                    kind: OnchainSwapLegKind::Btc,
+                    asset_id: Some(ASSET_1.to_string()),
+                    amount: 1_000,
+                },
+                &rgb(ASSET_2, 1),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_swap_proxy_transport() {
+        assert_eq!(
+            swap_proxy_transport_endpoint("http://127.0.0.1:3000").unwrap(),
+            "rpc://127.0.0.1:3000"
+        );
+        assert_eq!(
+            swap_proxy_transport_endpoint("https://example.com/json-rpc").unwrap(),
+            "rpcs://example.com/json-rpc"
+        );
+        assert!(swap_validate_proxy_url(&Some("rpc://127.0.0.1:3000".to_string())).is_ok());
+        assert!(swap_validate_proxy_url(&None).is_err());
+        assert!(swap_validate_proxy_url(&Some("ws://127.0.0.1:3000".to_string())).is_err());
+    }
+
+    #[test]
+    fn only_the_declared_inputs_may_be_signed() {
+        let proposal = rgb_rgb_proposal();
+        let (unsigned, _, _) = swap_build_psbt(&proposal).unwrap();
+        let own = proposal.request.taker_inputs.clone();
+        let own_outpoint = swap_input_to_outpoint(&own[0]);
+        let own_idx = unsigned
+            .unsigned_tx
+            .input
+            .iter()
+            .position(|i| i.previous_output == own_outpoint)
+            .unwrap();
+        let other_idx = 1 - own_idx;
+
+        // nothing signed: fine
+        swap_ensure_only_own_inputs_signed(&unsigned, &unsigned, &own).unwrap();
+        // a signature on a declared input: fine
+        let mut signed = unsigned.clone();
+        signed.inputs[own_idx].final_script_witness = Some(Witness::new());
+        swap_ensure_only_own_inputs_signed(&unsigned, &signed, &own).unwrap();
+        // a signature the counterparty put on its own input before: fine, it is not ours
+        let mut counterparty_signed = unsigned.clone();
+        counterparty_signed.inputs[other_idx].final_script_witness = Some(Witness::new());
+        let mut both = counterparty_signed.clone();
+        both.inputs[own_idx].final_script_witness = Some(Witness::new());
+        swap_ensure_only_own_inputs_signed(&counterparty_signed, &both, &own).unwrap();
+        // a signature that appears on the counterparty's input while signing: refused
+        signed.inputs[other_idx].final_script_witness = Some(Witness::new());
+        let err = swap_ensure_only_own_inputs_signed(&unsigned, &signed, &own).unwrap_err();
+        assert!(
+            err.to_string().contains("not one of this wallet's inputs"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validates_expected_swap_psbt_shape() {
+        let mut proposal = rgb_rgb_proposal();
+        let (psbt, _, _) = swap_build_psbt(&proposal).unwrap();
+        proposal.txid = psbt.unsigned_tx.compute_txid().to_string();
+        proposal.psbt = psbt.to_string();
+        swap_validate_proposal_psbt(&proposal, &psbt).unwrap();
+    }
+
+    #[test]
+    fn rejects_tampered_swap_psbt_output() {
+        let mut proposal = rgb_rgb_proposal();
+        let (mut psbt, _, _) = swap_build_psbt(&proposal).unwrap();
+        proposal.txid = psbt.unsigned_tx.compute_txid().to_string();
+        proposal.psbt = psbt.to_string();
+        psbt.unsigned_tx.output[1].value = BdkAmount::from_sat(42);
+        assert!(swap_validate_proposal_psbt(&proposal, &psbt).is_err());
+    }
+
+    #[test]
+    fn swap_coloring_carries_change_and_other_assets() {
+        let proposal = rgb_rgb_proposal();
+        let (psbt, _, taker_rgb_vout) = swap_build_psbt(&proposal).unwrap();
+        let recipient_vout = taker_rgb_vout.unwrap();
+        let change_vout = psbt.unsigned_tx.output.len() as u32 - 1;
+        let asset_1 = ContractId::from_str(ASSET_1).unwrap();
+        let asset_2 = ContractId::from_str(ASSET_2).unwrap();
+        let available = BTreeMap::from_iter([(asset_1, 15), (asset_2, 7)]);
+        let (contract_id, coloring_info, shift) = swap_rgb_leg_coloring_info(
+            &rgb(ASSET_1, 10),
+            &psbt,
+            recipient_vout,
+            Some(change_vout),
+            42,
+            &available,
+        )
+        .unwrap();
+        assert_eq!(contract_id, asset_1);
+        assert!(!shift);
+        let swap_info = &coloring_info.asset_info_map[&asset_1];
+        assert_eq!(
+            swap_info.output_map,
+            HashMap::from_iter([(recipient_vout, 10), (change_vout, 5)])
+        );
+        assert_eq!(swap_info.static_blinding, Some(42));
+        assert_eq!(
+            coloring_info.asset_info_map[&asset_2].output_map,
+            HashMap::from_iter([(change_vout, 7)])
+        );
+    }
+
+    #[test]
+    fn swap_coloring_fails_closed() {
+        let proposal = rgb_rgb_proposal();
+        let (psbt, _, taker_rgb_vout) = swap_build_psbt(&proposal).unwrap();
+        let recipient_vout = taker_rgb_vout.unwrap();
+        let outputs = psbt.unsigned_tx.output.len() as u32;
+        let asset_1 = ContractId::from_str(ASSET_1).unwrap();
+        let exact = BTreeMap::from_iter([(asset_1, 10)]);
+        let leftover = BTreeMap::from_iter([(asset_1, 11)]);
+        let leg = rgb(ASSET_1, 10);
+        // leftover without a change output would be burned
+        assert!(
+            swap_rgb_leg_coloring_info(&leg, &psbt, recipient_vout, None, 1, &leftover).is_err()
+        );
+        // not enough on the inputs
+        let short = BTreeMap::from_iter([(asset_1, 9)]);
+        assert!(swap_rgb_leg_coloring_info(&leg, &psbt, recipient_vout, None, 1, &short).is_err());
+        // out-of-range and OP_RETURN vouts
+        assert!(swap_rgb_leg_coloring_info(&leg, &psbt, outputs, None, 1, &exact).is_err());
+        assert!(swap_rgb_leg_coloring_info(&leg, &psbt, 0, None, 1, &exact).is_err());
+        assert!(
+            swap_rgb_leg_coloring_info(&leg, &psbt, recipient_vout, Some(outputs), 1, &leftover)
+                .is_err()
+        );
+        assert!(swap_rgb_leg_coloring_info(&leg, &psbt, recipient_vout, None, 1, &exact).is_ok());
+    }
+
+    #[test]
+    fn rejects_expired_offer() {
+        let mut proposal = rgb_rgb_proposal();
+        proposal.request.offer.expiration_timestamp = Some(1);
+        assert!(swap_ensure_not_expired(&proposal.request.offer).is_err());
+    }
+}
