@@ -170,7 +170,7 @@ use bdk_wallet::{
         bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource, Xpriv, Xpub},
         consensus::{Decodable, Encodable},
         hashes::{Hash as Sha256Hash, sha256},
-        psbt::{ExtractTxError, Psbt},
+        psbt::Psbt,
         secp256k1::Secp256k1,
     },
     chain::{
