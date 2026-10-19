@@ -7586,6 +7586,56 @@ fn psbt_op_complete_rejects_dropped_or_altered_bundle() {
     }
 }
 
+/// A stager can plant the MPC minimum tree depth key on the PSBT it hands on; the finalizer must
+/// refuse an out-of-bounds value instead of panicking or walking a 2^depth tree.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn psbt_op_finalize_refuses_planted_mpc_depth() {
+    use psrgbt::RgbPropKeyExt;
+
+    initialize();
+
+    let mut a = PsbtOpSwapSide::new(AMOUNT);
+    let mut b = PsbtOpSwapSide::new(AMOUNT_SMALL);
+    let mut psbt = psbt_op_swap_psbt(&a, &b);
+    let a_op = a.stage(&mut psbt, A_VOUT).operation_id;
+    let b_op = b.stage(&mut psbt, B_VOUT).operation_id;
+    let depth_key = bitcoin::psbt::raw::ProprietaryKey::mpc_min_tree_depth();
+
+    for (vout, depth) in [(0, 32), (0, 255), (0, 17), (A_VOUT as usize, 32)] {
+        let mut planted = psbt.clone();
+        planted.outputs[vout]
+            .proprietary
+            .insert(depth_key.clone(), vec![depth]);
+        let result = b
+            .party
+            .wallet
+            .psbt_op_finalize(&mut planted, Some(PSBT_OP_SWAP_ENTROPY));
+        assert!(
+            matches!(result, Err(Error::InvalidColoringInfo { ref details }) if details.contains("depth")),
+            "finalize must refuse MPC depth {depth} on output {vout}; got {result:?}"
+        );
+    }
+
+    // an in-bounds planted depth is honored by finalize and accepted by complete
+    let mut deeper = psbt.clone();
+    deeper.outputs[0]
+        .proprietary
+        .insert(depth_key.clone(), vec![5]);
+    b.party
+        .wallet
+        .psbt_op_finalize(&mut deeper, Some(PSBT_OP_SWAP_ENTROPY))
+        .unwrap();
+    a.party.wallet.psbt_op_complete(&a_op, &deeper).unwrap();
+    b.party.wallet.psbt_op_complete(&b_op, &deeper).unwrap();
+    for (side, op) in [(&mut a, &a_op), (&mut b, &b_op)] {
+        let online = side.party.party_online();
+        side.party.wallet.psbt_op_abort(online, op).unwrap();
+        assert_eq!(side.reconcile(op), PsbtOperationStatus::Failed);
+    }
+}
+
 /// Non-journaled [`Wallet::color_psbt_stage`] coloring of `vout` (a final vout of `psbt`),
 /// converted to its legacy convention: pre-OP_RETURN keys when any output is P2TR.
 fn psbt_op_legacy_coloring_info(

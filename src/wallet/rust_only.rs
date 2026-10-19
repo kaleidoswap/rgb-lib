@@ -649,6 +649,40 @@ fn psbt_rgb_commitment_finalized(psbt: &Psbt) -> bool {
         .any(|o| o.mpc_message_map().is_ok_and(|m| !m.is_empty()))
 }
 
+/// Largest MPC minimum tree depth accepted from a PSBT's `mpc_min_tree_depth` key.
+///
+/// The key is a byte whoever built the PSBT controls. Unbounded, a value above 31 panics in
+/// `u5::with` and one near 31 makes `MerkleTree::try_commit`, `commit_id` and `MerkleBlock::from`
+/// walk or allocate `2^depth` leaves. Neither rgb-lib nor rgb-std ever sets the key: their
+/// commitments use [`MPC_MINIMAL_DEPTH`] (3) and only grow the tree as the message count requires,
+/// and rgb-std's `MerkleBlock` documents its depth as "up to 16". 16 (65536 leaves) is therefore
+/// far above any honest value while keeping the tree cheap to rebuild.
+const PSBT_MPC_MAX_MIN_DEPTH: u8 = 16;
+
+/// The MPC minimum tree depth `output` asks for, bounded by [`PSBT_MPC_MAX_MIN_DEPTH`]. Like
+/// rgb-std, an absent or malformed key means [`MPC_MINIMAL_DEPTH`].
+fn psbt_mpc_min_depth(output: &bdk_wallet::bitcoin::psbt::Output) -> Result<u5, Error> {
+    let Some(depth) = output.mpc_min_tree_depth() else {
+        return Ok(MPC_MINIMAL_DEPTH);
+    };
+    u5::try_from(depth)
+        .ok()
+        .filter(|_| depth <= PSBT_MPC_MAX_MIN_DEPTH)
+        .ok_or_else(|| Error::InvalidColoringInfo {
+            details: format!(
+                "PSBT asks for an MPC minimum tree depth of {depth}, above the supported {PSBT_MPC_MAX_MIN_DEPTH}"
+            ),
+        })
+}
+
+/// Check every output of `psbt` with [`psbt_mpc_min_depth`], before rgb-std's `rgb_commit` reads
+/// the depth key unchecked.
+fn psbt_check_mpc_min_depths(psbt: &Psbt) -> Result<(), Error> {
+    psbt.outputs
+        .iter()
+        .try_for_each(|output| psbt_mpc_min_depth(output).map(|_| ()))
+}
+
 /// Rebuild the MPC tree committed by the OP_RETURN at `opret_idx` of `psbt` and check the output
 /// script carries exactly that commitment and that every `expected` message is in the tree.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -678,10 +712,7 @@ fn psbt_op_check_commitment(
         )));
     }
     let source = mpc::MultiSource {
-        min_depth: output
-            .mpc_min_tree_depth()
-            .map(u5::with)
-            .unwrap_or(MPC_MINIMAL_DEPTH),
+        min_depth: psbt_mpc_min_depth(output)?,
         messages,
         static_entropy: output.mpc_entropy(),
     };
@@ -1493,6 +1524,10 @@ impl Wallet {
         static_blinding: Option<u64>,
     ) -> Result<Fascia, Error> {
         info!(self.logger(), "Finalizing RGB commitment on PSBT...");
+        // rgb_commit reads the depth key unchecked: a party that staged before us may have planted
+        // one that panics or makes the commitment exhaust CPU and memory. Checked before the PSBT
+        // is touched.
+        psbt_check_mpc_min_depths(psbt)?;
         let opreturn_index = psbt
             .unsigned_tx
             .output
@@ -5199,6 +5234,108 @@ mod tests {
         // no commitment at all on that output
         assert!(matches!(
             psbt_op_check_commitment(&Psbt::from_unsigned_tx(staged_tx()).unwrap(), 0, &expected),
+            Err(Error::InvalidColoringInfo { .. })
+        ));
+    }
+
+    /// `psbt` with its OP_RETURN (vout 0) carrying `depth` as the MPC minimum tree depth key.
+    fn with_mpc_min_depth(mut psbt: Psbt, depth: u8) -> Psbt {
+        use psrgbt::RgbPropKeyExt;
+        psbt.outputs[0].proprietary.insert(
+            bdk_wallet::bitcoin::psbt::raw::ProprietaryKey::mpc_min_tree_depth(),
+            vec![depth],
+        );
+        psbt
+    }
+
+    /// A counterparty-chosen MPC depth must be refused, never panic (`u5::with` asserts <= 31) nor
+    /// walk a 2^depth tree.
+    fn assert_mpc_depth_refused(depth: u8) {
+        let ours = (
+            mpc::ProtocolId::from([1u8; 32]),
+            mpc::Message::from([2u8; 32]),
+        );
+        let psbt = with_mpc_min_depth(committed_psbt(&[ours]), depth);
+        let result = psbt_op_check_commitment(&psbt, 0, &BTreeMap::from([ours]));
+        assert!(
+            matches!(result, Err(Error::InvalidColoringInfo { ref details }) if details.contains("depth")),
+            "MPC depth {depth} must be refused; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn psbt_op_commitment_check_refuses_mpc_depth_32() {
+        assert_mpc_depth_refused(32);
+    }
+
+    #[test]
+    fn psbt_op_commitment_check_refuses_mpc_depth_255() {
+        assert_mpc_depth_refused(255);
+    }
+
+    #[test]
+    fn psbt_op_commitment_check_refuses_mpc_depth_over_cap() {
+        assert_mpc_depth_refused(PSBT_MPC_MAX_MIN_DEPTH + 1);
+        assert_mpc_depth_refused(28);
+    }
+
+    #[test]
+    fn psbt_mpc_min_depth_bounds_the_psbt_key() {
+        let psbt = Psbt::from_unsigned_tx(staged_tx()).unwrap();
+        // absent key: the rgb-std default
+        assert_eq!(
+            psbt_mpc_min_depth(&psbt.outputs[0]).unwrap(),
+            MPC_MINIMAL_DEPTH
+        );
+        psbt_check_mpc_min_depths(&psbt).unwrap();
+        for depth in [0, 3, PSBT_MPC_MAX_MIN_DEPTH] {
+            let planted = with_mpc_min_depth(psbt.clone(), depth);
+            assert_eq!(
+                psbt_mpc_min_depth(&planted.outputs[0]).unwrap(),
+                u5::with(depth)
+            );
+            psbt_check_mpc_min_depths(&planted).unwrap();
+        }
+        for depth in [PSBT_MPC_MAX_MIN_DEPTH + 1, 31, 32, 255] {
+            let planted = with_mpc_min_depth(psbt.clone(), depth);
+            assert!(matches!(
+                psbt_mpc_min_depth(&planted.outputs[0]),
+                Err(Error::InvalidColoringInfo { .. })
+            ));
+            assert!(matches!(
+                psbt_check_mpc_min_depths(&planted),
+                Err(Error::InvalidColoringInfo { .. })
+            ));
+        }
+        // any output, not only the OP_RETURN one
+        let mut planted = psbt.clone();
+        planted.outputs[2] = with_mpc_min_depth(psbt, 32).outputs[0].clone();
+        assert!(matches!(
+            psbt_check_mpc_min_depths(&planted),
+            Err(Error::InvalidColoringInfo { .. })
+        ));
+    }
+
+    #[test]
+    fn psbt_op_commitment_check_honors_an_in_bounds_mpc_depth() {
+        use psrgbt::DbcPsbtProof;
+        let ours = (
+            mpc::ProtocolId::from([1u8; 32]),
+            mpc::Message::from([2u8; 32]),
+        );
+        // committed at depth 5 by the finalizer: the check must rebuild the same tree
+        let mut psbt = with_mpc_min_depth(Psbt::from_unsigned_tx(staged_tx()).unwrap(), 5);
+        let output = &mut psbt.outputs[0];
+        output.set_opret_host();
+        output.set_mpc_entropy(42).unwrap();
+        output.set_mpc_message(ours.0, ours.1).unwrap();
+        OpretProof::dbc_commit(&mut psbt).unwrap();
+        let tree = psbt_op_check_commitment(&psbt, 0, &BTreeMap::from([ours])).unwrap();
+        assert_eq!(tree.depth(), u5::with(5));
+        // the same commitment rebuilt at another depth no longer matches the OP_RETURN
+        let relabeled = with_mpc_min_depth(psbt, 4);
+        assert!(matches!(
+            psbt_op_check_commitment(&relabeled, 0, &BTreeMap::from([ours])),
             Err(Error::InvalidColoringInfo { .. })
         ));
     }
