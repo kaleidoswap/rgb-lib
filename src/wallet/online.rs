@@ -1602,9 +1602,7 @@ pub trait WalletOnline: WalletOffline {
                     );
                 }
 
-                runtime
-                    .import_contract(valid_contract.clone(), self.blockchain_resolver())
-                    .expect("failure importing received contract");
+                runtime.import_contract(valid_contract.clone(), self.blockchain_resolver())?;
                 debug!(self.logger(), "Contract registered");
                 self.save_new_asset_internal(
                     txn,
