@@ -1519,4 +1519,143 @@ mod tests {
         assert_eq!(IndexerProtocol::Electrum.to_string(), "Electrum");
         assert_eq!(IndexerProtocol::Esplora.to_string(), "Esplora");
     }
+
+    use bdk_wallet::bitcoin::{
+        Sequence, TxIn, Witness, absolute::LockTime, psbt::raw::ProprietaryKey,
+        transaction::Version,
+    };
+
+    fn sentinel_key() -> ProprietaryKey {
+        ProprietaryKey {
+            prefix: b"rgb-lib-test".to_vec(),
+            subtype: 0x7A,
+            key: vec![0x01],
+        }
+    }
+
+    fn unsigned_tx(n_outputs: u64) -> BdkTransaction {
+        BdkTransaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: (0..n_outputs)
+                .map(|i| TxOut {
+                    value: BdkAmount::from_sat(1000 + i),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn stamped_psbt(n_outputs: u64) -> Psbt {
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx(n_outputs)).unwrap();
+        let key = sentinel_key();
+        psbt.proprietary.insert(key.clone(), vec![0xff]);
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: BdkAmount::from_sat(5000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        for (i, output) in psbt.outputs.iter_mut().enumerate() {
+            output.proprietary.insert(key.clone(), vec![i as u8]);
+        }
+        psbt
+    }
+
+    fn opreturn_txout() -> TxOut {
+        TxOut {
+            value: BdkAmount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return([]),
+        }
+    }
+
+    #[test]
+    fn psbt_has_input_signatures_detects_finalized_inputs() {
+        let psbt = stamped_psbt(2);
+        assert!(!psbt_has_input_signatures(&psbt));
+
+        let mut with_witness = psbt.clone();
+        with_witness.inputs[0].final_script_witness = Some(Witness::from_slice(&[vec![1u8]]));
+        assert!(psbt_has_input_signatures(&with_witness));
+
+        let mut with_script_sig = psbt;
+        with_script_sig.inputs[0].final_script_sig = Some(ScriptBuf::from_bytes(vec![0x51]));
+        assert!(psbt_has_input_signatures(&with_script_sig));
+    }
+
+    #[test]
+    fn rebuild_psbt_preserving_maps_front_insert_shifts_output_maps() {
+        let psbt = stamped_psbt(2);
+        let mut tx = psbt.unsigned_tx.clone();
+        tx.output.insert(0, opreturn_txout());
+        let rebuilt = rebuild_psbt_preserving_maps(&psbt, tx, true).unwrap();
+
+        let key = sentinel_key();
+        assert_eq!(rebuilt.unsigned_tx.output.len(), 3);
+        assert!(rebuilt.unsigned_tx.output[0].script_pubkey.is_op_return());
+        assert!(!rebuilt.outputs[0].proprietary.contains_key(&key));
+        assert_eq!(rebuilt.outputs[1].proprietary.get(&key), Some(&vec![0]));
+        assert_eq!(rebuilt.outputs[2].proprietary.get(&key), Some(&vec![1]));
+        assert_eq!(rebuilt.inputs, psbt.inputs);
+        assert_eq!(rebuilt.proprietary, psbt.proprietary);
+        assert_eq!(rebuilt.version, psbt.version);
+    }
+
+    #[test]
+    fn rebuild_psbt_preserving_maps_append_keeps_output_maps() {
+        let psbt = stamped_psbt(2);
+        let mut tx = psbt.unsigned_tx.clone();
+        tx.output.push(opreturn_txout());
+        let rebuilt = rebuild_psbt_preserving_maps(&psbt, tx, false).unwrap();
+
+        let key = sentinel_key();
+        assert_eq!(rebuilt.unsigned_tx.output.len(), 3);
+        assert!(rebuilt.unsigned_tx.output[2].script_pubkey.is_op_return());
+        assert_eq!(rebuilt.outputs[0].proprietary.get(&key), Some(&vec![0]));
+        assert_eq!(rebuilt.outputs[1].proprietary.get(&key), Some(&vec![1]));
+        assert!(!rebuilt.outputs[2].proprietary.contains_key(&key));
+        assert_eq!(rebuilt.inputs, psbt.inputs);
+    }
+
+    #[test]
+    fn rebuild_psbt_preserving_maps_clears_input_scripts() {
+        let psbt = stamped_psbt(1);
+        let mut tx = psbt.unsigned_tx.clone();
+        tx.input[0].script_sig = ScriptBuf::from_bytes(vec![0x51]);
+        tx.input[0].witness = Witness::from_slice(&[vec![1u8]]);
+        tx.output.push(opreturn_txout());
+        let rebuilt = rebuild_psbt_preserving_maps(&psbt, tx, false).unwrap();
+        assert!(rebuilt.unsigned_tx.input[0].script_sig.is_empty());
+        assert!(rebuilt.unsigned_tx.input[0].witness.is_empty());
+    }
+
+    #[test]
+    fn durable_file_helpers_create_and_replace() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("rgb-lib-durable-{}-{nanos}", std::process::id()));
+        let dir = root.join("transfers").join("txid");
+        persist_durable_create_dir(&dir).unwrap();
+        assert!(dir.is_dir());
+
+        let path = dir.join(FASCIA_FILE);
+        persist_durable_replace(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        persist_durable_replace(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert!(!dir.join(format!("{FASCIA_FILE}.tmp")).exists());
+
+        let marker = dir.join(STASH_CONSUMED_FILE);
+        persist_stash_consumed_marker(&marker).unwrap();
+        assert!(marker.exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
