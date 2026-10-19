@@ -437,6 +437,21 @@ pub trait WalletOnline: WalletOffline {
         batch_transfer: &DbBatchTransfer,
         db_data: &DbData,
     ) -> Result<TryFailBatchTransferOutcome, Error> {
+        // an Initiated batch transfer carrying a TXID is broadcast by the caller itself (the
+        // color-consume flow), so failing it would misreport state that already landed: once the
+        // indexer knows the TX its inputs are spent for good, and once the fascia is in the stash
+        // (marker left behind by a consume that crashed before its commit) the SQL side is the only
+        // thing still rollable back, which would diverge the two
+        if batch_transfer.status == TransferStatus::Initiated
+            && let Some(txid) = batch_transfer.txid.as_deref()
+            && (self
+                .get_transfer_dir(txid)
+                .join(super::rust_only::STASH_CONSUMED_FILE)
+                .exists()
+                || self.indexer().get_tx_confirmations(txid)?.is_some())
+        {
+            return Ok(TryFailBatchTransferOutcome::CannotFail);
+        }
         let updated_batch_transfer =
             match self.refresh_transfer(txn, batch_transfer, db_data, &[], true) {
                 Err(Error::MinFeeNotMet { txid: _ }) | Err(Error::MaxFeeExceeded { txid: _ }) => {
@@ -511,11 +526,13 @@ pub trait WalletOnline: WalletOffline {
                 }
             }
 
-            transfers_changed = true;
-            if let TryFailBatchTransferOutcome::Refreshed =
-                self.try_fail_batch_transfer(txn, &batch_transfer, &db_data)?
-            {
-                cannot_fail = true;
+            match self.try_fail_batch_transfer(txn, &batch_transfer, &db_data)? {
+                TryFailBatchTransferOutcome::Failed => transfers_changed = true,
+                TryFailBatchTransferOutcome::Refreshed => {
+                    transfers_changed = true;
+                    cannot_fail = true;
+                }
+                TryFailBatchTransferOutcome::CannotFail => cannot_fail = true,
             }
         } else {
             // fail all expired transfers that are in a fallible status
@@ -533,8 +550,12 @@ pub trait WalletOnline: WalletOffline {
                         continue;
                     }
                 }
-                transfers_changed = true;
-                self.try_fail_batch_transfer(txn, batch_transfer, &db_data)?;
+                if !matches!(
+                    self.try_fail_batch_transfer(txn, batch_transfer, &db_data)?,
+                    TryFailBatchTransferOutcome::CannotFail
+                ) {
+                    transfers_changed = true;
+                }
             }
         }
 
@@ -4069,6 +4090,10 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
     /// Transfers are eligible if they remain in a fallible status after a `refresh` has been
     /// performed. A transfer in status [`TransferStatus::WaitingBroadcast`] is an exception: it can
     /// only be failed once it has expired, since the TX may still be broadcast before then.
+    /// A transfer in status [`TransferStatus::Initiated`] whose TX is already known to the indexer
+    /// is a second exception: its inputs are spent on-chain, so it can no longer be failed.
+    /// So is a [`TransferStatus::Initiated`] batch whose fascia is already in the RGB stash
+    /// (`stash_consumed` under the transfer dir): failing it would diverge SQL from the stash.
     fn fail_transfers(
         &mut self,
         online: Online,

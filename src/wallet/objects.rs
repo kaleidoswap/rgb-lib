@@ -1955,6 +1955,7 @@ pub struct ReceivedConsignmentMeta {
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub enum TryFailBatchTransferOutcome {
+    CannotFail,
     Failed,
     Refreshed,
 }
