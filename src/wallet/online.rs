@@ -4922,6 +4922,9 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        if res.transfers_changed() {
+            self.trigger_auto_backup();
+        }
         info!(self.logger(), "Refresh completed");
         Ok(res)
     }
