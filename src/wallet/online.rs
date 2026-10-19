@@ -835,30 +835,16 @@ pub trait WalletOnline: WalletOffline {
                     let opout = Opout::new(*opid, *ass_type, no as u16);
                     if let Assign::ConfidentialSeal { seal, state, .. } = fungible_assignment
                         && Some(*seal) == known_concealed
+                        && let Some(assignment) = Assignment::fungible(*ass_type, state.as_u64())
                     {
-                        match *ass_type {
-                            OS_ASSET => {
-                                received.insert(opout, Assignment::Fungible(state.as_u64()));
-                            }
-                            OS_INFLATION => {
-                                received.insert(opout, Assignment::InflationRight(state.as_u64()));
-                            }
-                            _ => {}
-                        }
+                        received.insert(opout, assignment);
                     };
                     if let Assign::Revealed { seal, state, .. } = fungible_assignment
                         && seal.txid == TxPtr::WitnessTx
                         && Some(seal.vout.into_u32()) == vout
+                        && let Some(assignment) = Assignment::fungible(*ass_type, state.as_u64())
                     {
-                        match *ass_type {
-                            OS_ASSET => {
-                                received.insert(opout, Assignment::Fungible(state.as_u64()));
-                            }
-                            OS_INFLATION => {
-                                received.insert(opout, Assignment::InflationRight(state.as_u64()));
-                            }
-                            _ => {}
-                        }
+                        received.insert(opout, assignment);
                     };
                 }
                 for (no, structured_assignment) in typed_assigns.as_structured().iter().enumerate()
