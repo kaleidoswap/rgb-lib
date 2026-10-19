@@ -540,6 +540,53 @@ fn maker_rejects_request_with_mutated_offer() {
 
 #[test]
 #[parallel]
+fn taker_refuses_a_maker_input_declared_with_the_wrong_amount() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SPRV",
+        "Swap Prevout",
+        SWAP_RGB_AMOUNT,
+    );
+
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            vec![],
+        )
+        .unwrap();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let mut proposal = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap();
+    // the maker claims a bigger coin than it has, and builds a consistent PSBT on that claim
+    proposal.maker_inputs[0].amount_sat += 1_000;
+    let (psbt, _, _) = crate::wallet::offline::swap_build_psbt(&proposal).unwrap();
+    proposal.txid = psbt.unsigned_tx.compute_txid().to_string();
+    proposal.psbt = psbt.to_string();
+
+    let err = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("does not match its previous output"),
+        "{err}"
+    );
+}
+
+#[test]
+#[parallel]
 fn taker_rejects_proposal_with_mutated_request() {
     initialize();
 
@@ -1827,6 +1874,16 @@ fn execute_swap_with_extra_outputs(
         .unwrap();
     // the maker signs last in every direction: its proposal carries no signature
     assert_eq!(signature_count(&proposal.psbt), 0);
+    // locked to the maker's chain tip, like an ordinary wallet transaction
+    assert!(proposal.lock_time > 0);
+    assert_eq!(
+        Psbt::from_str(&proposal.psbt)
+            .unwrap()
+            .unsigned_tx
+            .lock_time
+            .to_consensus_u32(),
+        proposal.lock_time
+    );
     assert_consignment_transport(&proposal.consignments);
     if taker_receives_rgb {
         assert!(
