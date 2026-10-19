@@ -2067,6 +2067,10 @@ pub struct OnchainSwapProposal {
     /// Maker asset history, required when the maker sends RGB and the counterparty needs the
     /// contract history before completing the swap.
     pub maker_history: Option<OnchainSwapAssetHistory>,
+    /// Lock time (a block height) of the swap transaction: the maker's chain tip when it built
+    /// the proposal. 0 in proposals from before it was set.
+    #[serde(default)]
+    pub lock_time: u32,
 }
 
 /// A taker-completed swap ready for maker verification/broadcast.

@@ -4,9 +4,10 @@
 
 use super::offline::{
     SWAP_OUTGOING_FILE, SwapOutgoingState, swap_build_input, swap_consignment_dir,
-    swap_consignment_path, swap_ensure_only_own_inputs_signed, swap_history_recipient_id,
-    swap_input_to_outpoint, swap_invalid, swap_parse_script, swap_proxy_transport_endpoint,
-    swap_rgb_leg_coloring_info, swap_save_state, swap_selected_inputs_total,
+    swap_consignment_path, swap_ensure_net_btc_outflow, swap_ensure_only_own_inputs_signed,
+    swap_history_recipient_id, swap_input_to_outpoint, swap_input_txout, swap_invalid,
+    swap_mpc_entropy, swap_parse_script, swap_proxy_transport_endpoint, swap_rgb_leg_coloring_info,
+    swap_save_state, swap_selected_inputs_total,
 };
 use super::*;
 use rgbstd::Operation as _;
@@ -4982,7 +4983,8 @@ pub(crate) fn swap_color_rgb_leg(
     expiration_timestamp: Option<u64>,
 ) -> Result<Vec<OnchainSwapConsignment>, Error> {
     swap_stage_rgb_leg(wallet, psbt, send)?;
-    let fascia = wallet.color_psbt_finalize(psbt, Some(send.blinding))?;
+    let mpc_entropy = swap_mpc_entropy(wallet.wallet_dir(), swap_id)?;
+    let fascia = wallet.color_psbt_finalize(psbt, Some(mpc_entropy))?;
     swap_prepare_rgb_leg(
         txn,
         wallet,
@@ -5396,14 +5398,95 @@ pub(crate) fn swap_ensure_inputs_foreign(
     Ok(())
 }
 
-/// Sign the inputs this wallet declared, refusing a PSBT that would make it sign anything else.
+/// The counterparty's inputs must exist on chain exactly as declared (amount and script): the
+/// PSBT carries only what the counterparty said about them.
+pub(crate) fn swap_ensure_prevouts_match(
+    wallet: &Wallet,
+    inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    let mut txs = HashMap::new();
+    for input in inputs {
+        let txid = &input.outpoint.txid;
+        if !txs.contains_key(txid) {
+            let tx = wallet.indexer().get_tx(txid)?;
+            txs.insert(txid.clone(), tx);
+        }
+        let prevout = txs
+            .get(txid)
+            .and_then(|tx| tx.as_ref())
+            .and_then(|tx| tx.output.get(input.outpoint.vout as usize))
+            .ok_or_else(|| {
+                swap_invalid(format!(
+                    "swap input {} is unknown to the indexer",
+                    input.outpoint
+                ))
+            })?;
+        if *prevout != swap_input_txout(input)? {
+            return Err(swap_invalid(format!(
+                "swap input {} does not match its previous output",
+                input.outpoint
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// What the swap takes from this wallet, net of what it pays back to it, from the wallet's own
+/// view of its coins rather than what the PSBT says they are worth.
+fn swap_ensure_own_net_outflow(
+    wallet: &Wallet,
+    psbt: &Psbt,
+    proposal: &OnchainSwapProposal,
+    role: OnchainSwapRole,
+    own_inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    let mut own_in = 0u64;
+    for input in own_inputs {
+        let utxo = wallet
+            .bdk_wallet()
+            .get_utxo(swap_input_to_outpoint(input))
+            .ok_or_else(|| {
+                swap_invalid(format!(
+                    "swap input {} is not an unspent coin of this wallet",
+                    input.outpoint
+                ))
+            })?;
+        if utxo.txout != swap_input_txout(input)? {
+            return Err(swap_invalid(format!(
+                "swap input {} does not match this wallet's coin",
+                input.outpoint
+            )));
+        }
+        own_in = own_in
+            .checked_add(utxo.txout.value.to_sat())
+            .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+    }
+    let own_out = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .filter(|o| wallet.bdk_wallet().is_mine(o.script_pubkey.clone()))
+        .try_fold(0u64, |total, o| total.checked_add(o.value.to_sat()))
+        .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+    swap_ensure_net_btc_outflow(proposal, role, own_in, own_out)
+}
+
+/// Sign the inputs this wallet declared as `role`, refusing a PSBT that would make it sign
+/// anything else, spend counterparty inputs that are not what they claim, or take more BTC from
+/// it than the swap terms allow.
 pub(crate) fn swap_sign_psbt(
     wallet: &Wallet,
     psbt: &mut Psbt,
-    own_inputs: &[OnchainSwapInput],
-    counterparty_inputs: &[OnchainSwapInput],
+    proposal: &OnchainSwapProposal,
+    role: OnchainSwapRole,
 ) -> Result<(), Error> {
+    let (own_inputs, counterparty_inputs) = match role {
+        OnchainSwapRole::Maker => (&proposal.maker_inputs, &proposal.request.taker_inputs),
+        OnchainSwapRole::Taker => (&proposal.request.taker_inputs, &proposal.maker_inputs),
+    };
     swap_ensure_inputs_foreign(wallet, counterparty_inputs, own_inputs)?;
+    swap_ensure_prevouts_match(wallet, counterparty_inputs)?;
+    swap_ensure_own_net_outflow(wallet, psbt, proposal, role, own_inputs)?;
     let sign_options = SignOptions {
         trust_witness_utxo: true,
         ..Default::default()

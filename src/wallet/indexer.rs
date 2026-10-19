@@ -194,6 +194,26 @@ impl Indexer {
         })
     }
 
+    /// The transaction with `txid`, or `None` when the indexer doesn't know it.
+    pub(crate) fn get_tx(&self, txid: &str) -> Result<Option<BdkTransaction>, Error> {
+        let txid = bdk_wallet::bitcoin::Txid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
+        Ok(match self {
+            #[cfg(feature = "electrum")]
+            Indexer::Electrum(client) => match client.inner.transaction_get(&txid) {
+                Ok(tx) => Some(tx),
+                Err(e)
+                    if e.to_string()
+                        .contains("No such mempool or blockchain transaction") =>
+                {
+                    None
+                }
+                Err(e) => return Err(IndexerError::from(e).into()),
+            },
+            #[cfg(feature = "esplora")]
+            Indexer::Esplora(client) => client.get_tx(&txid).map_err(IndexerError::from)?,
+        })
+    }
+
     pub(crate) fn populate_tx_cache(
         &self,
         #[cfg_attr(feature = "esplora", allow(unused))] bdk_wallet: &PersistedWallet<

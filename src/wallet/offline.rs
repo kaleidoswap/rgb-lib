@@ -27,6 +27,12 @@ pub(crate) const SWAP_COMPLETION_FILE: &str = "completion.json";
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const SWAP_INVALIDATION_FILE: &str = "invalidation.json";
 #[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_SEED_FILE: &str = "seed.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+/// How far past its own chain tip the taker accepts the lock time the maker set, to allow for
+/// indexers that lag behind each other.
+pub(crate) const SWAP_LOCK_TIME_MAX_AHEAD: u32 = 3;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const SWAP_CANCELLED_EXTENSION: &str = "cancelled";
 
 const ASSET_ID_PREFIX: &str = "rgb:";
@@ -2954,20 +2960,89 @@ pub(crate) fn swap_random_blinding() -> u64 {
     rand::rng().random_range(1..=u64::MAX)
 }
 
-/// Derive a deterministic MPC entropy for a swap from its identifier. Both parties compute the
-/// same value so the MPC commitment they each (re)produce is identical.
+/// The MPC entropy for an RGB commitment this wallet finalizes in a swap.
+///
+/// It comes from a random seed that only exists in the local swap state, so neither the
+/// counterparty nor anyone who saw the offer can recompute it (the swap ID and the blindings are
+/// known to them). A retried step derives the same value. Nobody else needs it: the entropy
+/// travels in the PSBT.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
-pub(crate) fn swap_mpc_entropy(swap_id: &str) -> u64 {
-    let hash = hash_bytes_hex(swap_id.as_bytes());
+pub(crate) fn swap_mpc_entropy(wallet_dir: &Path, swap_id: &str) -> Result<u64, Error> {
+    let seed: String = if swap_state_path(wallet_dir, swap_id, SWAP_SEED_FILE).exists() {
+        swap_load_state(wallet_dir, swap_id, SWAP_SEED_FILE)?
+    } else {
+        let seed = hex::encode(rand::rng().random::<[u8; 32]>());
+        swap_save_state(wallet_dir, swap_id, SWAP_SEED_FILE, &seed)?;
+        seed
+    };
+    let seed = hex::decode(seed).map_err(|_| swap_invalid("corrupt local swap seed"))?;
+    let mut data = b"rgb-lib:swap:mpc-entropy:".to_vec();
+    data.extend_from_slice(&seed);
+    data.extend_from_slice(swap_id.as_bytes());
+    let hash = hash_bytes(&data);
     let mut bytes = [0u8; 8];
-    let src = hash.as_bytes();
-    let take = src.len().min(16);
-    let hex_slice = &hash[..take];
-    if let Ok(parsed) = u64::from_str_radix(hex_slice, 16) {
-        return std::cmp::Ord::max(parsed, 1);
+    bytes.copy_from_slice(&hash[..8]);
+    Ok(std::cmp::Ord::max(u64::from_be_bytes(bytes), 1))
+}
+
+/// The lock time the maker set must be a block height no further than
+/// [`SWAP_LOCK_TIME_MAX_AHEAD`] past `tip`: one in the future would keep the signed transaction
+/// from confirming until then.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_ensure_lock_time_current(
+    proposal: &OnchainSwapProposal,
+    tip: u32,
+) -> Result<(), Error> {
+    if proposal.lock_time > tip.saturating_add(SWAP_LOCK_TIME_MAX_AHEAD) {
+        return Err(swap_invalid(format!(
+            "swap lock time {} is ahead of the chain tip {tip}",
+            proposal.lock_time
+        )));
     }
-    bytes.copy_from_slice(&src[..8]);
-    std::cmp::Ord::max(u64::from_be_bytes(bytes), 1)
+    Ok(())
+}
+
+/// The most BTC the swap may take from `role`'s wallet, net of what it pays back to it: the BTC it
+/// gives, the network fee (taker) and the extra outputs it funds, less the BTC it receives.
+/// Negative when the side receives BTC.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_max_net_btc_outflow(
+    proposal: &OnchainSwapProposal,
+    role: OnchainSwapRole,
+) -> Result<i128, Error> {
+    let offer = &proposal.request.offer;
+    let (gives, receives) = match role {
+        OnchainSwapRole::Maker => (&offer.maker_gives, &offer.maker_receives),
+        OnchainSwapRole::Taker => (&offer.maker_receives, &offer.maker_gives),
+    };
+    let mut fee = swap_extra_funded_by(&offer.extra_outputs, role)?;
+    if role == OnchainSwapRole::Taker {
+        fee = fee
+            .checked_add(offer.network_fee_sat)
+            .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+    }
+    Ok(i128::from(swap_side_btc_payment(gives)) + i128::from(fee)
+        - i128::from(swap_side_btc_payment(receives)))
+}
+
+/// Defense in depth before signing, independent of how the PSBT was built: what this wallet puts
+/// in (`own_in`, from its own view of its coins) less what the transaction pays to its scripts
+/// (`own_out`) must not exceed [`swap_max_net_btc_outflow`].
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_ensure_net_btc_outflow(
+    proposal: &OnchainSwapProposal,
+    role: OnchainSwapRole,
+    own_in: u64,
+    own_out: u64,
+) -> Result<(), Error> {
+    let outflow = i128::from(own_in) - i128::from(own_out);
+    let allowed = swap_max_net_btc_outflow(proposal, role)?;
+    if outflow > allowed {
+        return Err(swap_invalid(format!(
+            "swap would take {outflow} sat from this wallet, at most {allowed} allowed"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -3455,9 +3530,11 @@ pub(crate) fn swap_build_psbt(
         &proposal.request.taker_change_script_pubkey_hex,
     )?;
 
+    let lock_time = LockTime::from_height(proposal.lock_time)
+        .map_err(|_| swap_invalid("swap lock time is not a block height"))?;
     let mut psbt = Psbt::from_unsigned_tx(BdkTransaction {
         version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
+        lock_time,
         input: tx_inputs,
         output: outputs,
     })
@@ -3898,6 +3975,7 @@ mod swap_unit_tests {
             txid: String::new(),
             consignments: vec![],
             maker_history: None,
+            lock_time: 0,
         }
     }
 
@@ -3910,6 +3988,102 @@ mod swap_unit_tests {
         let mut proposal = rgb_rgb_proposal();
         proposal.request.taker_inputs[0].amount_sat = 1_000;
         assert!(swap_tx_fee(&proposal).is_err());
+    }
+
+    #[test]
+    fn net_btc_outflow_is_bounded_by_the_swap_terms() {
+        // RGB for RGB: the taker only pays the network fee, the maker nothing
+        let proposal = rgb_rgb_proposal();
+        assert_eq!(
+            swap_max_net_btc_outflow(&proposal, OnchainSwapRole::Taker).unwrap(),
+            100
+        );
+        assert_eq!(
+            swap_max_net_btc_outflow(&proposal, OnchainSwapRole::Maker).unwrap(),
+            0
+        );
+        // the taker's 2_100 sat come back as its RGB output and 1_000 of change
+        swap_ensure_net_btc_outflow(&proposal, OnchainSwapRole::Taker, 2_100, 2_000).unwrap();
+        assert!(
+            swap_ensure_net_btc_outflow(&proposal, OnchainSwapRole::Taker, 2_100, 1_999).is_err()
+        );
+        // paying this wallet more than the terms is fine
+        swap_ensure_net_btc_outflow(&proposal, OnchainSwapRole::Maker, 1_000, 1_001).unwrap();
+        assert!(
+            swap_ensure_net_btc_outflow(&proposal, OnchainSwapRole::Maker, 1_000, 999).is_err()
+        );
+
+        // RGB for BTC with extra outputs on both sides
+        let mut proposal = rgb_rgb_proposal();
+        proposal.request.offer.maker_receives = btc(1_000);
+        proposal.request.offer.extra_outputs = vec![
+            extra(500, OnchainSwapRole::Taker),
+            extra(300, OnchainSwapRole::Maker),
+        ];
+        assert_eq!(
+            swap_max_net_btc_outflow(&proposal, OnchainSwapRole::Taker).unwrap(),
+            1_000 + 100 + 500
+        );
+        // the maker must come out at least 1_000 - 300 ahead
+        assert_eq!(
+            swap_max_net_btc_outflow(&proposal, OnchainSwapRole::Maker).unwrap(),
+            -700
+        );
+        swap_ensure_net_btc_outflow(&proposal, OnchainSwapRole::Maker, 1_000, 1_700).unwrap();
+        assert!(
+            swap_ensure_net_btc_outflow(&proposal, OnchainSwapRole::Maker, 1_000, 1_699).is_err()
+        );
+    }
+
+    #[test]
+    fn the_swap_transaction_carries_the_proposal_lock_time() {
+        let mut proposal = rgb_rgb_proposal();
+        proposal.lock_time = 100;
+        let (psbt, _, _) = swap_build_psbt(&proposal).unwrap();
+        assert_eq!(
+            psbt.unsigned_tx.lock_time,
+            LockTime::from_height(100).unwrap()
+        );
+        // a proposal built with another lock time is a different transaction
+        let mut other = proposal.clone();
+        other.lock_time = 0;
+        assert!(swap_validate_proposal_psbt(&other, &psbt).is_err());
+        // a lock time is a height, not a timestamp
+        proposal.lock_time = 500_000_000;
+        assert!(swap_build_psbt(&proposal).is_err());
+    }
+
+    #[test]
+    fn the_taker_refuses_a_lock_time_ahead_of_the_chain() {
+        let mut proposal = rgb_rgb_proposal();
+        proposal.lock_time = 100;
+        swap_ensure_lock_time_current(&proposal, 100).unwrap();
+        swap_ensure_lock_time_current(&proposal, 100 - SWAP_LOCK_TIME_MAX_AHEAD).unwrap();
+        assert!(swap_ensure_lock_time_current(&proposal, 99 - SWAP_LOCK_TIME_MAX_AHEAD).is_err());
+        // a proposal from before the lock time was set
+        proposal.lock_time = 0;
+        swap_ensure_lock_time_current(&proposal, 100).unwrap();
+        let json = serde_json::to_value(rgb_rgb_proposal()).unwrap();
+        let mut old = json.as_object().unwrap().clone();
+        old.retain(|k, _| k != "lock_time" && k != "lockTime");
+        let parsed: OnchainSwapProposal = serde_json::from_value(old.into()).unwrap();
+        assert_eq!(parsed.lock_time, 0);
+    }
+
+    #[test]
+    fn the_mpc_entropy_comes_from_a_private_seed() {
+        let wallet = tempfile::tempdir().unwrap();
+        let other_wallet = tempfile::tempdir().unwrap();
+        let entropy = swap_mpc_entropy(wallet.path(), "swap1").unwrap();
+        // stable across retries of the same swap
+        assert_eq!(swap_mpc_entropy(wallet.path(), "swap1").unwrap(), entropy);
+        assert!(swap_state_path(wallet.path(), "swap1", SWAP_SEED_FILE).exists());
+        // not derivable from the swap ID alone
+        assert_ne!(
+            swap_mpc_entropy(other_wallet.path(), "swap1").unwrap(),
+            entropy
+        );
+        assert_ne!(swap_mpc_entropy(wallet.path(), "swap2").unwrap(), entropy);
     }
 
     #[test]
