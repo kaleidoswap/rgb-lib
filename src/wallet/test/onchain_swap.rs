@@ -1,6 +1,11 @@
 use std::str::FromStr;
 
+#[cfg(feature = "electrum")]
+use base64::{Engine as _, engine::general_purpose};
 use bdk_wallet::bitcoin::psbt::Psbt;
+
+#[cfg(feature = "electrum")]
+use crate::api::proxy::ProxyClient;
 
 use super::*;
 use crate::wallet::offline::{
@@ -582,9 +587,11 @@ fn taker_refuses_a_maker_input_declared_with_the_wrong_amount() {
     let err = taker
         .complete_swap_proposal(taker_online, proposal, 0, false)
         .unwrap_err();
+    // the unspent check before coloring catches it first, the prevout check before signing
+    // would otherwise
+    let err = err.to_string();
     assert!(
-        err.to_string()
-            .contains("does not match its previous output"),
+        err.contains("amount mismatch") || err.contains("does not match its previous output"),
         "{err}"
     );
 }
@@ -2295,7 +2302,7 @@ fn execute_swap(
     maker_gives: OnchainSwapLeg,
     maker_receives: OnchainSwapLeg,
     proxy_url: &str,
-) {
+) -> OnchainSwapCompletion {
     execute_swap_with_extra_outputs(
         maker,
         maker_online,
@@ -2318,7 +2325,7 @@ fn execute_swap_with_extra_outputs(
     maker_receives: OnchainSwapLeg,
     proxy_url: &str,
     extra_outputs: Vec<OnchainSwapExtraOutput>,
-) {
+) -> OnchainSwapCompletion {
     let maker_receives_rgb = matches!(maker_receives.kind, OnchainSwapLegKind::Rgb);
     let taker_receives_rgb = matches!(maker_gives.kind, OnchainSwapLegKind::Rgb);
     let rgb_for_rgb = maker_receives_rgb && taker_receives_rgb;
@@ -2556,10 +2563,16 @@ fn execute_swap_with_extra_outputs(
     }
     if !maker_receives_rgb {
         let receive_result = maker
-            .accept_swap_transfers(maker_online, completion, OnchainSwapRole::Maker, false)
+            .accept_swap_transfers(
+                maker_online,
+                completion.clone(),
+                OnchainSwapRole::Maker,
+                false,
+            )
             .unwrap();
         assert!(receive_result.assignments.is_empty());
     }
+    completion
 }
 
 fn alternate_swap_recipient_id(wallet: &mut Wallet) -> String {
@@ -2699,4 +2712,678 @@ fn assert_asset_balances(
             expected.asset_id
         );
     }
+}
+
+/// A maker selling RGB hands the taker a bad consignment for it. Each one is refused before the
+/// taker signs, and leaves the taker's wallet as it was. The taker fetches the consignment from
+/// the endpoint the maker put in the proposal, so a maker can serve any bytes it likes: a mock
+/// proxy plays that part.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn taker_refuses_a_bad_maker_consignment_before_signing() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SBAD",
+        "Swap Bad Consignment",
+        SWAP_RGB_AMOUNT * 2,
+    );
+
+    // an earlier swap, whose consignment the maker replays
+    let earlier = execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    let earlier_consignment = earlier.consignments[0].clone();
+    let earlier_bytes = proxy_consignment_bytes(&earlier_consignment.recipient_id);
+
+    let offer = maker
+        .create_swap_offer(
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            btc(SWAP_BTC_PRICE),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            vec![],
+        )
+        .unwrap();
+    let swap_id = offer.swap_id.clone();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let proposal = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap();
+    assert_eq!(proposal.consignments.len(), 1);
+    let honest = proposal.consignments[0].clone();
+    let honest_bytes = proxy_consignment_bytes(&honest.recipient_id);
+    let with_consignment = |consignment: OnchainSwapConsignment| {
+        let mut bad = proposal.clone();
+        bad.consignments = vec![consignment];
+        bad
+    };
+
+    let (_replay_server, _replay_mock, replay_endpoint) =
+        hostile_proxy(&earlier_bytes, &earlier.txid);
+    let (_truncated_server, _truncated_mock, truncated_endpoint) =
+        hostile_proxy(&honest_bytes[..honest_bytes.len() / 2], &proposal.txid);
+    let mut bad_proposals = vec![];
+    let mut consignment = honest.clone();
+    consignment.blinding += 1;
+    bad_proposals.push((
+        "blinding + 1",
+        with_consignment(consignment),
+        "blinding mismatch",
+    ));
+    let mut consignment = honest.clone();
+    consignment.vout += 1;
+    bad_proposals.push(("wrong vout", with_consignment(consignment), "vout mismatch"));
+    bad_proposals.push((
+        "earlier swap's consignment",
+        with_consignment(earlier_consignment),
+        "txid mismatch",
+    ));
+    // every field matches this swap, the bytes are the earlier swap's
+    let mut consignment = honest.clone();
+    consignment.endpoint = Some(replay_endpoint);
+    bad_proposals.push((
+        "replayed bytes",
+        with_consignment(consignment),
+        "does not include the expected witness transaction",
+    ));
+    let mut consignment = honest.clone();
+    consignment.endpoint = Some(truncated_endpoint);
+    bad_proposals.push((
+        "truncated bytes",
+        with_consignment(consignment),
+        "unexpected end of file",
+    ));
+
+    let before = wallet_snapshot(&mut taker, taker_online, &[&asset_id]);
+    for (name, bad_proposal, expected) in bad_proposals {
+        let err = taker
+            .complete_swap_proposal(taker_online, bad_proposal, 0, false)
+            .unwrap_err();
+        assert!(err.to_string().contains(expected), "{name}: {err}");
+        assert_refused_before_signing(&mut taker, taker_online, &swap_id, &[&asset_id], &before);
+    }
+
+    // the honest proposal still completes and settles
+    settle_swap(&mut maker, maker_online, &mut taker, taker_online, proposal);
+    assert_settled_balance(&maker, &asset_id, 0);
+    assert_settled_balance(&taker, &asset_id, SWAP_RGB_AMOUNT * 2);
+}
+
+/// RGB-for-RGB: the taker imports the maker's asset history before signing. A truncated one is
+/// refused without touching the taker's wallet.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn taker_refuses_a_truncated_maker_history_before_signing() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let maker_asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SHMA",
+        "Swap History Maker",
+        SWAP_RGB_AMOUNT,
+    );
+    let taker_asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SHTA",
+        "Swap History Taker",
+        SWAP_RGB_AMOUNT,
+    );
+    let offer = maker
+        .create_swap_offer(
+            rgb(&maker_asset_id, SWAP_RGB_AMOUNT),
+            rgb(&taker_asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            vec![],
+        )
+        .unwrap();
+    let swap_id = offer.swap_id.clone();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let proposal = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap();
+    let history = proposal.maker_history.clone().unwrap();
+    let history_bytes = proxy_consignment_bytes(&history.recipient_id);
+    let (_server, _mock, endpoint) =
+        hostile_proxy(&history_bytes[..history_bytes.len() / 2], &proposal.txid);
+    let mut bad_proposal = proposal.clone();
+    bad_proposal.maker_history.as_mut().unwrap().endpoint = Some(endpoint);
+
+    let before = wallet_snapshot(&mut taker, taker_online, &[&taker_asset_id]);
+    let err = taker
+        .complete_swap_proposal(taker_online, bad_proposal, 0, false)
+        .unwrap_err();
+    assert!(err.to_string().contains("unexpected end of file"), "{err}");
+    assert_refused_before_signing(
+        &mut taker,
+        taker_online,
+        &swap_id,
+        &[&taker_asset_id],
+        &before,
+    );
+    assert!(taker.get_asset_balance(maker_asset_id.clone()).is_err());
+
+    settle_swap(&mut maker, maker_online, &mut taker, taker_online, proposal);
+    assert_settled_balance(&taker, &maker_asset_id, SWAP_RGB_AMOUNT);
+    assert_settled_balance(&maker, &taker_asset_id, SWAP_RGB_AMOUNT);
+}
+
+/// BTC-for-RGB: the maker receives RGB, then spends it in two hops, part to a third wallet, which
+/// forwards it to a fourth, and its change straight to the fourth.
+#[test]
+#[parallel]
+fn btc_for_rgb_received_asset_survives_two_hops() {
+    initialize();
+
+    const PARTIAL: u64 = 400;
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SHOP",
+        "Swap Hops",
+        SWAP_RGB_AMOUNT,
+    );
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        btc(SWAP_BTC_PRICE),
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &asset_id, SWAP_RGB_AMOUNT);
+
+    let mut receiver = party!(maker, maker_online);
+    let mut w3 = get_funded_party!();
+    let mut w4 = get_funded_party!();
+    normal_send(&mut receiver, &mut w3, &asset_id, PARTIAL);
+    normal_send(&mut w3, &mut w4, &asset_id, PARTIAL);
+    normal_send(&mut receiver, &mut w4, &asset_id, SWAP_RGB_AMOUNT - PARTIAL);
+    assert_eq!(receiver.get_asset_balance(&asset_id).settled, 0);
+    assert_eq!(w3.get_asset_balance(&asset_id).settled, 0);
+    assert_eq!(w4.get_asset_balance(&asset_id).settled, SWAP_RGB_AMOUNT);
+}
+
+/// RGB-for-RGB: each side spends part of what it received to a third wallet, which forwards both
+/// assets to a fourth, and sends the rest back across to the other side.
+#[test]
+#[parallel]
+fn rgb_for_rgb_received_assets_survive_two_hops() {
+    initialize();
+
+    const MAKER_PARTIAL: u64 = 400;
+    const TAKER_PARTIAL: u64 = 300;
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let maker_asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SHPA",
+        "Swap Hops Maker",
+        SWAP_RGB_AMOUNT,
+    );
+    let taker_asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SHPB",
+        "Swap Hops Taker",
+        SWAP_RGB_AMOUNT,
+    );
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&maker_asset_id, SWAP_RGB_AMOUNT),
+        rgb(&taker_asset_id, SWAP_RGB_AMOUNT),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+
+    let mut maker = party!(maker, maker_online);
+    let mut taker = party!(taker, taker_online);
+    let mut w3 = get_funded_party!();
+    let mut w4 = get_funded_party!();
+    normal_send(&mut maker, &mut w3, &taker_asset_id, MAKER_PARTIAL);
+    normal_send(&mut taker, &mut w3, &maker_asset_id, TAKER_PARTIAL);
+    normal_send(&mut w3, &mut w4, &taker_asset_id, MAKER_PARTIAL);
+    normal_send(&mut w3, &mut w4, &maker_asset_id, TAKER_PARTIAL);
+    normal_send(
+        &mut maker,
+        &mut taker,
+        &taker_asset_id,
+        SWAP_RGB_AMOUNT - MAKER_PARTIAL,
+    );
+    normal_send(
+        &mut taker,
+        &mut maker,
+        &maker_asset_id,
+        SWAP_RGB_AMOUNT - TAKER_PARTIAL,
+    );
+
+    let settled =
+        |party: &SinglesigParty, asset_id: &str| party.get_asset_balance(asset_id).settled;
+    assert_eq!(settled(&w4, &taker_asset_id), MAKER_PARTIAL);
+    assert_eq!(settled(&w4, &maker_asset_id), TAKER_PARTIAL);
+    assert_eq!(settled(&w3, &taker_asset_id), 0);
+    assert_eq!(settled(&w3, &maker_asset_id), 0);
+    assert_eq!(
+        settled(&maker, &maker_asset_id),
+        SWAP_RGB_AMOUNT - TAKER_PARTIAL
+    );
+    assert_eq!(settled(&maker, &taker_asset_id), 0);
+    assert_eq!(
+        settled(&taker, &taker_asset_id),
+        SWAP_RGB_AMOUNT - MAKER_PARTIAL
+    );
+    assert_eq!(settled(&taker, &maker_asset_id), 0);
+}
+
+/// The maker spends the RGB coin it declared after sending the proposal: the taker refuses to
+/// sign, both sides cancel, and the taker's wallet is as it was.
+#[test]
+#[parallel]
+fn taker_refuses_a_proposal_whose_maker_rgb_input_was_spent() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SDRI",
+        "Swap Spent RGB Input",
+        SWAP_RGB_AMOUNT,
+    );
+    // an asset the taker holds outside the swap
+    let taker_asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SDRT",
+        "Swap Spent Taker Own",
+        SWAP_RGB_AMOUNT,
+    );
+    let offer = maker
+        .create_swap_offer(
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            btc(SWAP_BTC_PRICE),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            vec![],
+        )
+        .unwrap();
+    let swap_id = offer.swap_id.clone();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let proposal = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap();
+
+    // the maker drops the swap on its side and sends the asset elsewhere, spending the coin
+    maker.cancel_swap(maker_online, swap_id.clone()).unwrap();
+    let mut maker = party!(maker, maker_online);
+    let mut w3 = get_funded_party!();
+    normal_send(&mut maker, &mut w3, &asset_id, SWAP_RGB_AMOUNT);
+    let mut maker = maker.wallet;
+    let maker_unspents = settled_unspents(&mut maker, maker_online);
+    for input in &proposal.maker_inputs {
+        assert!(
+            !maker_unspents
+                .iter()
+                .any(|u| u.starts_with(&input.outpoint.to_string())),
+            "declared maker input {} should be spent",
+            input.outpoint
+        );
+    }
+
+    let before = wallet_snapshot(&mut taker, taker_online, &[&taker_asset_id]);
+    let err = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap_err();
+    assert!(err.to_string().contains("already spent"), "{err}");
+    assert_refused_before_signing(
+        &mut taker,
+        taker_online,
+        &swap_id,
+        &[&taker_asset_id],
+        &before,
+    );
+    taker.cancel_swap(taker_online, swap_id.clone()).unwrap();
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Cancelled);
+    assert_eq!(
+        wallet_snapshot(&mut taker, taker_online, &[&taker_asset_id]),
+        before
+    );
+    assert_eq!(swap_stage(&maker, &swap_id), OnchainSwapStage::Cancelled);
+    assert_settled_balance(&taker, &taker_asset_id, SWAP_RGB_AMOUNT);
+    assert_eq!(w3.get_asset_balance(&asset_id).settled, SWAP_RGB_AMOUNT);
+}
+
+#[test]
+#[parallel]
+fn taker_refuses_an_expired_offer() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SXPO",
+        "Swap Expired Offer",
+        SWAP_RGB_AMOUNT,
+    );
+    let expiration = now().unix_timestamp() as u64 + 5;
+    let offer = maker
+        .create_swap_offer(
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            btc(SWAP_BTC_PRICE),
+            SWAP_FEE,
+            Some(expiration),
+            Some(PROXY_URL.to_string()),
+            vec![],
+        )
+        .unwrap();
+    let swap_id = offer.swap_id.clone();
+    while (now().unix_timestamp() as u64) <= expiration {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    let before = settled_unspents(&mut taker, taker_online);
+    let err = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap_err();
+    assert!(err.to_string().contains("expired"), "{err}");
+    assert!(!swap_state_path(taker.wallet_dir(), &swap_id, SWAP_REQUEST_FILE).exists());
+    assert!(
+        !taker
+            .list_swaps()
+            .unwrap()
+            .iter()
+            .any(|s| s.swap_id == swap_id)
+    );
+    assert_eq!(settled_unspents(&mut taker, taker_online), before);
+}
+
+/// After a swap and a refresh, in every direction and on both sides: no batch of the swap is left
+/// waiting, every output of the swap transaction the wallet tracks exists and has its witness,
+/// and every input the wallet declared is spent.
+#[test]
+#[parallel]
+fn swap_db_invariants_hold_after_refresh() {
+    initialize();
+
+    for (i, direction) in [
+        SwapDirection::RgbForBtc,
+        SwapDirection::BtcForRgb,
+        SwapDirection::RgbForRgb,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+        let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+        let issue = |wallet: &mut Wallet, online: Online, side: &str| {
+            issue_swap_asset(
+                wallet,
+                online,
+                &format!("SDB{i}{side}"),
+                "Swap DB Invariants",
+                SWAP_RGB_AMOUNT,
+            )
+        };
+        let (maker_gives, maker_receives) = match direction {
+            SwapDirection::RgbForBtc => (
+                rgb(&issue(&mut maker, maker_online, "M"), SWAP_RGB_AMOUNT),
+                btc(SWAP_BTC_PRICE),
+            ),
+            SwapDirection::BtcForRgb => (
+                btc(SWAP_BTC_PRICE),
+                rgb(&issue(&mut taker, taker_online, "T"), SWAP_RGB_AMOUNT),
+            ),
+            SwapDirection::RgbForRgb => (
+                rgb(&issue(&mut maker, maker_online, "M"), SWAP_RGB_AMOUNT),
+                rgb(&issue(&mut taker, taker_online, "T"), SWAP_RGB_AMOUNT),
+            ),
+        };
+        let completion = execute_swap(
+            &mut maker,
+            maker_online,
+            &mut taker,
+            taker_online,
+            maker_gives,
+            maker_receives,
+            PROXY_URL,
+        );
+        refresh_settled(&mut maker, maker_online);
+        refresh_settled(&mut taker, taker_online);
+        assert_swap_db_invariants(
+            &mut maker,
+            maker_online,
+            &completion,
+            &completion.proposal.maker_inputs,
+            &format!("{direction:?} maker"),
+        );
+        assert_swap_db_invariants(
+            &mut taker,
+            taker_online,
+            &completion,
+            &completion.proposal.request.taker_inputs,
+            &format!("{direction:?} taker"),
+        );
+    }
+}
+
+fn assert_swap_db_invariants(
+    wallet: &mut Wallet,
+    online: Online,
+    completion: &OnchainSwapCompletion,
+    own_inputs: &[OnchainSwapInput],
+    side: &str,
+) {
+    let _ = wallet.list_unspents(Some(online), false, false).unwrap();
+    let db_data = wallet
+        .database()
+        .begin_transaction()
+        .unwrap()
+        .get_db_data(false)
+        .unwrap();
+    let batches = db_data
+        .batch_transfers
+        .iter()
+        .filter(|b| b.txid.as_deref() == Some(completion.txid.as_str()))
+        .collect::<Vec<_>>();
+    assert!(!batches.is_empty(), "{side}: no batch for the swap");
+    for batch in batches {
+        assert_eq!(
+            batch.status,
+            TransferStatus::Settled,
+            "{side}: batch {} not settled",
+            batch.idx
+        );
+    }
+    for txo in db_data.txos.iter().filter(|t| t.txid == completion.txid) {
+        assert!(
+            txo.exists && !txo.pending_witness,
+            "{side}: swap output {}:{} exists={} pending_witness={}",
+            txo.txid,
+            txo.vout,
+            txo.exists,
+            txo.pending_witness
+        );
+    }
+    for input in own_inputs {
+        if let Some(txo) = db_data
+            .txos
+            .iter()
+            .find(|t| t.txid == input.outpoint.txid && t.vout == input.outpoint.vout)
+        {
+            assert!(
+                txo.spent,
+                "{side}: input {} not spent in the DB",
+                input.outpoint
+            );
+        }
+        assert!(
+            wallet
+                .bdk_wallet()
+                .get_utxo(input.outpoint.clone().into())
+                .is_none(),
+            "{side}: input {} still unspent for BDK",
+            input.outpoint
+        );
+    }
+}
+
+/// Complete, process, broadcast and accept an honest proposal, then refresh both sides.
+fn settle_swap(
+    maker: &mut Wallet,
+    maker_online: Online,
+    taker: &mut Wallet,
+    taker_online: Online,
+    proposal: OnchainSwapProposal,
+) {
+    let completion = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap();
+    let completion = maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap();
+    maker
+        .broadcast_swap_completion(maker_online, completion.clone())
+        .unwrap();
+    mine(false);
+    maker
+        .accept_swap_transfers(
+            maker_online,
+            completion.clone(),
+            OnchainSwapRole::Maker,
+            false,
+        )
+        .unwrap();
+    taker
+        .accept_swap_transfers(taker_online, completion, OnchainSwapRole::Taker, false)
+        .unwrap();
+    refresh_settled(maker, maker_online);
+    refresh_settled(taker, taker_online);
+}
+
+/// What a refused swap step must leave unchanged: transfers, unspents, the stash and balance of
+/// `asset_ids`, and the row count of every DB table.
+fn wallet_snapshot(wallet: &mut Wallet, online: Online, asset_ids: &[&str]) -> Vec<String> {
+    let mut snapshot = wallet
+        .list_transfers(AssetFilter::AnyOrNone, None)
+        .unwrap()
+        .iter()
+        .map(|t| format!("{t:?}"))
+        .collect::<Vec<_>>();
+    snapshot.extend(settled_unspents(wallet, online));
+    for asset_id in asset_ids {
+        snapshot.push(format!("{:?}", stash_assignments(wallet, online, asset_id)));
+        snapshot.push(format!(
+            "{:?}",
+            wallet.get_asset_balance(asset_id.to_string()).unwrap()
+        ));
+    }
+    let db_data = wallet
+        .database()
+        .begin_transaction()
+        .unwrap()
+        .get_db_data(false)
+        .unwrap();
+    snapshot.push(format!(
+        "batch_transfers={} asset_transfers={} transfers={} colorings={} txos={}",
+        db_data.batch_transfers.len(),
+        db_data.asset_transfers.len(),
+        db_data.transfers.len(),
+        db_data.colorings.len(),
+        db_data.txos.len(),
+    ));
+    snapshot
+}
+
+/// The taker refused to complete `swap_id`: it saved no completion (so no signature left it),
+/// is still waiting for a proposal, and its wallet is unchanged.
+fn assert_refused_before_signing(
+    taker: &mut Wallet,
+    taker_online: Online,
+    swap_id: &str,
+    asset_ids: &[&str],
+    before: &[String],
+) {
+    assert!(!swap_state_path(taker.wallet_dir(), swap_id, SWAP_COMPLETION_FILE).exists());
+    assert!(!swap_outgoing_path(taker, swap_id).exists());
+    assert_eq!(swap_stage(taker, swap_id), OnchainSwapStage::Requested);
+    assert_eq!(wallet_snapshot(taker, taker_online, asset_ids), before);
+}
+
+#[cfg(feature = "electrum")]
+fn proxy_consignment_bytes(recipient_id: &str) -> Vec<u8> {
+    let res = ProxyClient::new(PROXY_URL)
+        .unwrap()
+        .get_consignment(recipient_id)
+        .unwrap();
+    general_purpose::STANDARD
+        .decode(res.result.unwrap().consignment)
+        .unwrap()
+}
+
+/// A proxy that answers every consignment request with `consignment`. The returned server and
+/// mock must be kept alive while it is used.
+#[cfg(feature = "electrum")]
+fn hostile_proxy(consignment: &[u8], txid: &str) -> (mockito::ServerGuard, mockito::Mock, String) {
+    let mut server = mockito::Server::new();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "result": {
+            "consignment": general_purpose::STANDARD.encode(consignment),
+            "txid": txid,
+            "vout": null,
+        },
+    });
+    let mock = server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex("consignment\\.get".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body.to_string())
+        .create();
+    let endpoint = format!("rpc://{}", server.url().trim_start_matches("http://"));
+    (server, mock, endpoint)
 }
