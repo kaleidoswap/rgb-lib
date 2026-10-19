@@ -78,7 +78,8 @@ fn refund_leaf_script(refund_key: &XOnlyPublicKey, timeout_height: u32) -> Scrip
         .into_script()
 }
 
-/// Both leaves at depth 1, claim first, under `internal_key` (the Boltz/maker layout).
+/// Both leaves at depth 1 under `internal_key` (the Boltz/maker layout). Taproot sorts the two
+/// branch hashes, so the order the leaves are added in is not committed.
 fn swap_tree_spend_info(
     secp: &Secp256k1<All>,
     claim_leaf: &ScriptBuf,
