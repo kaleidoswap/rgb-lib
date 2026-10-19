@@ -4968,12 +4968,13 @@ pub(crate) fn swap_pick_smallest_covering(values: &[u64], needed: u64) -> Option
 
 /// Select plain BTC inputs from the vanilla wallet worth at least `needed_sat`.
 ///
-/// Coins in `excluded` and coins already spent are never picked. With `prefer_smallest` the coins
-/// are chosen to leave the smallest leftover, otherwise they are taken in wallet order until the
-/// amount is covered.
+/// Coins in `excluded`, coins already spent and coins the wallet holds back from vanilla sends
+/// (DB-tracked TXOs and those reserved by an unbroadcast `send_btc_begin` / `create_utxos_begin`)
+/// are never picked. With `prefer_smallest` the coins are chosen to leave the smallest leftover,
+/// otherwise they are taken in wallet order until the amount is covered.
 pub(crate) fn swap_select_btc_inputs(
     wallet: &mut Wallet,
-    online: Online,
+    txn: &DbTxn,
     needed_sat: u64,
     min_confirmations: u8,
     excluded: &HashSet<(&str, u32)>,
@@ -4982,12 +4983,19 @@ pub(crate) fn swap_select_btc_inputs(
     // The caller (swap_select_inputs) already synced via sync_if_requested; we use
     // internal_unspents() directly to avoid opening a second DB connection while the
     // caller's transaction is still live (pool size = 1).
-    let _ = online; // consumed by the caller's sync; kept in signature for clarity
+    // a pending send_btc_begin / create_utxos_begin PSBT relies on its reserved coins: spending
+    // one here would make that PSBT invalid
+    let unspendable = wallet
+        .get_unspendable_bdk_outpoints(txn)?
+        .into_iter()
+        .collect::<HashSet<_>>();
     let candidates = wallet
         .internal_unspents()
         .filter(|o| {
             let txid = o.outpoint.txid.to_string();
-            !o.is_spent && !excluded.contains(&(txid.as_str(), o.outpoint.vout))
+            !o.is_spent
+                && !unspendable.contains(&o.outpoint)
+                && !excluded.contains(&(txid.as_str(), o.outpoint.vout))
         })
         .collect::<Vec<_>>();
     let is_confirmed = |output: &LocalOutput| -> Result<bool, Error> {
@@ -5071,7 +5079,7 @@ pub(crate) fn swap_select_inputs(
         OnchainSwapLegKind::Btc => {
             let inputs = swap_select_btc_inputs(
                 wallet,
-                online,
+                txn,
                 gives
                     .amount
                     .checked_add(extra_sat)
@@ -5142,7 +5150,7 @@ pub(crate) fn swap_select_inputs(
                     // spent with RGB, so pick the coins that leave the least behind.
                     let btc_inputs = swap_select_btc_inputs(
                         wallet,
-                        online,
+                        txn,
                         needed - colored_total,
                         min_confirmations,
                         &excluded,
