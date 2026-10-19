@@ -27,6 +27,48 @@ pub struct ColoringInfo {
 /// Map of contract ID and list of its beneficiaries
 pub type AssetBeneficiariesMap = BTreeMap<ContractId, Vec<BuilderSeal<GraphSeal>>>;
 
+fn psbt_has_input_signatures(psbt: &Psbt) -> bool {
+    psbt.inputs.iter().any(|input| {
+        !input.partial_sigs.is_empty()
+            || input.tap_key_sig.is_some()
+            || !input.tap_script_sigs.is_empty()
+            || input.final_script_sig.is_some()
+            || input.final_script_witness.is_some()
+    })
+}
+
+fn rebuild_psbt_preserving_maps(
+    psbt: &Psbt,
+    mut unsigned_tx: BdkTransaction,
+    opreturn_first: bool,
+) -> Result<Psbt, Error> {
+    for txin in &mut unsigned_tx.input {
+        txin.script_sig = ScriptBuf::new();
+        txin.witness.clear();
+    }
+    let mut rebuilt = Psbt::from_unsigned_tx(unsigned_tx).map_err(|e| Error::Internal {
+        details: format!("Failed to create PSBT: {e}"),
+    })?;
+    rebuilt.version = psbt.version;
+    rebuilt.xpub = psbt.xpub.clone();
+    rebuilt.proprietary = psbt.proprietary.clone();
+    rebuilt.unknown = psbt.unknown.clone();
+    for (rebuilt_input, input) in rebuilt.inputs.iter_mut().zip(psbt.inputs.iter()) {
+        *rebuilt_input = input.clone();
+    }
+    if opreturn_first {
+        for (rebuilt_output, output) in rebuilt.outputs.iter_mut().skip(1).zip(psbt.outputs.iter())
+        {
+            *rebuilt_output = output.clone();
+        }
+    } else {
+        for (rebuilt_output, output) in rebuilt.outputs.iter_mut().zip(psbt.outputs.iter()) {
+            *rebuilt_output = output.clone();
+        }
+    }
+    Ok(rebuilt)
+}
+
 /// Indexer protocol
 #[derive(Debug, Clone)]
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -81,6 +123,19 @@ pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
 impl Wallet {
     /// Color a PSBT.
     ///
+    /// # `output_map` index convention
+    ///
+    /// Keys are PSBT output indices. When any output is P2TR (RGB `OpretFirst`), OP_RETURN is
+    /// placed at vout 0 (inserted if missing) and keys are treated as **pre-OP_RETURN** indices:
+    /// they are shifted by +1 internally. That applies even if OP_RETURN was already present at
+    /// vout 0. With P2TR, a pre-existing OP_RETURN at index > 0 is rejected (would silently
+    /// mis-seal under the +1 rule). With no P2TR, OP_RETURN is appended and keys are final.
+    /// A key must not point to the OP_RETURN output.
+    ///
+    /// Coloring must happen **before** any input is signed. Partial signatures are rejected
+    /// because embedding the RGB commitment rewrites the OP_RETURN output and invalidates existing
+    /// sighashes.
+    ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     pub fn color_psbt(
@@ -88,54 +143,115 @@ impl Wallet {
         psbt: &mut Psbt,
         coloring_info: ColoringInfo,
     ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
-        info!(self.logger(), "Coloring PSBT...");
-        let mut transaction = match psbt.clone().extract_tx() {
-            Ok(tx) => tx,
-            Err(ExtractTxError::MissingInputValue { tx }) => tx, // required for non-standard TXs
-            Err(e) => return Err(InternalError::from(e).into()),
-        };
-        let mut opreturn_first = false;
-        if transaction.output.iter().any(|o| o.script_pubkey.is_p2tr()) {
-            opreturn_first = true;
-        }
-
-        if !transaction
-            .output
-            .iter()
-            .any(|o| o.script_pubkey.is_op_return())
-        {
-            let opreturn_output = TxOut {
-                value: BdkAmount::ZERO,
-                script_pubkey: ScriptBuf::new_op_return([]),
-            };
-            if opreturn_first {
-                transaction.output.insert(0, opreturn_output);
-            } else {
-                transaction.output.push(opreturn_output);
-            }
-            *psbt = Psbt::from_unsigned_tx(transaction).unwrap();
-        }
-
-        let runtime = self.rgb_runtime()?;
-
         let prev_outputs = psbt
             .unsigned_tx
             .input
             .iter()
             .map(|txin| txin.previous_output)
             .collect::<HashSet<OutPoint>>();
+        self.color_psbt_with_prevouts(psbt, coloring_info, prev_outputs, false)
+    }
 
+    /// Ensure the PSBT can be colored: reject signed inputs, insert OP_RETURN if missing.
+    ///
+    /// Returns whether `output_map` keys should be +1-shifted ([`Self::color_psbt`] legacy
+    /// `OpretFirst` rule): `true` when any output is P2TR and OP_RETURN is (or will be) at
+    /// vout 0. With P2TR, a pre-existing OP_RETURN at index > 0 is rejected so +1 cannot
+    /// silently mis-seal.
+    ///
+    /// Uses `unsigned_tx` directly (no `extract_tx`): fee-rate guards are irrelevant to RGB
+    /// commitment layout, and some PSBTs may trip `AbsurdFeeRate` without being invalid to color.
+    pub(crate) fn prepare_psbt_for_coloring(&self, psbt: &mut Psbt) -> Result<bool, Error> {
+        if psbt_has_input_signatures(psbt) {
+            return Err(Error::InvalidColoringInfo {
+                details: s!(
+                    "cannot color a signed PSBT: RGB commitment rewrites the OP_RETURN output"
+                ),
+            });
+        }
+        let opreturn_first = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .any(|o| o.script_pubkey.is_p2tr());
+        match psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .position(|o| o.script_pubkey.is_op_return())
+        {
+            None => {
+                let mut transaction = psbt.unsigned_tx.clone();
+                let opreturn_output = TxOut {
+                    value: BdkAmount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return([]),
+                };
+                if opreturn_first {
+                    transaction.output.insert(0, opreturn_output);
+                } else {
+                    transaction.output.push(opreturn_output);
+                }
+                *psbt = rebuild_psbt_preserving_maps(psbt, transaction, opreturn_first)?;
+            }
+            Some(0) => {}
+            // +1 assumes OP_RETURN at / inserted at vout 0; otherwise seals shift with no insert.
+            Some(_) if opreturn_first => {
+                return Err(Error::InvalidColoringInfo {
+                    details: s!("OP_RETURN must be the first PSBT output"),
+                });
+            }
+            Some(_) => {}
+        }
+
+        Ok(opreturn_first)
+    }
+
+    fn color_psbt_with_prevouts(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        prev_outputs: HashSet<OutPoint>,
+        require_full_allocation: bool,
+    ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
+        info!(self.logger(), "Coloring PSBT...");
+        let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
+        let runtime = self.rgb_runtime()?;
+        self.color_psbt_with_prevouts_runtime(
+            &runtime,
+            psbt,
+            coloring_info,
+            prev_outputs,
+            require_full_allocation,
+            shift_output_map_for_opreturn_first,
+        )
+    }
+
+    /// Build the RGB transitions for `coloring_info`, spending the allocations found on
+    /// `prev_outputs`, and commit them to the PSBT's OP_RETURN output.
+    ///
+    /// The PSBT must already have gone through [`Self::prepare_psbt_for_coloring`], whose result
+    /// is `shift_output_map_for_opreturn_first`. With `require_full_allocation`, the `output_map`
+    /// of each contract must re-assign exactly the amount found on the inputs, and inputs carrying
+    /// non-asset assignments (e.g. inflation rights) are rejected, since they would be destroyed.
+    pub(crate) fn color_psbt_with_prevouts_runtime(
+        &self,
+        runtime: &RgbRuntime,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        prev_outputs: HashSet<OutPoint>,
+        require_full_allocation: bool,
+        shift_output_map_for_opreturn_first: bool,
+    ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
         let mut all_transitions: HashMap<ContractId, Transition> = HashMap::new();
         let mut asset_beneficiaries: AssetBeneficiariesMap = bmap![];
         let assignment_name = FieldName::from(RGB_STATE_ASSET_OWNER);
 
         for (contract_id, asset_coloring_info) in coloring_info.asset_info_map.clone() {
-            let schema =
-                AssetSchema::get_from_contract_id(contract_id, &runtime).map_err(|_| {
-                    Error::AssetNotFound {
-                        asset_id: contract_id.to_string(),
-                    }
-                })?;
+            let schema = AssetSchema::get_from_contract_id(contract_id, runtime).map_err(|_| {
+                Error::AssetNotFound {
+                    asset_id: contract_id.to_string(),
+                }
+            })?;
 
             let mut asset_transition_builder =
                 runtime.transition_builder(contract_id, "transfer")?;
@@ -146,6 +262,22 @@ impl Wallet {
                 runtime.contract_assignments_for(contract_id, prev_outputs.iter().copied())?
             {
                 for (opout, state) in opout_state_map {
+                    // Only the asset-owner assignment is re-assigned below, so a right on a spent
+                    // input would be destroyed. An inflation right is `Amount` state too, so it
+                    // would additionally be counted as spendable fungible value by the accounting
+                    // right after this, making the full-allocation check reject honest callers.
+                    if require_full_allocation && opout.ty != OS_ASSET {
+                        let right = if opout.ty == OS_INFLATION {
+                            "an inflation right"
+                        } else {
+                            "a non-asset assignment"
+                        };
+                        return Err(Error::InvalidColoringInfo {
+                            details: format!(
+                                "a PSBT input carries {right} for contract {contract_id}, which this method cannot re-assign"
+                            ),
+                        });
+                    }
                     if let AllocatedState::Amount(amt) = &state {
                         asset_available_amt = asset_available_amt
                             .checked_add(amt.as_u64())
@@ -160,12 +292,15 @@ impl Wallet {
             }
 
             let mut beneficiaries = vec![];
+            let mut output_seals: Vec<(BuilderSeal<GraphSeal>, u64)> = vec![];
             let mut sending_amt: u64 = 0;
-            for (mut vout, amount) in asset_coloring_info.output_map {
+            // walk vouts in ascending order: iterating the HashMap directly would let the reported
+            // validation error and the beneficiary ordering vary between otherwise identical calls
+            for (mut vout, amount) in BTreeMap::from_iter(asset_coloring_info.output_map) {
                 if amount == 0 {
                     continue;
                 }
-                if opreturn_first {
+                if shift_output_map_for_opreturn_first {
                     vout = vout
                         .checked_add(1)
                         .ok_or_else(|| Error::InvalidColoringInfo {
@@ -178,9 +313,17 @@ impl Wallet {
                         .ok_or_else(|| Error::InvalidColoringInfo {
                             details: s!("total amount in output_map exceeds u64::MAX"),
                         })?;
-                if vout as usize > psbt.outputs.len() {
+                if vout as usize >= psbt.unsigned_tx.output.len() {
                     return Err(Error::InvalidColoringInfo {
                         details: s!("invalid vout in output_map, does not exist in the given PSBT"),
+                    });
+                }
+                if psbt.unsigned_tx.output[vout as usize]
+                    .script_pubkey
+                    .is_op_return()
+                {
+                    return Err(Error::InvalidColoringInfo {
+                        details: format!("output_map vout {vout} points to the OP_RETURN output"),
                     });
                 }
                 let graph_seal = if let Some(blinding) = asset_coloring_info.static_blinding {
@@ -190,7 +333,24 @@ impl Wallet {
                 };
                 let seal = BuilderSeal::Revealed(graph_seal);
                 beneficiaries.push(seal);
+                output_seals.push((seal, amount));
+            }
+            if sending_amt > asset_available_amt {
+                return Err(Error::InvalidColoringInfo {
+                    details: format!(
+                        "total amount in output_map ({sending_amt}) greater than available ({asset_available_amt})"
+                    ),
+                });
+            }
+            if require_full_allocation && sending_amt < asset_available_amt {
+                return Err(Error::InvalidColoringInfo {
+                    details: format!(
+                        "total amount in output_map ({sending_amt}) less than available ({asset_available_amt}); full allocation required"
+                    ),
+                });
+            }
 
+            for (seal, amount) in output_seals {
                 match schema {
                     AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa => {
                         asset_transition_builder = asset_transition_builder.add_fungible_state(
@@ -200,20 +360,18 @@ impl Wallet {
                         )?;
                     }
                     AssetSchema::Uda => {
-                        if let AllocatedState::Data(state) = uda_state.clone().unwrap() {
-                            asset_transition_builder = asset_transition_builder
-                                .add_data(assignment_name.clone(), seal, Allocation::from(state))
-                                .map_err(Error::from)?;
-                        }
+                        let Some(AllocatedState::Data(state)) = uda_state.clone() else {
+                            return Err(Error::InvalidColoringInfo {
+                                details: format!(
+                                    "UDA contract {contract_id} has no token assignment on the selected inputs"
+                                ),
+                            });
+                        };
+                        asset_transition_builder = asset_transition_builder
+                            .add_data(assignment_name.clone(), seal, Allocation::from(state))
+                            .map_err(Error::from)?;
                     }
                 }
-            }
-            if sending_amt > asset_available_amt {
-                return Err(Error::InvalidColoringInfo {
-                    details: format!(
-                        "total amount in output_map ({sending_amt}) greater than available ({asset_available_amt})"
-                    ),
-                });
             }
 
             if let Some(nonce) = coloring_info.nonce {
