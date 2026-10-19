@@ -3727,6 +3727,7 @@ dependencies = [
  "scrypt",
  "sea-orm",
  "sea-query",
+ "secp256k1 0.32.0-beta.2",
  "serde",
  "serde_json",
  "serial_test",
