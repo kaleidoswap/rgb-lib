@@ -307,6 +307,9 @@ impl Wallet {
     /// is `shift_output_map_for_opreturn_first`. With `require_full_allocation`, the `output_map`
     /// of each contract must re-assign exactly the amount found on the inputs, and inputs carrying
     /// non-asset assignments (e.g. inflation rights) are rejected, since they would be destroyed.
+    ///
+    /// This is [`Self::color_psbt_stage_runtime`] followed by [`Self::color_psbt_finalize`] with
+    /// the `coloring_info` static blinding as MPC entropy.
     pub(crate) fn color_psbt_with_prevouts_runtime(
         &self,
         runtime: &RgbRuntime,
@@ -316,6 +319,35 @@ impl Wallet {
         require_full_allocation: bool,
         shift_output_map_for_opreturn_first: bool,
     ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
+        let static_blinding = coloring_info.static_blinding;
+        let asset_beneficiaries = self.color_psbt_stage_runtime(
+            runtime,
+            psbt,
+            coloring_info,
+            prev_outputs,
+            require_full_allocation,
+            shift_output_map_for_opreturn_first,
+        )?;
+        let fascia = self.color_psbt_finalize(psbt, static_blinding)?;
+        info!(self.logger(), "Color PSBT completed");
+        Ok((fascia, asset_beneficiaries))
+    }
+
+    /// Build the RGB transitions for `coloring_info`, spending the allocations found on
+    /// `prev_outputs`, and push them into the PSBT without committing them.
+    ///
+    /// Same preconditions and checks as [`Self::color_psbt_with_prevouts_runtime`]. The PSBT stays
+    /// modifiable: further contracts can be staged on it (e.g. by a counterparty) before
+    /// [`Self::color_psbt_finalize`] commits all of them at once.
+    pub(crate) fn color_psbt_stage_runtime(
+        &self,
+        runtime: &RgbRuntime,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        prev_outputs: HashSet<OutPoint>,
+        require_full_allocation: bool,
+        shift_output_map_for_opreturn_first: bool,
+    ) -> Result<AssetBeneficiariesMap, Error> {
         let mut all_transitions: HashMap<ContractId, Transition> = HashMap::new();
         let mut asset_beneficiaries: AssetBeneficiariesMap = bmap![];
         let assignment_name = FieldName::from(RGB_STATE_ASSET_OWNER);
@@ -457,22 +489,6 @@ impl Wallet {
             asset_beneficiaries.insert(contract_id, beneficiaries);
         }
 
-        let opreturn_index = psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .enumerate()
-            .find(|(_, o)| o.script_pubkey.is_op_return())
-            .expect("psbt should have an op_return output")
-            .0;
-        let opreturn_output = psbt.outputs.get_mut(opreturn_index).unwrap();
-        opreturn_output.set_opret_host();
-        if let Some(blinding) = coloring_info.static_blinding {
-            opreturn_output
-                .set_mpc_entropy(blinding)
-                .map_err(InternalError::from)?;
-        }
-
         for (contract_id, transition) in all_transitions {
             for opout in transition.inputs() {
                 psbt.set_rgb_contract_consumer(contract_id, opout, transition.id())
@@ -482,12 +498,118 @@ impl Wallet {
                 .map_err(InternalError::from)?;
         }
 
+        info!(self.logger(), "Stage RGB coloring completed");
+        Ok(asset_beneficiaries)
+    }
+
+    /// Stage RGB coloring information onto a PSBT without finalizing the MPC commitment.
+    ///
+    /// Multiple parties may each call this method on the same PSBT (each for their own contracts),
+    /// in which case [`Self::color_psbt_finalize`] must be invoked once after all staging is
+    /// complete to produce the [`Fascia`]. `output_map` indexing and the signed-PSBT rejection
+    /// follow [`Self::color_psbt`].
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn color_psbt_stage(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+    ) -> Result<AssetBeneficiariesMap, Error> {
+        info!(self.logger(), "Staging RGB coloring onto PSBT...");
+        let prev_outputs = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|txin| txin.previous_output)
+            .collect::<HashSet<OutPoint>>();
+        let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
+        let runtime = self.rgb_runtime()?;
+        self.color_psbt_stage_runtime(
+            &runtime,
+            psbt,
+            coloring_info,
+            prev_outputs,
+            false,
+            shift_output_map_for_opreturn_first,
+        )
+    }
+
+    /// Finalize the RGB commitment on a PSBT that has had one or more contracts staged via
+    /// [`Self::color_psbt_stage`]: the first OP_RETURN output becomes the opret host (with
+    /// `static_blinding` as MPC entropy, if given) and the PSBT is made unmodifiable. Must be
+    /// called exactly once per PSBT, after all staging is complete.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn color_psbt_finalize(
+        &self,
+        psbt: &mut Psbt,
+        static_blinding: Option<u64>,
+    ) -> Result<Fascia, Error> {
+        info!(self.logger(), "Finalizing RGB commitment on PSBT...");
+        let opreturn_index = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .position(|o| o.script_pubkey.is_op_return())
+            .ok_or_else(|| Error::InvalidColoringInfo {
+                details: s!("PSBT has no OP_RETURN output to host the RGB commitment"),
+            })?;
+        let opreturn_output =
+            psbt.outputs
+                .get_mut(opreturn_index)
+                .ok_or_else(|| Error::InvalidPsbt {
+                    details: s!("PSBT outputs do not match its unsigned transaction"),
+                })?;
+        opreturn_output.set_opret_host();
+        if let Some(blinding) = static_blinding {
+            opreturn_output
+                .set_mpc_entropy(blinding)
+                .map_err(InternalError::from)?;
+        }
+
         psbt.set_rgb_close_method(CloseMethod::OpretFirst);
         psbt.set_as_unmodifiable();
         let fascia = psbt.rgb_commit().map_err(InternalError::from)?;
 
-        info!(self.logger(), "Color PSBT completed");
-        Ok((fascia, asset_beneficiaries))
+        info!(self.logger(), "Finalize RGB commitment completed");
+        Ok(fascia)
+    }
+
+    /// Produce an [`RgbTransfer`] consignment for a single contract given its beneficiaries
+    /// (typically obtained from a prior [`Self::color_psbt_stage`] call) and the witness
+    /// transaction ID of the PSBT being colored, built from the colored PSBT's `fascia` without
+    /// consuming it into the RGB stash.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn generate_transfer(
+        &self,
+        contract_id: ContractId,
+        beneficiaries: Vec<BuilderSeal<GraphSeal>>,
+        witness_txid: RgbTxid,
+        fascia: &Fascia,
+    ) -> Result<RgbTransfer, Error> {
+        let runtime = self.rgb_runtime()?;
+        let mut beneficiaries_witness = vec![];
+        let mut beneficiaries_blinded = vec![];
+        for builder_seal in beneficiaries {
+            match builder_seal {
+                BuilderSeal::Revealed(seal) => {
+                    beneficiaries_witness.push(ExplicitSeal::with(witness_txid, seal.vout));
+                }
+                BuilderSeal::Concealed(secret_seal) => {
+                    beneficiaries_blinded.push(secret_seal);
+                }
+            };
+        }
+        Ok(runtime.transfer_from_fascia(
+            contract_id,
+            beneficiaries_witness,
+            beneficiaries_blinded,
+            fascia,
+        )?)
     }
 
     /// Color a PSBT, consume the RGB fascia and return the related consignment.
