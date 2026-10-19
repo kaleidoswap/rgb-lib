@@ -160,8 +160,7 @@ fn swap_refuses_counterparty_inputs_that_belong_to_this_wallet() {
     let proposal = maker
         .accept_swap_request(maker_online, request.clone(), 0, false, vec![])
         .unwrap();
-    let mut smuggled_proposal = proposal.clone();
-    smuggled_proposal.maker_inputs[0] = request.taker_inputs[0].clone();
+    let smuggled_proposal = smuggle_maker_input(&proposal, request.taker_inputs[0].clone());
     let err = taker
         .complete_swap_proposal(taker_online, smuggled_proposal, 0, false)
         .unwrap_err();
@@ -169,6 +168,102 @@ fn swap_refuses_counterparty_inputs_that_belong_to_this_wallet() {
     taker
         .complete_swap_proposal(taker_online, proposal, 0, false)
         .unwrap();
+}
+
+/// A maker that lists one of the taker's coins the taker did not declare (not a duplicate of a
+/// taker input), with a PSBT rebuilt to match so the shape checks pass. Covers an uncolored coin
+/// and a colored one holding another asset.
+#[test]
+#[parallel]
+fn taker_refuses_undeclared_own_coins_as_maker_inputs() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SUND",
+        "Swap Undeclared",
+        SWAP_RGB_AMOUNT,
+    );
+    // a second colored coin carrying another asset, which the swap must not touch
+    issue_swap_asset(&mut taker, taker_online, "SOTH", "Swap Other", 500);
+
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            vec![],
+        )
+        .unwrap();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let proposal = maker
+        .accept_swap_request(maker_online, request.clone(), 0, false, vec![])
+        .unwrap();
+
+    let declared = request
+        .taker_inputs
+        .iter()
+        .map(|i| i.outpoint.clone())
+        .collect::<Vec<_>>();
+    let undeclared = taker
+        .list_unspents(Some(taker_online), false, false)
+        .unwrap()
+        .into_iter()
+        .filter(|u| !declared.contains(&u.utxo.outpoint))
+        .collect::<Vec<_>>();
+    let uncolored = undeclared
+        .iter()
+        .find(|u| !u.utxo.colorable)
+        .expect("taker has an undeclared uncolored coin");
+    let colored = undeclared
+        .iter()
+        .find(|u| u.utxo.colorable && !u.rgb_allocations.is_empty())
+        .expect("taker has an undeclared colored coin");
+
+    for unspent in [uncolored, colored] {
+        let local_output = taker
+            .bdk_wallet()
+            .get_utxo(unspent.utxo.outpoint.clone().into())
+            .unwrap();
+        let smuggled = smuggle_maker_input(&proposal, swap_build_input(&local_output));
+        let err = taker
+            .complete_swap_proposal(taker_online, smuggled, 0, false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("belongs to this wallet"),
+            "{}: {err}",
+            unspent.utxo.outpoint
+        );
+    }
+
+    // the refusals left nothing behind: the honest proposal still completes and settles
+    let completion = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap();
+    maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap();
+}
+
+/// Add `input` to the maker inputs (its value goes to the maker's change) and rebuild the PSBT
+/// and txid to match, as a malicious maker would.
+fn smuggle_maker_input(
+    proposal: &OnchainSwapProposal,
+    input: OnchainSwapInput,
+) -> OnchainSwapProposal {
+    let mut smuggled = proposal.clone();
+    smuggled.maker_inputs.push(input);
+    let (psbt, _, _) = swap_build_psbt(&smuggled).unwrap();
+    smuggled.txid = psbt.unsigned_tx.compute_txid().to_string();
+    smuggled.psbt = psbt.to_string();
+    smuggled
 }
 
 #[test]
@@ -440,6 +535,53 @@ fn maker_rejects_request_with_mutated_offer() {
         maker
             .accept_swap_request(maker_online, request, 0, false, vec![])
             .is_err()
+    );
+}
+
+#[test]
+#[parallel]
+fn taker_refuses_a_maker_input_declared_with_the_wrong_amount() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SPRV",
+        "Swap Prevout",
+        SWAP_RGB_AMOUNT,
+    );
+
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            vec![],
+        )
+        .unwrap();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let mut proposal = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap();
+    // the maker claims a bigger coin than it has, and builds a consistent PSBT on that claim
+    proposal.maker_inputs[0].amount_sat += 1_000;
+    let (psbt, _, _) = crate::wallet::offline::swap_build_psbt(&proposal).unwrap();
+    proposal.txid = psbt.unsigned_tx.compute_txid().to_string();
+    proposal.psbt = psbt.to_string();
+
+    let err = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("does not match its previous output"),
+        "{err}"
     );
 }
 
@@ -1190,6 +1332,414 @@ fn refused_rebroadcast_keeps_swap_uncancellable() {
     ));
 }
 
+#[test]
+#[parallel]
+fn taker_invalidates_a_withheld_swap() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SINV",
+        "Swap Invalidate",
+        SWAP_RGB_AMOUNT,
+    );
+    // an asset the taker holds outside the swap must not be touched by the invalidation
+    let taker_asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SOWN",
+        "Swap Own",
+        SWAP_RGB_AMOUNT,
+    );
+    let taker_btc_before = total_btc(&mut taker, taker_online);
+    let taker_unspents_before = settled_unspents(&mut taker, taker_online);
+
+    let completion = swap_to_completion(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        None,
+    );
+    let swap_id = completion.proposal.request.offer.swap_id.clone();
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Proposed);
+    // the maker holds a fully signed swap transaction and withholds it
+    let completion = maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap();
+    assert!(completion.finalized_psbt.is_some());
+
+    let invalidation_txid = taker
+        .invalidate_swap(taker_online, swap_id.clone(), FEE_RATE)
+        .unwrap();
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Invalidating);
+    // a retry re-broadcasts the same invalidation
+    assert_eq!(
+        taker
+            .invalidate_swap(taker_online, swap_id.clone(), FEE_RATE)
+            .unwrap(),
+        invalidation_txid
+    );
+    // the swap transaction may still win until the invalidation confirms
+    assert!(matches!(
+        taker.cancel_swap(taker_online, swap_id.clone()),
+        Err(Error::InvalidDetails { .. })
+    ));
+    assert!(taker.cancel_expired_swaps(taker_online).unwrap().is_empty());
+
+    // the invalidation only spends the uncolored inputs the taker declared, paying at least the
+    // swap transaction's fee so the swap transaction can't replace it
+    let invalidation_tx = taker
+        .bdk_wallet()
+        .get_tx(Txid::from_str(&invalidation_txid).unwrap())
+        .unwrap()
+        .tx_node
+        .tx
+        .clone();
+    let declared = completion
+        .proposal
+        .request
+        .taker_inputs
+        .iter()
+        .map(|i| i.outpoint.clone())
+        .collect::<Vec<_>>();
+    for input in &invalidation_tx.input {
+        assert!(declared.contains(&Outpoint {
+            txid: input.previous_output.txid.to_string(),
+            vout: input.previous_output.vout,
+        }));
+    }
+    let invalidation_fee = taker
+        .bdk_wallet()
+        .calculate_fee(&invalidation_tx)
+        .unwrap()
+        .to_sat();
+    assert!(invalidation_fee >= SWAP_FEE);
+
+    mine(false);
+    assert!(
+        maker
+            .broadcast_swap_completion(maker_online, completion)
+            .is_err()
+    );
+    assert_eq!(
+        taker.cancel_expired_swaps(taker_online).unwrap(),
+        vec![swap_id.clone()]
+    );
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Cancelled);
+    assert!(taker.cancel_expired_swaps(taker_online).unwrap().is_empty());
+    // invalidating an invalidated swap is a no-op
+    assert_eq!(
+        taker
+            .invalidate_swap(taker_online, swap_id.clone(), FEE_RATE)
+            .unwrap(),
+        invalidation_txid
+    );
+    // the rejected broadcast left the maker's swap cancellable, releasing its RGB leg
+    maker.cancel_swap(maker_online, swap_id).unwrap();
+
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &asset_id, SWAP_RGB_AMOUNT);
+    assert_settled_balance(&taker, &taker_asset_id, SWAP_RGB_AMOUNT);
+    assert_eq!(asset_amount(&taker, &asset_id), 0);
+    assert_eq!(
+        settled_unspents(&mut taker, taker_online)
+            .into_iter()
+            .filter(|u| !u.ends_with("[]"))
+            .collect::<Vec<_>>(),
+        taker_unspents_before
+            .into_iter()
+            .filter(|u| !u.ends_with("[]"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        total_btc(&mut taker, taker_online),
+        taker_btc_before - invalidation_fee
+    );
+
+    // the maker's released UTXO can be swapped again
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &asset_id, 0);
+    assert_settled_balance(&taker, &asset_id, SWAP_RGB_AMOUNT);
+}
+
+#[test]
+#[parallel]
+fn invalidating_swap_is_recovered_after_restart() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SRST",
+        "Swap Restart",
+        SWAP_RGB_AMOUNT,
+    );
+    let completion = swap_to_completion(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        None,
+    );
+    let swap_id = completion.proposal.request.offer.swap_id.clone();
+    let completion = maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap();
+    let invalidation_txid = taker
+        .invalidate_swap(taker_online, swap_id.clone(), FEE_RATE)
+        .unwrap();
+
+    // the taker restarts before the invalidation confirms
+    let (mut taker, taker_online) = reopen_wallet(taker);
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Invalidating);
+    assert!(taker.cancel_expired_swaps(taker_online).unwrap().is_empty());
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Invalidating);
+
+    mine(false);
+    assert_eq!(
+        taker.cancel_expired_swaps(taker_online).unwrap(),
+        vec![swap_id.clone()]
+    );
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Cancelled);
+    assert_eq!(
+        taker
+            .invalidate_swap(taker_online, swap_id.clone(), FEE_RATE)
+            .unwrap(),
+        invalidation_txid
+    );
+    assert!(
+        maker
+            .broadcast_swap_completion(maker_online, completion)
+            .is_err()
+    );
+    maker.cancel_swap(maker_online, swap_id).unwrap();
+    refresh_settled(&mut maker, maker_online);
+    assert_settled_balance(&maker, &asset_id, SWAP_RGB_AMOUNT);
+}
+
+#[test]
+#[parallel]
+fn cancelled_signed_swap_can_still_be_invalidated() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SCIV",
+        "Swap Cancel Invalidate",
+        SWAP_RGB_AMOUNT,
+    );
+    let completion = swap_to_completion(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        None,
+    );
+    let swap_id = completion.proposal.request.offer.swap_id.clone();
+    let completion = maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap();
+    // cancelling only drops the taker's local state, the maker can still broadcast
+    taker.cancel_swap(taker_online, swap_id.clone()).unwrap();
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Cancelled);
+
+    taker
+        .invalidate_swap(taker_online, swap_id.clone(), FEE_RATE)
+        .unwrap();
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Invalidating);
+    mine(false);
+    assert!(
+        maker
+            .broadcast_swap_completion(maker_online, completion)
+            .is_err()
+    );
+    assert_eq!(
+        taker.cancel_expired_swaps(taker_online).unwrap(),
+        vec![swap_id.clone()]
+    );
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Cancelled);
+}
+
+#[test]
+#[parallel]
+fn maker_broadcast_wins_over_invalidation() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SRCE",
+        "Swap Race",
+        SWAP_RGB_AMOUNT,
+    );
+    let completion = swap_to_completion(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        None,
+    );
+    let swap_id = completion.proposal.request.offer.swap_id.clone();
+    let completion = maker
+        .process_swap_completion(maker_online, completion)
+        .unwrap();
+    maker
+        .broadcast_swap_completion(maker_online, completion.clone())
+        .unwrap();
+
+    // the swap transaction is out: the swap settles instead
+    assert!(matches!(
+        taker.invalidate_swap(taker_online, swap_id.clone(), FEE_RATE),
+        Err(Error::CannotFailBatchTransfer)
+    ));
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Broadcast);
+    assert!(matches!(
+        taker.cancel_swap(taker_online, swap_id.clone()),
+        Err(Error::CannotFailBatchTransfer)
+    ));
+    assert!(taker.cancel_expired_swaps(taker_online).unwrap().is_empty());
+
+    mine(false);
+    maker
+        .accept_swap_transfers(
+            maker_online,
+            completion.clone(),
+            OnchainSwapRole::Maker,
+            false,
+        )
+        .unwrap();
+    taker
+        .accept_swap_transfers(taker_online, completion, OnchainSwapRole::Taker, false)
+        .unwrap();
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Accepted);
+    assert!(matches!(
+        taker.invalidate_swap(taker_online, swap_id, FEE_RATE),
+        Err(Error::CannotFailBatchTransfer)
+    ));
+    refresh_settled(&mut maker, maker_online);
+    refresh_settled(&mut taker, taker_online);
+    assert_settled_balance(&maker, &asset_id, 0);
+    assert_settled_balance(&taker, &asset_id, SWAP_RGB_AMOUNT);
+}
+
+#[test]
+#[parallel]
+fn invalidate_swap_rejects_invalid_calls() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut taker,
+        taker_online,
+        "SIVC",
+        "Swap Invalid Calls",
+        SWAP_RGB_AMOUNT,
+    );
+    let invalid_details = |res: Result<String, Error>| {
+        assert!(
+            matches!(res, Err(Error::InvalidDetails { .. })),
+            "unexpected result {res:?}"
+        )
+    };
+
+    // unknown or malformed swap IDs
+    invalid_details(taker.invalidate_swap(taker_online, s!("unknown"), FEE_RATE));
+    invalid_details(taker.invalidate_swap(taker_online, s!("../swap"), FEE_RATE));
+    invalid_details(taker.invalidate_swap(taker_online, s!(""), FEE_RATE));
+
+    // the taker sends the RGB leg: it only declared colored inputs
+    let offer = maker
+        .create_swap_offer(
+            btc(SWAP_BTC_PRICE),
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            vec![],
+        )
+        .unwrap();
+    let swap_id = offer.swap_id.clone();
+    // the maker side can't invalidate
+    invalid_details(maker.invalidate_swap(maker_online, swap_id.clone(), FEE_RATE));
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    // nothing to invalidate before the taker signed
+    invalid_details(taker.invalidate_swap(taker_online, swap_id.clone(), FEE_RATE));
+    let proposal = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap();
+    invalid_details(maker.invalidate_swap(maker_online, swap_id.clone(), FEE_RATE));
+    let _completion = taker
+        .complete_swap_proposal(taker_online, proposal, 0, false)
+        .unwrap();
+    // spending a colored input outside the swap would destroy its allocations
+    let stash_before = stash_assignments(&mut taker, taker_online, &asset_id);
+    invalid_details(taker.invalidate_swap(taker_online, swap_id.clone(), FEE_RATE));
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Proposed);
+    assert_eq!(
+        stash_assignments(&mut taker, taker_online, &asset_id),
+        stash_before
+    );
+    // a refused invalidation of a cancelled swap leaves it cancelled
+    taker.cancel_swap(taker_online, swap_id.clone()).unwrap();
+    invalid_details(taker.invalidate_swap(taker_online, swap_id.clone(), FEE_RATE));
+    assert_eq!(swap_stage(&taker, &swap_id), OnchainSwapStage::Cancelled);
+    maker.cancel_swap(maker_online, swap_id).unwrap();
+    assert_settled_balance(&taker, &asset_id, SWAP_RGB_AMOUNT);
+}
+
+/// Drop a wallet and open it again from the same directory, as after a restart.
+fn reopen_wallet(wallet: Wallet) -> (Wallet, Online) {
+    let wallet_data = wallet.get_wallet_data();
+    let keys = wallet.get_keys();
+    drop(wallet);
+    let mut wallet = Wallet::new(wallet_data, keys).unwrap();
+    let online = wallet.go_online(test_go_online_options(None)).unwrap();
+    (wallet, online)
+}
+
+fn swap_stage(wallet: &Wallet, swap_id: &str) -> OnchainSwapStage {
+    wallet
+        .list_swaps()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.swap_id == swap_id)
+        .unwrap()
+        .stage
+}
+
 fn refresh_settled(wallet: &mut Wallet, online: Online) {
     wallet.refresh(online, None, vec![], false).unwrap();
 }
@@ -1324,6 +1874,16 @@ fn execute_swap_with_extra_outputs(
         .unwrap();
     // the maker signs last in every direction: its proposal carries no signature
     assert_eq!(signature_count(&proposal.psbt), 0);
+    // locked to the maker's chain tip, like an ordinary wallet transaction
+    assert!(proposal.lock_time > 0);
+    assert_eq!(
+        Psbt::from_str(&proposal.psbt)
+            .unwrap()
+            .unsigned_tx
+            .lock_time
+            .to_consensus_u32(),
+        proposal.lock_time
+    );
     assert_consignment_transport(&proposal.consignments);
     if taker_receives_rgb {
         assert!(
