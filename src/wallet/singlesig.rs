@@ -210,26 +210,27 @@ impl Wallet {
         // reject settings the wallet wasn't created with before any of them reaches the database
         WalletManifest::check_settings_unchanged(&wallet_dir, &wallet_data, &keys)?;
 
-        // setup the BDK wallet
-        let (bdk_wallet, bdk_database) = setup_bdk(
-            &wdata,
+        // setup rgb-lib DB
+        let database = setup_db(&wallet_dir)?;
+
+        // setup the BDK wallet, persisting its data inside the rgb-lib DB
+        let txn = database.begin_transaction()?;
+        let bdk_wallet = setup_bdk(
+            &txn,
             &wallet_dir,
             descs.colored,
             descs.vanilla,
             watch_only,
-            BdkNetwork::from(wdata.bitcoin_network),
-            &logger,
+            wdata.bitcoin_network,
         )?;
+        txn.commit()?;
 
         // setup RGB
         setup_rgb(&wallet_dir, wdata.supported_schemas, wdata.bitcoin_network)?;
 
-        // setup rgb-lib DB
-        let database = setup_db(&wallet_dir)?;
-        let reuse_address_index = database.begin_transaction()?.get_reuse_address_index()?;
-
         // persist the settings needed to load the wallet back
         WalletManifest::new(&wallet_data, &keys).write(&wallet_dir)?;
+        let reuse_address_index = database.begin_transaction()?.get_reuse_address_index()?;
 
         info!(logger, "New wallet completed");
         Ok(Self {
@@ -240,14 +241,12 @@ impl Wallet {
                 database: Arc::new(database),
                 wallet_dir,
                 bdk_wallet,
-                bdk_database,
+                bdk_pending: Arc::new(Mutex::new(ChangeSet::default())),
                 reuse_address_index,
                 #[cfg(any(feature = "electrum", feature = "esplora"))]
                 online_data: None,
                 #[cfg(feature = "vss")]
                 vss_client: None,
-                #[cfg(feature = "vss")]
-                auto_backup_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             keys,
         })
@@ -326,34 +325,9 @@ impl Wallet {
         let address = self.get_new_addresses(KeychainKind::Internal, 1)?;
         let txn = self.database().begin_transaction()?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Get address completed");
-        Ok(address.to_string())
-    }
-
-    /// Rotate the pinned address for the given keychain.
-    ///
-    /// Only meaningful when `reuse_addresses` is `true`. Increments the pinned derivation
-    /// index so subsequent address generation returns a fresh address.
-    pub fn rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
-        if !self.wallet_data().reuse_addresses {
-            return Err(Error::AddressReuseDisabled);
-        }
-        let index = self
-            .internals()
-            .reuse_address_index
-            .get(&keychain)
-            .copied()
-            .unwrap_or(0);
-        let new_index = index + 1;
-        self.internals_mut()
-            .reuse_address_index
-            .insert(keychain, new_index);
-        let txn = self.database().begin_transaction()?;
-        txn.set_reuse_address_index(keychain, new_index)?;
-        txn.commit()?;
-        let address = self.bdk_wallet().peek_address(keychain, new_index).address;
         Ok(address.to_string())
     }
 
@@ -406,8 +380,38 @@ impl Wallet {
         txn.del_wallet_transaction(wt.idx)?; // relies on cascade to delete reserved txos
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Abort pending vanilla TX completed");
         Ok(())
+    }
+
+    /// Rotate the pinned address for the given keychain.
+    ///
+    /// Only meaningful when `reuse_addresses` is `true`. Increments the pinned derivation
+    /// index so subsequent address generation returns a fresh address.
+    pub fn rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
+        if !self.wallet_data().reuse_addresses {
+            return Err(Error::AddressReuseDisabled);
+        }
+        let index = self
+            .internals()
+            .reuse_address_index
+            .get(&keychain)
+            .copied()
+            .unwrap_or(0);
+        let new_index = index.checked_add(1).ok_or_else(|| Error::Internal {
+            details: "address derivation index exhausted".to_string(),
+        })?;
+        let txn = self.database().begin_transaction()?;
+        txn.set_reuse_address_index(keychain, new_index)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        self.internals_mut()
+            .reuse_address_index
+            .insert(keychain, new_index);
+        self.trigger_auto_backup();
+        let address = self.bdk_wallet().peek_address(keychain, new_index).address;
+        Ok(address.to_string())
     }
 
     fn finalize_offline_issuance<T: IssuedAssetDetails>(
@@ -612,7 +616,7 @@ impl Wallet {
         let batch_transfer_idx =
             self.store_receive_transfer(&txn, &receive_data_internal, min_confirmations)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Blind receive completed");
         Ok(ReceiveData {
@@ -675,7 +679,7 @@ impl Wallet {
         let batch_transfer_idx =
             self.store_receive_transfer(&txn, &receive_data_internal, min_confirmations)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Witness receive completed");
         Ok(ReceiveData {
@@ -726,7 +730,7 @@ impl Wallet {
         self.sign_psbt_impl(&mut psbt, None)?;
         let res = self.create_utxos_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Create UTXOs completed");
         Ok(res)
@@ -813,7 +817,7 @@ impl Wallet {
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Create UTXOs (begin) completed");
         Ok(res.to_string())
     }
@@ -833,7 +837,8 @@ impl Wallet {
         let txn = self.database().begin_transaction()?;
         let res = self.create_utxos_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Create UTXOs (end) completed");
         Ok(res)
     }
@@ -868,7 +873,7 @@ impl Wallet {
         self.sign_psbt_impl(&mut psbt, None)?;
         let tx = self.drain_to_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Drain completed");
         Ok(tx.compute_txid().to_string())
@@ -905,7 +910,7 @@ impl Wallet {
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Drain (begin) completed");
         Ok(psbt.to_string())
     }
@@ -925,7 +930,7 @@ impl Wallet {
         let txn = self.database().begin_transaction()?;
         let tx = self.drain_to_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Drain (end) completed");
         Ok(tx.compute_txid().to_string())
@@ -964,7 +969,7 @@ impl Wallet {
         self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
         let res = self.send_end_impl(&txn, &begin_op_data.psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Send completed");
         Ok(res)
@@ -1038,7 +1043,7 @@ impl Wallet {
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         if !dry_run {
             self.trigger_auto_backup();
         }
@@ -1079,7 +1084,7 @@ impl Wallet {
         let txn = self.database().begin_transaction()?;
         let res = self.send_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Send (end) completed");
         Ok(res)
@@ -1118,7 +1123,7 @@ impl Wallet {
         let res =
             self.provide_out_of_band_consignment_impl(&txn, &consignment_path, media_file_paths)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Provide out-of-band consignment completed");
         Ok(res)
@@ -1150,7 +1155,7 @@ impl Wallet {
         let txn = self.database().begin_transaction()?;
         let res = self.provide_out_of_band_ack_impl(&txn, recipient_id)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Provide out-of-band ACK completed");
         Ok(res)
@@ -1187,7 +1192,8 @@ impl Wallet {
         self.sign_psbt_impl(&mut psbt, None)?;
         let res = self.send_btc_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Send BTC completed");
         Ok(res)
     }
@@ -1269,7 +1275,7 @@ impl Wallet {
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Send BTC (begin) completed");
         Ok(res.to_string())
     }
@@ -1289,7 +1295,8 @@ impl Wallet {
         let txn = self.database().begin_transaction()?;
         let res = self.send_btc_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Send BTC (end) completed");
         Ok(res)
     }
@@ -1326,7 +1333,7 @@ impl Wallet {
         self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
         let res = self.inflate_end_impl(&txn, &begin_op_data.psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Inflate completed");
         Ok(res)
@@ -1381,7 +1388,7 @@ impl Wallet {
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         if !dry_run {
             self.trigger_auto_backup();
         }
@@ -1421,7 +1428,7 @@ impl Wallet {
         let txn = self.database().begin_transaction()?;
         let res = self.inflate_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Inflate (end) completed");
         Ok(res)
@@ -1450,7 +1457,8 @@ impl Wallet {
         self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
         let res = self.burn_end_impl(&txn, &begin_op_data.psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Burn completed");
         Ok(res)
     }
@@ -1489,7 +1497,7 @@ impl Wallet {
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Burn (begin) completed");
         Ok(BurnBeginResult {
             psbt: begin_operation_data.psbt.to_string(),
@@ -1525,7 +1533,8 @@ impl Wallet {
         let txn = self.database().begin_transaction()?;
         let res = self.burn_end_impl(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
+        self.trigger_auto_backup();
         info!(self.logger(), "Burn (end) completed");
         Ok(res)
     }
@@ -1609,7 +1618,7 @@ impl Wallet {
         )?;
         swap_save_state(self.wallet_dir(), &offer.swap_id, SWAP_OFFER_FILE, &offer)?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Create swap offer completed");
         Ok(offer)
     }
@@ -1710,7 +1719,7 @@ impl Wallet {
             &request,
         )?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Accept swap offer completed");
         Ok(request)
     }
@@ -1850,7 +1859,7 @@ impl Wallet {
             &proposal,
         )?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Accept swap request completed");
         Ok(proposal)
     }
@@ -2011,7 +2020,7 @@ impl Wallet {
             taker_history,
         };
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         info!(self.logger(), "Complete swap proposal completed");
         Ok(completion)
     }
@@ -2082,7 +2091,7 @@ impl Wallet {
                     ..completion
                 };
                 self.update_backup_info(&txn, false)?;
-                txn.commit()?;
+                self.persist_and_commit(txn)?;
                 info!(self.logger(), "Process swap completion completed");
                 Ok(completion)
             }
@@ -2124,7 +2133,7 @@ impl Wallet {
                     ..completion
                 };
                 self.update_backup_info(&txn, false)?;
-                txn.commit()?;
+                self.persist_and_commit(txn)?;
                 info!(self.logger(), "Process swap completion completed");
                 Ok(completion)
             }
@@ -2216,7 +2225,7 @@ impl Wallet {
                     ..completion
                 };
                 self.update_backup_info(&txn, false)?;
-                txn.commit()?;
+                self.persist_and_commit(txn)?;
                 info!(self.logger(), "Process swap completion completed");
                 Ok(completion)
             }
@@ -2295,7 +2304,7 @@ impl Wallet {
             Err(e) => return Err(e),
         };
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         let txid = tx.compute_txid().to_string();
         if self.indexer().get_tx_confirmations(&txid)?.is_some() {
             self.swap_apply_outgoing(online, &offer.swap_id, &txid)?;
@@ -2485,10 +2494,9 @@ impl Wallet {
             return Err(swap_invalid("swap transaction is not known to the indexer"));
         }
         let seen_at = now().unix_timestamp() as u64;
-        let (bdk_wallet, bdk_db) = self.bdk_wallet_db_mut();
-        bdk_wallet.apply_unconfirmed_txs([(tx, seen_at)]);
-        bdk_wallet.persist(bdk_db)?;
-        Ok(())
+        let txn = self.database().begin_transaction()?;
+        self.bdk_wallet_mut().apply_unconfirmed_txs([(tx, seen_at)]);
+        self.persist_and_commit(txn)
     }
 
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -2568,7 +2576,7 @@ impl Wallet {
                 assignments: vec![],
             };
             self.update_backup_info(&txn, false)?;
-            txn.commit()?;
+            self.persist_and_commit(txn)?;
             swap_save_state(
                 self.wallet_dir(),
                 &offer.swap_id,
@@ -2607,7 +2615,7 @@ impl Wallet {
         }
         let result = OnchainSwapReceiveResult { assignments };
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.persist_and_commit(txn)?;
         swap_save_state(
             self.wallet_dir(),
             &offer.swap_id,

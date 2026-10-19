@@ -67,6 +67,140 @@ fn swap_offer_requires_proxy_url() {
     ));
 }
 
+// An offer hands the counterparty freshly revealed addresses (the maker's RGB receive script and
+// recipient ID, or its BTC receive address). The reveals must reach the DB with the offer: if
+// they don't, a restarted wallet hands the same script and recipient ID out again, so two
+// transfers collide on one receive. Offline, no services needed.
+#[test]
+#[parallel]
+fn swap_offer_reveals_survive_restart() {
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    let data_dir = PrivateDataDir::new();
+    let asset_id = "rgb:Ar4ouaLv-b7f7Dc_-z5EMvtu-FA5KNh1-nlae~jk-8xMBo7E";
+    let create_offers = |wallet: &mut Wallet| {
+        let rgb_receive = wallet
+            .create_swap_offer(
+                btc(SWAP_BTC_PRICE),
+                rgb(asset_id, SWAP_RGB_AMOUNT),
+                SWAP_FEE,
+                None,
+                Some(PROXY_URL.to_string()),
+                0,
+                None,
+            )
+            .unwrap();
+        let btc_receive = wallet
+            .create_swap_offer(
+                rgb(asset_id, SWAP_RGB_AMOUNT),
+                btc(SWAP_BTC_PRICE),
+                SWAP_FEE,
+                None,
+                Some(PROXY_URL.to_string()),
+                0,
+                None,
+            )
+            .unwrap();
+        (rgb_receive, btc_receive)
+    };
+
+    let (rgb_before, btc_before) = {
+        let mut wallet = data_dir.wallet_raw(&wallet_keys, None, BitcoinNetwork::Regtest);
+        create_offers(&mut wallet)
+    };
+    // restart: the wallet is rebuilt from what the offers left in the DB
+    let mut wallet = data_dir.wallet_raw(&wallet_keys, None, BitcoinNetwork::Regtest);
+    let (rgb_after, btc_after) = create_offers(&mut wallet);
+
+    assert!(rgb_before.maker_rgb_script_pubkey_hex.is_some());
+    assert_ne!(
+        rgb_before.maker_rgb_script_pubkey_hex,
+        rgb_after.maker_rgb_script_pubkey_hex
+    );
+    assert!(rgb_before.maker_rgb_recipient_id.is_some());
+    assert_ne!(
+        rgb_before.maker_rgb_recipient_id,
+        rgb_after.maker_rgb_recipient_id
+    );
+    assert!(btc_before.maker_btc_address.is_some());
+    assert_ne!(btc_before.maker_btc_address, btc_after.maker_btc_address);
+}
+
+// The online steps reveal addresses too (the taker's RGB receive script, each side's change
+// script): they must also be durable once the step returns, as checked here across a restart.
+#[test]
+#[parallel]
+fn swap_request_and_proposal_reveals_survive_restart() {
+    initialize();
+
+    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let asset_id = issue_swap_asset(
+        &mut maker,
+        maker_online,
+        "SRVR",
+        "Swap Reveals Restart",
+        SWAP_RGB_AMOUNT,
+    );
+
+    let offer = maker
+        .create_swap_offer(
+            rgb(&asset_id, SWAP_RGB_AMOUNT),
+            btc(SWAP_BTC_PRICE),
+            SWAP_FEE,
+            None,
+            Some(PROXY_URL.to_string()),
+            0,
+            None,
+        )
+        .unwrap();
+    let request = taker
+        .accept_swap_offer(taker_online, offer, 0, false, vec![])
+        .unwrap();
+    let proposal = maker
+        .accept_swap_request(maker_online, request, 0, false, vec![])
+        .unwrap();
+
+    // restart both wallets, then reveal the next external address of each through an offer
+    let restart = |wallet: Wallet| {
+        let (wallet_data, keys) = (wallet.get_wallet_data(), wallet.get_keys());
+        drop(wallet);
+        Wallet::new(wallet_data, keys).unwrap()
+    };
+    let next_external_script = |wallet: &mut Wallet| {
+        wallet
+            .create_swap_offer(
+                btc(SWAP_BTC_PRICE),
+                rgb(&asset_id, SWAP_RGB_AMOUNT),
+                SWAP_FEE,
+                None,
+                Some(PROXY_URL.to_string()),
+                0,
+                None,
+            )
+            .unwrap()
+            .maker_rgb_script_pubkey_hex
+            .unwrap()
+    };
+    let mut maker = restart(maker);
+    let mut taker = restart(taker);
+
+    // revealed by accept_swap_offer
+    assert_ne!(
+        next_external_script(&mut taker),
+        proposal
+            .request
+            .taker_rgb_script_pubkey_hex
+            .clone()
+            .unwrap()
+    );
+    // revealed by accept_swap_request (the maker sends RGB, so its change is colored)
+    assert_ne!(
+        next_external_script(&mut maker),
+        proposal.maker_change_script_pubkey_hex
+    );
+}
+
 #[test]
 #[parallel]
 fn maker_taker_rgb_for_btc_balances() {
