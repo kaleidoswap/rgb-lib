@@ -3,10 +3,10 @@
 //! This module defines the online wallet methods.
 
 use super::offline::{
-    SWAP_OUTGOING_FILE, SwapOutgoingState, swap_build_input, swap_consignment_dir,
-    swap_consignment_path, swap_ensure_only_own_inputs_signed, swap_history_recipient_id,
-    swap_input_to_outpoint, swap_invalid, swap_parse_script, swap_proxy_transport_endpoint,
-    swap_rgb_leg_coloring_info, swap_save_state, swap_selected_inputs_total,
+    SwapOutgoingState, swap_build_input, swap_consignment_dir, swap_consignment_path,
+    swap_ensure_only_own_inputs_signed, swap_history_recipient_id, swap_input_to_outpoint,
+    swap_invalid, swap_parse_script, swap_proxy_transport_endpoint, swap_rgb_leg_coloring_info,
+    swap_selected_inputs_total,
 };
 use super::*;
 
@@ -4172,6 +4172,10 @@ pub(crate) fn swap_stage_rgb_leg(
 
 /// Record the RGB leg of a finalized swap PSBT as an Initiated batch (the stash is untouched
 /// until the TX is seen) and emit the recipient's consignment.
+///
+/// The returned [`SwapOutgoingState`] points at the batch written in `txn`: the caller persists it
+/// (as `SWAP_OUTGOING_FILE`) only once `txn` is about to be committed, so a refusal in between
+/// never leaves a record of a batch that was rolled back.
 pub(crate) fn swap_prepare_rgb_leg(
     txn: &DbTxn,
     wallet: &Wallet,
@@ -4181,7 +4185,7 @@ pub(crate) fn swap_prepare_rgb_leg(
     proxy_url: Option<&str>,
     swap_id: &str,
     expiration_timestamp: Option<u64>,
-) -> Result<Vec<OnchainSwapConsignment>, Error> {
+) -> Result<(Vec<OnchainSwapConsignment>, SwapOutgoingState), Error> {
     let (contract_id, coloring_info, shift) = send.coloring_info(wallet, psbt)?;
     let batch_transfer_idx = wallet.prepare_consume_txn(
         txn,
@@ -4194,21 +4198,12 @@ pub(crate) fn swap_prepare_rgb_leg(
         expiration_timestamp,
     )?;
     let txid = psbt.unsigned_tx.compute_txid().to_string();
-    swap_save_state(
-        wallet.wallet_dir(),
-        swap_id,
-        SWAP_OUTGOING_FILE,
-        &SwapOutgoingState {
-            txid: txid.clone(),
-            batch_transfer_idx,
-        },
-    )?;
     let seal = BuilderSeal::Revealed(GraphSeal::with_blinded_vout(
         send.recipient_vout,
         send.blinding,
     ));
     let transfer = wallet.generate_transfer(contract_id, vec![seal], psbt.get_txid(), fascia)?;
-    swap_emit_consignments(
+    let consignments = swap_emit_consignments(
         wallet,
         vec![transfer],
         proxy_url,
@@ -4217,7 +4212,14 @@ pub(crate) fn swap_prepare_rgb_leg(
         send.recipient_id,
         send.recipient_vout,
         send.blinding,
-    )
+    )?;
+    Ok((
+        consignments,
+        SwapOutgoingState {
+            txid,
+            batch_transfer_idx,
+        },
+    ))
 }
 
 /// Color the RGB leg of a swap sent by a single party and prepare it for consumption.
@@ -4229,7 +4231,7 @@ pub(crate) fn swap_color_rgb_leg(
     proxy_url: Option<&str>,
     swap_id: &str,
     expiration_timestamp: Option<u64>,
-) -> Result<Vec<OnchainSwapConsignment>, Error> {
+) -> Result<(Vec<OnchainSwapConsignment>, SwapOutgoingState), Error> {
     swap_stage_rgb_leg(wallet, psbt, send)?;
     let fascia = wallet.color_psbt_finalize(psbt, Some(send.blinding))?;
     swap_prepare_rgb_leg(
@@ -4752,6 +4754,60 @@ pub(crate) fn swap_ensure_inputs_confirmed(
                 "swap input {} has {confirmations} confirmations, required {min_confirmations}",
                 input.outpoint
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse swap inputs the indexer doesn't report as unspent (mempool included) or that don't hold
+/// the declared amount: signing over a spent input wastes the swap, as the transaction can never be
+/// mined, and so does signing over a wrong amount, as the PSBT's witness UTXOs are built from the
+/// declared ones and taproot signatures commit to every prevout amount.
+///
+/// `own_inputs` are this wallet's coins: when one of them is refused, the wallet's view of its
+/// UTXOs is stale (e.g. with `skip_sync`) rather than the counterparty at fault.
+pub(crate) fn swap_ensure_inputs_unspent(
+    wallet: &Wallet,
+    own_inputs: &[OnchainSwapInput],
+    counterparty_inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    let mut seen = HashSet::new();
+    let inputs = own_inputs
+        .iter()
+        .map(|i| (i, true))
+        .chain(counterparty_inputs.iter().map(|i| (i, false)));
+    for (input, own) in inputs {
+        let outpoint = swap_input_to_outpoint(input);
+        // each declared input costs indexer round trips: never check one twice, a transaction
+        // can't spend it twice anyway
+        if !seen.insert(outpoint) {
+            return Err(swap_invalid(format!(
+                "swap input {} is declared more than once",
+                input.outpoint
+            )));
+        }
+        let script = swap_parse_script(&input.script_pubkey_hex)?;
+        match wallet.indexer().unspent_txo_amount(&outpoint, &script)? {
+            None if own => {
+                return Err(swap_invalid(format!(
+                    "this wallet's swap input {} is already spent or unknown to the indexer: \
+                     the wallet needs a sync",
+                    input.outpoint
+                )));
+            }
+            None => {
+                return Err(swap_invalid(format!(
+                    "swap input {} is already spent or does not exist",
+                    input.outpoint
+                )));
+            }
+            Some(amount) if amount != input.amount_sat => {
+                return Err(swap_invalid(format!(
+                    "swap input {} amount mismatch: declared {} sat, found {amount} sat",
+                    input.outpoint, input.amount_sat
+                )));
+            }
+            Some(_) => {}
         }
     }
     Ok(())
