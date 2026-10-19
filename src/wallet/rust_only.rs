@@ -98,6 +98,13 @@ fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     sha256::Hash::hash(bytes.as_ref()).to_string()
 }
 
+/// Version of `meta.json`. Deliberately still 1 after `psbt_op_stage` added the `staged` status
+/// and the optional `hashes.staged` and `completing_txid` fields: every journal an older binary
+/// wrote still parses, and a Prepared one written by this binary still parses in an older one.
+/// Going back to an older binary is not supported while a Staged operation exists (it can't parse
+/// `"staged"`, so its `psbt_op_scan` errors): complete or abort them first. A bump would not
+/// change that, since an older binary refuses an unknown version the same way, but it would make
+/// every journal, Prepared ones included, unreadable to it.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 const PSBT_OP_META_SCHEMA_VERSION: u32 = 1;
 
@@ -3081,6 +3088,11 @@ impl Wallet {
     /// and [`Self::psbt_op_reconcile`] apply unchanged. Retrying with the same PSBT after a crash
     /// or a lost response is safe and returns the same result.
     ///
+    /// The operation keeps the expiry given to [`Self::psbt_op_stage`]. Once it has passed, this
+    /// refuses to complete the operation, which must then be aborted with [`Self::psbt_op_abort`]
+    /// and staged again: a batch published already expired could be failed by the expiry sweep
+    /// after the transaction is signed and broadcast.
+    ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -3169,6 +3181,20 @@ impl Wallet {
                     });
                 }
             }
+        }
+        // the final-txid batch inherits the stage-time expiry: published past it, the expiry sweep
+        // could fail the batch and release the inputs after the parties signed and broadcast.
+        // Restarting the clock here would let the counterparty, who controls when finalize ends,
+        // stretch the reservation, so the operation must be aborted and staged again instead.
+        if let Some(expiration) = manifest.expiration_timestamp
+            && i64::try_from(expiration).unwrap_or(i64::MAX) <= now().unix_timestamp()
+        {
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "operation {operation_id} expired at {expiration} before it was completed; \
+                     abort it with psbt_op_abort and stage a new one"
+                ),
+            });
         }
 
         let runtime = self.rgb_runtime()?;

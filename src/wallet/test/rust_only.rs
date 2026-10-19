@@ -7636,6 +7636,85 @@ fn psbt_op_finalize_refuses_planted_mpc_depth() {
     }
 }
 
+/// `psbt_op_complete` must not publish an operation whose stage-time expiry already passed: the
+/// final-txid batch inherits it and the expiry sweep could fail it after both sides signed.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn psbt_op_complete_refuses_expired_staged_operation() {
+    initialize();
+
+    let mut a = PsbtOpSwapSide::new(AMOUNT);
+    let mut b = PsbtOpSwapSide::new(AMOUNT_SMALL);
+    let mut psbt = psbt_op_swap_psbt(&a, &b);
+    let staged_txid = psbt.unsigned_tx.compute_txid().to_string();
+    let expired = (now().unix_timestamp() - 1) as u64;
+    let a_op = a
+        .party
+        .wallet
+        .psbt_op_stage(
+            &mut psbt,
+            coloring_info_for(
+                &a.asset_id,
+                HashMap::from([(A_VOUT, a.amount)]),
+                PSBT_OP_SWAP_BLINDING,
+            ),
+            vec![a.input],
+            MIN_CONFIRMATIONS,
+            PsbtOpExpiry::At(expired),
+        )
+        .unwrap()
+        .operation_id;
+    let b_op = b.stage(&mut psbt, B_VOUT).operation_id;
+    b.party
+        .wallet
+        .psbt_op_finalize(&mut psbt, Some(PSBT_OP_SWAP_ENTROPY))
+        .unwrap();
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+
+    let refused = |result: Result<PsbtOpPrepareResult, Error>| {
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidPsbtOperationStatus { ref details })
+                    if details.contains("expired") && details.contains("psbt_op_abort")
+            ),
+            "complete must refuse an expired staged operation; got {result:?}"
+        );
+    };
+    refused(a.party.wallet.psbt_op_complete(&a_op, &psbt));
+    // nothing moved: still Staged, reserved by the staged batch, no batch for the final txid
+    assert_eq!(a.reconcile(&a_op), PsbtOperationStatus::Staged);
+    assert!(
+        a.party
+            .check_test_transfer_status_sender(&staged_txid, TransferStatus::Initiated)
+    );
+    assert!(a.party.db_batch_transfers_filtered(&txid).is_empty());
+    // a retry is refused the same way
+    refused(a.party.wallet.psbt_op_complete(&a_op, &psbt));
+
+    // abort still releases the inputs
+    let online = a.party.party_online();
+    a.party.wallet.psbt_op_abort(online, &a_op).unwrap();
+    assert_eq!(a.reconcile(&a_op), PsbtOperationStatus::Failed);
+    assert!(
+        a.party
+            .check_test_transfer_status_sender(&staged_txid, TransferStatus::Failed)
+    );
+    let balance = a.party.get_asset_balance(&a.asset_id);
+    assert_eq!(
+        (balance.settled, balance.future, balance.spendable),
+        (a.amount, a.amount, a.amount)
+    );
+
+    // the side whose expiry has not passed completes normally, then walks away too
+    b.party.wallet.psbt_op_complete(&b_op, &psbt).unwrap();
+    assert_eq!(b.reconcile(&b_op), PsbtOperationStatus::Prepared);
+    let online = b.party.party_online();
+    b.party.wallet.psbt_op_abort(online, &b_op).unwrap();
+    assert_eq!(b.reconcile(&b_op), PsbtOperationStatus::Failed);
+}
+
 /// Non-journaled [`Wallet::color_psbt_stage`] coloring of `vout` (a final vout of `psbt`),
 /// converted to its legacy convention: pre-OP_RETURN keys when any output is P2TR.
 fn psbt_op_legacy_coloring_info(
