@@ -613,6 +613,94 @@ fn color_psbt_uda() {
     assert_eq!(seal.vout.into_u32(), 0);
 }
 
+/// The fascia must be rebuilt from the OP_RETURN commitment host, not from the first output: every
+/// output without MPC messages has an (empty) message map.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn fascia_from_finalized_psbt_opret_host_not_first() {
+    initialize();
+
+    // wallets
+    let mut party_send = get_funded_noutxo_party!();
+    party_send.create_utxos(false, Some(1), None, FEE_RATE, None);
+    let mut recv_party = get_empty_party!();
+    party_send.send_btc(&recv_party.get_address(), 99_998_200);
+
+    // issue
+    let asset = party_send.issue_asset_uda(None, None, vec![]);
+
+    // a p2wpkh-only PSBT gets its OP_RETURN appended at the end
+    let mnemonic = Mnemonic::parse_in(
+        Language::English,
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    )
+    .unwrap();
+    let xprv = Xpriv::new_master(BdkNetwork::Regtest, &mnemonic.to_seed("")).unwrap();
+    let custom_bdk_wallet =
+        BdkWallet::create(format!("wpkh({xprv}/0/*)"), format!("wpkh({xprv}/1/*)"))
+            .network(BdkNetwork::Regtest)
+            .create_wallet_no_persist()
+            .unwrap();
+    let p2wpkh_addr = custom_bdk_wallet
+        .peek_address(KeychainKind::External, 0)
+        .address;
+    let mut tx_builder = party_send.wallet.bdk_wallet_mut().build_tx();
+    tx_builder
+        .drain_wallet()
+        .drain_to(p2wpkh_addr.script_pubkey())
+        .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
+    let mut psbt = tx_builder.finish().unwrap();
+
+    // color PSBT
+    let coloring_info = ColoringInfo {
+        asset_info_map: HashMap::from_iter([(
+            ContractId::from_str(&asset.asset_id).unwrap(),
+            AssetColoringInfo {
+                output_map: HashMap::from_iter([(0u32, 1u64)]),
+                static_blinding: None,
+            },
+        )]),
+        static_blinding: None,
+        nonce: None,
+    };
+    let (fascia, _) = party_send
+        .wallet
+        .color_psbt(&mut psbt, coloring_info)
+        .unwrap();
+    let opret_vout = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .position(|o| o.script_pubkey.is_op_return())
+        .unwrap();
+    assert!(opret_vout > 0);
+
+    // rebuild the fascia from the PSBT as a counterparty would receive it
+    let received = Psbt::from_str(&psbt.to_string()).unwrap();
+    let rebuilt = party_send
+        .wallet
+        .fascia_from_finalized_psbt(&received)
+        .unwrap();
+    assert_eq!(rebuilt, fascia);
+
+    // without MPC messages on the OP_RETURN output there is no commitment to rebuild
+    let mut no_messages = received.clone();
+    no_messages.outputs[opret_vout] = Default::default();
+    let result = party_send.wallet.fascia_from_finalized_psbt(&no_messages);
+    assert!(
+        matches!(result, Err(Error::InvalidColoringInfo { ref details }) if details == "PSBT OP_RETURN output carries no RGB MPC messages")
+    );
+
+    // the OP_RETURN script must carry the commitment of the rebuilt MPC tree
+    let mut tampered = received.clone();
+    tampered.unsigned_tx.output[opret_vout].script_pubkey = ScriptBuf::new_op_return([0u8; 32]);
+    let result = party_send.wallet.fascia_from_finalized_psbt(&tampered);
+    assert!(
+        matches!(result, Err(Error::InvalidColoringInfo { ref details }) if details == "PSBT OP_RETURN output does not carry its RGB MPC commitment")
+    );
+}
+
 /// UniFFI `psbt_op_prepare` shares `color_psbt_with_prevouts_runtime`. A known UDA whose selected
 /// inputs do not carry the token used to panic on `uda_state.unwrap()` before the insufficient
 /// allocation check.
