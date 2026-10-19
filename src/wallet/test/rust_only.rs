@@ -484,7 +484,7 @@ fn color_psbt_fail() {
     };
     let result = party_send.wallet.color_psbt(&mut psbt, coloring_info);
     let msg = "invalid vout in output_map, does not exist in the given PSBT";
-    assert!(matches!(result, Err(Error::InvalidColoringInfo { details: m }) if m == msg));
+    assert!(matches!(result, Err(Error::InvalidColoringInfo { details: m }) if m.starts_with(msg)));
 
     // wrong output map amount
     let fake_o_map = output_map.keys().map(|k| (*k, 999u64)).collect();
@@ -2530,6 +2530,172 @@ fn broadcast_wallet_psbt(wallet: &Wallet, psbt: &Psbt) {
         .extract_tx()
         .expect("valid tx");
     wallet.broadcast_tx(tx).unwrap();
+}
+
+/// The pre-OP_RETURN APIs (`color_psbt`, `color_psbt_stage`, `color_psbt_and_prepare_consume`)
+/// must reject a final-vout `output_map` whenever the P2TR +1 shift lands on an output that
+/// cannot carry a witness seal or past the last output.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn pre_opreturn_apis_reject_final_vout_output_map() {
+    initialize();
+
+    let amt_sat = 500;
+    let blinding = 777;
+
+    let mut party_send = get_funded_noutxo_party!();
+    let mut recv_party = get_empty_party!();
+    party_send.create_utxos(false, Some(1), None, FEE_RATE, None);
+    party_send.send_btc(&recv_party.get_address(), 99_998_200);
+    let asset = party_send.issue_asset_nia(Some(&[AMOUNT]));
+
+    let address = BdkAddress::from_str(&recv_party.get_address()).unwrap();
+    let mut tx_builder = party_send.wallet.bdk_wallet_mut().build_tx();
+    tx_builder
+        .add_recipient(
+            address.assume_checked().script_pubkey(),
+            BdkAmount::from_sat(amt_sat),
+        )
+        .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
+    let mut psbt = tx_builder.finish().unwrap();
+    // [OP_RETURN, .., recipient, bare multisig, ..]
+    let recipient_vout = layout_index_mixup_psbt(&mut psbt, amt_sat);
+    let base_psbt = psbt.clone();
+
+    // final key shifted by +1 lands on the bare-multisig output
+    let shifted_vout = recipient_vout + 1;
+    let final_coloring = coloring_info_for(
+        &asset.asset_id,
+        HashMap::from([(recipient_vout, AMOUNT)]),
+        blinding,
+    );
+    let result = party_send
+        .wallet
+        .color_psbt(&mut psbt, final_coloring.clone());
+    assert_matches!(
+        result,
+        Err(Error::InvalidColoringInfo { details: m })
+            if m.starts_with(&format!("output_map vout {shifted_vout} script cannot carry an RGB witness seal"))
+                && m.contains("pre-OP_RETURN")
+    );
+    assert_eq!(psbt, base_psbt);
+    let result = party_send
+        .wallet
+        .color_psbt_stage(&mut psbt, final_coloring.clone());
+    assert_matches!(
+        result,
+        Err(Error::InvalidColoringInfo { details: m })
+            if m.starts_with(&format!("output_map vout {shifted_vout} script cannot carry an RGB witness seal"))
+                && m.contains("pre-OP_RETURN")
+    );
+    assert_eq!(psbt, base_psbt);
+    let result = party_send.wallet.color_psbt_and_prepare_consume(
+        &mut psbt,
+        final_coloring,
+        MIN_CONFIRMATIONS,
+        None,
+    );
+    assert_matches!(
+        result,
+        Err(Error::InvalidColoringInfo { details: m })
+            if m.starts_with(&format!("output_map vout {shifted_vout} script cannot carry an RGB witness seal"))
+                && m.contains("pre-OP_RETURN")
+    );
+    assert_eq!(
+        psbt, base_psbt,
+        "a rejected output_map must not color the PSBT"
+    );
+
+    // the last final vout shifted by +1 falls off the end of the PSBT
+    let last_vout = psbt.unsigned_tx.output.len() as u32 - 1;
+    let result = party_send.wallet.color_psbt(
+        &mut psbt,
+        coloring_info_for(
+            &asset.asset_id,
+            HashMap::from([(last_vout, AMOUNT)]),
+            blinding,
+        ),
+    );
+    assert_matches!(
+        result,
+        Err(Error::InvalidColoringInfo { details: m })
+            if m.starts_with("invalid vout in output_map, does not exist in the given PSBT")
+                && m.contains("pre-OP_RETURN")
+    );
+    assert_eq!(psbt, base_psbt);
+
+    // the pre-OP_RETURN index seals the recipient
+    let (fascia, _) = party_send
+        .wallet
+        .color_psbt(
+            &mut psbt,
+            coloring_info_for(
+                &asset.asset_id,
+                HashMap::from([(recipient_vout - 1, AMOUNT)]),
+                blinding,
+            ),
+        )
+        .unwrap();
+    assert_eq!(fascia_seal_vouts(&fascia), vec![recipient_vout]);
+}
+
+/// Lay out a P2TR PSBT for index-convention mix-up tests: put a bare-multisig output (which
+/// cannot carry a witness seal) right after the `amt_sat` recipient, then an OP_RETURN at vout 0.
+/// Returns the recipient's final vout.
+#[cfg(feature = "electrum")]
+fn layout_index_mixup_psbt(psbt: &mut Psbt, amt_sat: u64) -> u32 {
+    assert!(
+        psbt.unsigned_tx
+            .output
+            .iter()
+            .any(|o| o.script_pubkey.is_p2tr()),
+        "test wallet must produce P2TR outputs"
+    );
+    let find_recipient = |psbt: &Psbt| {
+        psbt.unsigned_tx
+            .output
+            .iter()
+            .position(|o| o.value.to_sat() == amt_sat)
+            .unwrap()
+    };
+    let at = find_recipient(psbt) + 1;
+    psbt.unsigned_tx.output.insert(
+        at,
+        TxOut {
+            value: BdkAmount::from_sat(amt_sat + 1),
+            script_pubkey: bare_multisig_script(),
+        },
+    );
+    psbt.outputs
+        .insert(at, bdk_wallet::bitcoin::psbt::Output::default());
+    insert_op_return(psbt, true);
+    find_recipient(psbt) as u32
+}
+
+/// Vouts of the revealed seals assigned by every transition in `fascia`.
+#[cfg(feature = "electrum")]
+fn fascia_seal_vouts(fascia: &Fascia) -> Vec<u32> {
+    let mut vouts = vec![];
+    for (_, bundle) in fascia.bundles().iter() {
+        for known in bundle.known_transitions.iter() {
+            for (_, assignments) in known.transition.assignments.iter() {
+                for assignment in assignments.as_fungible() {
+                    vouts.push(assignment.revealed_seal().unwrap().vout.into_u32());
+                }
+            }
+        }
+    }
+    vouts
+}
+
+/// A bare 1-of-1 multisig script: a standard output that cannot carry an RGB witness seal.
+#[cfg(feature = "electrum")]
+fn bare_multisig_script() -> ScriptBuf {
+    let mut bytes = vec![0x51, 0x21, 0x02];
+    bytes.extend([0x11u8; 32]);
+    bytes.extend([0x51, 0xae]);
+    ScriptBuf::from_bytes(bytes)
 }
 
 #[cfg(feature = "electrum")]
