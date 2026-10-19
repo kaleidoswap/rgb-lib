@@ -20,8 +20,8 @@ use super::online::{
     swap_ensure_inputs_confirmed, swap_ensure_inputs_foreign, swap_ensure_inputs_unspent,
     swap_fetch_consignment_to_file, swap_finalize_psbt, swap_finalize_psbt_required,
     swap_import_asset_history, swap_input_rgb_amounts, swap_prepare_rgb_leg, swap_select_inputs,
-    swap_sign_psbt,
-    swap_stage_rgb_leg, swap_validate_fascia_received_leg, swap_validate_received_swap_leg,
+    swap_sign_psbt, swap_stage_rgb_leg, swap_validate_fascia_received_leg,
+    swap_validate_received_swap_leg,
 };
 use super::*;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -1669,7 +1669,7 @@ impl Wallet {
         // maker commits resources to building the PSBT.
         swap_ensure_inputs_foreign(self, &request.taker_inputs, &[])?;
         swap_ensure_inputs_confirmed(self, &request.taker_inputs, min_confirmations)?;
-        swap_ensure_inputs_unspent(self, &request.taker_inputs)?;
+        swap_ensure_inputs_unspent(self, &[], &request.taker_inputs)?;
         swap_require_rgb_destination(
             &offer.maker_gives,
             &request.taker_rgb_script_pubkey_hex,
@@ -1696,7 +1696,7 @@ impl Wallet {
             &exclude_outpoints,
         )?;
         // with `skip_sync` the wallet may not know its selected coins were spent already
-        swap_ensure_inputs_unspent(self, &maker_inputs)?;
+        swap_ensure_inputs_unspent(self, &maker_inputs, &[])?;
         let maker_change_keychain = if matches!(offer.maker_gives.kind, OnchainSwapLegKind::Rgb) {
             KeychainKind::External
         } else {
@@ -1719,6 +1719,7 @@ impl Wallet {
         let (mut psbt, _maker_rgb_vout, taker_rgb_vout) = swap_build_psbt(&proposal)?;
         let mut consignments = vec![];
         let mut maker_history = None;
+        let mut outgoing = None;
         if matches!(offer.maker_gives.kind, OnchainSwapLegKind::Rgb) {
             maker_history = swap_emit_asset_history(
                 self,
@@ -1744,7 +1745,7 @@ impl Wallet {
             };
             match direction {
                 SwapDirection::RgbForBtc => {
-                    consignments = swap_color_rgb_leg(
+                    let (leg_consignments, leg_outgoing) = swap_color_rgb_leg(
                         &txn,
                         self,
                         &mut psbt,
@@ -1753,6 +1754,8 @@ impl Wallet {
                         &offer.swap_id,
                         offer.expiration_timestamp,
                     )?;
+                    consignments = leg_consignments;
+                    outgoing = Some(leg_outgoing);
                 }
                 SwapDirection::RgbForRgb => {
                     swap_stage_rgb_leg(self, &mut psbt, &send)?;
@@ -1779,8 +1782,7 @@ impl Wallet {
             SWAP_PROPOSAL_FILE,
             &proposal,
         )?;
-        self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.swap_commit(txn, &offer.swap_id, outgoing.as_ref())?;
         info!(self.logger(), "Accept swap request completed");
         Ok(proposal)
     }
@@ -1843,6 +1845,9 @@ impl Wallet {
             .cloned()
             .collect::<Vec<_>>();
         swap_restore_input_metadata(&mut psbt, &all_inputs)?;
+        // Correctness: refuse spent inputs before coloring, uploading or recording anything. The
+        // check is repeated right before signing, to catch a spend in between.
+        swap_ensure_inputs_unspent(self, &proposal.request.taker_inputs, &proposal.maker_inputs)?;
         let taker_send = SwapRgbSend {
             leg: &offer.maker_receives,
             inputs: &proposal.request.taker_inputs,
@@ -1858,9 +1863,10 @@ impl Wallet {
         {
             return Err(swap_invalid("missing maker RGB receive data"));
         }
+        let mut outgoing = None;
         match direction {
             SwapDirection::BtcForRgb => {
-                consignments.extend(swap_color_rgb_leg(
+                let (leg_consignments, leg_outgoing) = swap_color_rgb_leg(
                     &txn,
                     self,
                     &mut psbt,
@@ -1868,7 +1874,9 @@ impl Wallet {
                     offer.proxy_url.as_deref(),
                     &offer.swap_id,
                     offer.expiration_timestamp,
-                )?);
+                )?;
+                consignments.extend(leg_consignments);
+                outgoing = Some(leg_outgoing);
                 swap_restore_input_metadata(&mut psbt, &all_inputs)?;
             }
             SwapDirection::RgbForBtc => {
@@ -1919,7 +1927,7 @@ impl Wallet {
                     taker_recv_vout,
                     taker_recv_blinding,
                 )?;
-                consignments.extend(swap_prepare_rgb_leg(
+                let (leg_consignments, leg_outgoing) = swap_prepare_rgb_leg(
                     &txn,
                     self,
                     &psbt,
@@ -1928,7 +1936,9 @@ impl Wallet {
                     offer.proxy_url.as_deref(),
                     &offer.swap_id,
                     offer.expiration_timestamp,
-                )?);
+                )?;
+                consignments.extend(leg_consignments);
+                outgoing = Some(leg_outgoing);
                 swap_restore_input_metadata(&mut psbt, &all_inputs)?;
             }
         }
@@ -1936,7 +1946,7 @@ impl Wallet {
         self.sync_if_requested(&txn, Some(online), skip_sync, KeychainKind::External)?;
         swap_ensure_inputs_confirmed(self, &proposal.maker_inputs, min_confirmations)?;
         swap_ensure_inputs_confirmed(self, &proposal.request.taker_inputs, min_confirmations)?;
-        swap_ensure_inputs_unspent(self, &all_inputs)?;
+        swap_ensure_inputs_unspent(self, &proposal.request.taker_inputs, &proposal.maker_inputs)?;
         swap_sign_psbt(self, &mut psbt, &proposal, OnchainSwapRole::Taker)?;
         let finalized_psbt = swap_finalize_psbt(self, &psbt)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
@@ -1956,8 +1966,11 @@ impl Wallet {
             SWAP_COMPLETION_FILE,
             &completion,
         )?;
-        self.update_backup_info(&txn, false)?;
-        txn.commit()?;
+        self.swap_commit(
+            txn,
+            &completion.proposal.request.offer.swap_id,
+            outgoing.as_ref(),
+        )?;
         info!(self.logger(), "Complete swap proposal completed");
         Ok(completion)
     }
@@ -2013,7 +2026,11 @@ impl Wallet {
                 let txn = self.database().begin_transaction()?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::Internal)?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
-                swap_ensure_inputs_unspent(self, &all_inputs)?;
+                swap_ensure_inputs_unspent(
+                    self,
+                    &completion.proposal.maker_inputs,
+                    &completion.proposal.request.taker_inputs,
+                )?;
                 swap_sign_psbt(
                     self,
                     &mut psbt,
@@ -2054,7 +2071,11 @@ impl Wallet {
                 let txn = self.database().begin_transaction()?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::Internal)?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
-                swap_ensure_inputs_unspent(self, &all_inputs)?;
+                swap_ensure_inputs_unspent(
+                    self,
+                    &completion.proposal.maker_inputs,
+                    &completion.proposal.request.taker_inputs,
+                )?;
                 swap_sign_psbt(
                     self,
                     &mut psbt,
@@ -2073,6 +2094,14 @@ impl Wallet {
                 Ok(completion)
             }
             SwapDirection::RgbForRgb => {
+                // Correctness: refuse spent inputs before importing, recording or uploading
+                // anything. The check is repeated right before signing, to catch a spend in
+                // between.
+                swap_ensure_inputs_unspent(
+                    self,
+                    &completion.proposal.maker_inputs,
+                    &completion.proposal.request.taker_inputs,
+                )?;
                 let recv_vout =
                     maker_rgb_vout.ok_or_else(|| swap_invalid("missing maker RGB vout"))?;
                 let recv_blinding = offer
@@ -2132,7 +2161,7 @@ impl Wallet {
                         .ok_or_else(|| swap_invalid("missing taker RGB blinding"))?,
                 };
                 let mut consignments = completion.consignments.clone();
-                consignments.extend(swap_prepare_rgb_leg(
+                let (leg_consignments, outgoing) = swap_prepare_rgb_leg(
                     &txn,
                     self,
                     &psbt,
@@ -2141,10 +2170,15 @@ impl Wallet {
                     offer.proxy_url.as_deref(),
                     &offer.swap_id,
                     offer.expiration_timestamp,
-                )?);
+                )?;
+                consignments.extend(leg_consignments);
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::Internal)?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
-                swap_ensure_inputs_unspent(self, &all_inputs)?;
+                swap_ensure_inputs_unspent(
+                    self,
+                    &completion.proposal.maker_inputs,
+                    &completion.proposal.request.taker_inputs,
+                )?;
                 swap_sign_psbt(
                     self,
                     &mut psbt,
@@ -2158,8 +2192,7 @@ impl Wallet {
                     consignments,
                     ..completion
                 };
-                self.update_backup_info(&txn, false)?;
-                txn.commit()?;
+                self.swap_commit(txn, &offer.swap_id, Some(&outgoing))?;
                 info!(self.logger(), "Process swap completion completed");
                 Ok(completion)
             }
@@ -2674,6 +2707,45 @@ impl Wallet {
         Ok(())
     }
 
+    /// Commit a swap step's `txn`, recording the RGB leg it prepared, if any, as
+    /// `SWAP_OUTGOING_FILE`.
+    ///
+    /// The record is written after every fallible step of the swap step and removed if the commit
+    /// fails, so it only points at a batch that was committed. A crash in between can still leave
+    /// a record of a rolled-back batch, which `swap_outgoing_batch` ignores. Writing the record
+    /// after the commit instead would trade that for a committed Initiated batch that
+    /// [`cancel_swap`](Wallet::cancel_swap) can't find, keeping its inputs locked.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn swap_commit(
+        &self,
+        txn: DbTxn,
+        swap_id: &str,
+        outgoing: Option<&SwapOutgoingState>,
+    ) -> Result<(), Error> {
+        self.update_backup_info(&txn, false)?;
+        if let Some(outgoing) = outgoing {
+            swap_save_state(self.wallet_dir(), swap_id, SWAP_OUTGOING_FILE, outgoing)?;
+        }
+        if let Err(e) = txn.commit() {
+            if outgoing.is_some() {
+                let _ = fs::remove_file(swap_state_path(
+                    self.wallet_dir(),
+                    swap_id,
+                    SWAP_OUTGOING_FILE,
+                ));
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// The Initiated batch recording this wallet's RGB leg of a swap, if any.
+    ///
+    /// A `SWAP_OUTGOING_FILE` that doesn't match a batch in the database (one rolled back by a
+    /// crash before its commit, or a failed batch removed by `delete_transfers`, whose index may
+    /// since have been reused) is
+    /// stale: there is nothing to fail or consume, so it's ignored rather than blocking
+    /// [`cancel_swap`](Wallet::cancel_swap) and the expiry sweep.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn swap_outgoing_batch(
         &self,
@@ -2686,13 +2758,20 @@ impl Wallet {
             swap_load_state(self.wallet_dir(), swap_id, SWAP_OUTGOING_FILE)?;
         let txn = self.database().begin_transaction()?;
         let db_data = txn.get_db_data(false)?;
-        let batch_transfer =
-            txn.get_batch_transfer_or_fail(outgoing.batch_transfer_idx, &db_data.batch_transfers)?;
-        if batch_transfer.incoming || batch_transfer.txid.as_deref() != Some(&outgoing.txid) {
-            return Err(Error::Inconsistency {
-                details: format!("swap {swap_id} outgoing batch does not match its local state"),
-            });
-        }
+        let batch_transfer = db_data
+            .batch_transfers
+            .into_iter()
+            .find(|bt| bt.idx == outgoing.batch_transfer_idx)
+            .filter(|bt| !bt.incoming && bt.txid.as_deref() == Some(&outgoing.txid));
+        let Some(batch_transfer) = batch_transfer else {
+            warn!(
+                self.logger(),
+                "Ignoring swap {swap_id} outgoing state: batch transfer {} for {} not found",
+                outgoing.batch_transfer_idx,
+                outgoing.txid
+            );
+            return Ok(None);
+        };
         Ok(Some((outgoing, batch_transfer)))
     }
 
