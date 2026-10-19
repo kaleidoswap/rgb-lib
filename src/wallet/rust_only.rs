@@ -15,6 +15,7 @@ use bdk_wallet::bitcoin::psbt::Output as PsbtOutput;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use rgbstd::AssignmentType;
 use rgbstd::Operation as _;
+use rgbstd::TransitionBundle;
 use rgbstd::{
     containers::SealWitness,
     opret::OpretProof,
@@ -4029,6 +4030,26 @@ fn bounded_mpc_tree(
     Ok(merkle_tree)
 }
 
+/// Check that `messages` commit every bundle, under its contract, by its bundle ID.
+///
+/// The bundles and the MPC messages are separate PSBT keys: without this, whoever finalizes a
+/// PSBT can commit another bundle for a contract (e.g. one sending its inputs to them) while the
+/// PSBT still shows the expected one.
+fn check_bundles_committed<'a>(
+    bundles: impl IntoIterator<Item = (&'a ContractId, &'a TransitionBundle)>,
+    messages: &mpc::MessageMap,
+) -> Result<(), Error> {
+    for (contract_id, bundle) in bundles {
+        if messages.get(&ProtocolId::from(*contract_id)) != Some(&Message::from(bundle.bundle_id()))
+        {
+            return Err(Error::InvalidColoringInfo {
+                details: format!("PSBT MPC commitment does not commit the bundle of {contract_id}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Check that `rgb_commit` will build a bounded MPC tree for `psbt`, before it builds it unchecked.
 ///
 /// `rgb_commit` writes the MPC messages to the first opret host and commits the first OP_RETURN
@@ -4088,7 +4109,14 @@ fn commit_staged_psbt(psbt: &mut Psbt, static_blinding: Option<u64>) -> Result<F
     psbt.set_rgb_close_method(CloseMethod::OpretFirst);
     psbt.set_as_unmodifiable();
     check_psbt_mpc_commit_bounds(psbt, opreturn_index)?;
-    Ok(psbt.rgb_commit().map_err(InternalError::from)?)
+    let fascia = psbt.rgb_commit().map_err(InternalError::from)?;
+    // the fascia's merkle block is built from the committed output's messages, so check these
+    // carry every bundle: staging may have sent them to another output flagged as opret host
+    let messages = psbt.outputs[opreturn_index]
+        .mpc_message_map()
+        .map_err(InternalError::from)?;
+    check_bundles_committed(fascia.bundles().iter(), &messages)?;
+    Ok(fascia)
 }
 
 /// Rebuild the fascia of a PSBT whose RGB commitment was finalized, possibly by a counterparty.
@@ -4117,6 +4145,7 @@ fn fascia_from_committed_psbt(psbt: &Psbt) -> Result<Fascia, Error> {
             details: s!("PSBT OP_RETURN output carries no RGB MPC messages"),
         });
     }
+    check_bundles_committed(&bundles, &messages)?;
     let merkle_tree =
         bounded_mpc_tree(psbt_mpc_min_depth(output)?, messages, output.mpc_entropy())?;
     let expected_script = ScriptBuf::new_op_return(merkle_tree.commit_id().to_byte_array());
@@ -4280,6 +4309,58 @@ mod tests {
         let mut psbt = staged_psbt();
         psbt.set_rgb_close_method(CloseMethod::TapretFirst);
         assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "close method");
+    }
+
+    #[test]
+    fn fascia_rebuild_rejects_uncommitted_bundle() {
+        let mut psbt = staged_psbt();
+        let fascia = commit_staged_psbt(&mut psbt, Some(7)).unwrap();
+        let contract_id = *fascia.bundles().keys().next().unwrap();
+        let protocol_id = ProtocolId::from(contract_id);
+        // commit another bundle ID for the contract, e.g. one moving its inputs to the attacker
+        psbt.outputs[0]
+            .proprietary
+            .insert(ProprietaryKey::mpc_message(protocol_id), vec![0x42u8; 32]);
+        let output = &psbt.outputs[0];
+        let tree = bounded_mpc_tree(
+            MPC_MINIMAL_DEPTH,
+            output.mpc_message_map().unwrap(),
+            output.mpc_entropy(),
+        )
+        .unwrap();
+        psbt.unsigned_tx.output[0].script_pubkey =
+            ScriptBuf::new_op_return(tree.commit_id().to_byte_array());
+        assert_rejected(fascia_from_committed_psbt(&psbt), "does not commit");
+
+        // without any message for the contract
+        psbt.outputs[0]
+            .proprietary
+            .remove(&ProprietaryKey::mpc_message(protocol_id));
+        let other_protocol_id = ProtocolId::copy_from_slice(&[0x11u8; 32]).unwrap();
+        psbt.outputs[0].proprietary.insert(
+            ProprietaryKey::mpc_message(other_protocol_id),
+            vec![0x42u8; 32],
+        );
+        let output = &psbt.outputs[0];
+        let tree = bounded_mpc_tree(
+            MPC_MINIMAL_DEPTH,
+            output.mpc_message_map().unwrap(),
+            output.mpc_entropy(),
+        )
+        .unwrap();
+        psbt.unsigned_tx.output[0].script_pubkey =
+            ScriptBuf::new_op_return(tree.commit_id().to_byte_array());
+        assert_rejected(fascia_from_committed_psbt(&psbt), "does not commit");
+    }
+
+    #[test]
+    fn commit_rejects_bundles_left_off_the_commitment() {
+        // the OP_RETURN is not the first output, and staging flagged an earlier one as opret
+        // host: the bundles' messages would go there while the OP_RETURN commits none of them
+        let mut psbt = staged_psbt();
+        psbt.unsigned_tx.output.swap(0, 1);
+        psbt.outputs[0].set_opret_host();
+        assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "does not commit");
     }
 
     #[test]
