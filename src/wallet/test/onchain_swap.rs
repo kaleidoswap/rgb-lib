@@ -997,6 +997,8 @@ fn default_utxo_full_sale_returns_btc_change_to_vanilla() {
         "Swap Default Full Sale",
         SWAP_RGB_AMOUNT,
     );
+    // confirm the new colored UTXO so the balances below count it as settled
+    mine(false);
     let before = taker.get_btc_balance(Some(taker_online), false).unwrap();
 
     let offer = maker
