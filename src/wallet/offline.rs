@@ -10,6 +10,21 @@ const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
 
 const CONSIGNMENT_RCV_META_FILE: &str = "rcv_compose.meta.json";
 
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_OFFER_FILE: &str = "offer.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_REQUEST_FILE: &str = "request.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_PROPOSAL_FILE: &str = "proposal.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_OUTGOING_FILE: &str = "outgoing.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_BROADCAST_FILE: &str = "broadcast.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_ACCEPTED_FILE: &str = "accepted.json";
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_CANCELLED_EXTENSION: &str = "cancelled";
+
 const ASSET_ID_PREFIX: &str = "rgb:";
 
 pub(crate) const UDA_FIXED_INDEX: u32 = 0;
@@ -2647,6 +2662,720 @@ pub trait WalletOffline: WalletBackup {
         }
         Ok(())
     }
+
+    // ─── On-chain swap ─────────────────────────────────────────────────────────
+
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn create_swap_offer_impl(
+        &mut self,
+        _txn: &DbTxn,
+        maker_gives: OnchainSwapLeg,
+        maker_receives: OnchainSwapLeg,
+        network_fee_sat: u64,
+        expiration_timestamp: Option<u64>,
+        proxy_url: Option<String>,
+        platform_fee_sat: u64,
+        fee_recipient: Option<String>,
+    ) -> Result<OnchainSwapOffer, Error> {
+        swap_validate_legs(&maker_gives, &maker_receives)?;
+        swap_validate_proxy_url(&proxy_url)?;
+        let fee_recipient_script_pubkey_hex = if platform_fee_sat > 0 {
+            let address = fee_recipient.ok_or_else(|| {
+                swap_invalid("fee_recipient is required when platform_fee_sat > 0")
+            })?;
+            Some(
+                parse_address_str(&address, self.bitcoin_network())?
+                    .script_pubkey()
+                    .to_hex_string(),
+            )
+        } else {
+            None
+        };
+        let (
+            maker_btc_address,
+            maker_rgb_recipient_id,
+            maker_rgb_script_pubkey_hex,
+            maker_rgb_blinding,
+        ) = if matches!(maker_receives.kind, OnchainSwapLegKind::Btc) {
+            let addr = self.get_new_addresses(KeychainKind::Internal, 1)?;
+            (Some(addr.to_string()), None, None, None)
+        } else {
+            let script = self
+                .get_new_addresses(KeychainKind::External, 1)?
+                .script_pubkey();
+            let blinding = swap_random_blinding();
+            (
+                None,
+                Some(recipient_id_from_script_buf(
+                    script.clone(),
+                    self.bitcoin_network(),
+                )),
+                Some(script.to_hex_string()),
+                Some(blinding),
+            )
+        };
+        Ok(OnchainSwapOffer {
+            swap_id: swap_random_id(),
+            maker_gives,
+            maker_receives,
+            bitcoin_network: self.bitcoin_network(),
+            network_fee_sat,
+            rgb_output_sat: SWAP_DEFAULT_RGB_OUTPUT_SAT,
+            expiration_timestamp,
+            maker_btc_address,
+            maker_rgb_recipient_id,
+            maker_rgb_script_pubkey_hex,
+            maker_rgb_blinding,
+            proxy_url,
+            platform_fee_sat,
+            fee_recipient_script_pubkey_hex,
+        })
+    }
+}
+
+// ─── On-chain swap: free helper functions (offline-safe) ──────────────────────
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const SWAP_DEFAULT_RGB_OUTPUT_SAT: u64 = 1_000;
+
+/// The Initiated batch recording this wallet's RGB leg of a swap, applied after broadcast.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct SwapOutgoingState {
+    pub(crate) txid: String,
+    pub(crate) batch_transfer_idx: i32,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum SwapDirection {
+    RgbForBtc,
+    BtcForRgb,
+    RgbForRgb,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_invalid(details: impl Into<String>) -> Error {
+    Error::InvalidDetails {
+        details: details.into(),
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_random_id() -> String {
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_random_blinding() -> u64 {
+    rand::rng().random_range(1..=u64::MAX)
+}
+
+/// Derive a deterministic MPC entropy for a swap from its identifier. Both parties compute the
+/// same value so the MPC commitment they each (re)produce is identical.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_mpc_entropy(swap_id: &str) -> u64 {
+    let hash = hash_bytes_hex(swap_id.as_bytes());
+    let mut bytes = [0u8; 8];
+    let src = hash.as_bytes();
+    let take = src.len().min(16);
+    let hex_slice = &hash[..take];
+    if let Ok(parsed) = u64::from_str_radix(hex_slice, 16) {
+        return std::cmp::Ord::max(parsed, 1);
+    }
+    bytes.copy_from_slice(&src[..8]);
+    std::cmp::Ord::max(u64::from_be_bytes(bytes), 1)
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_ensure_not_expired(offer: &OnchainSwapOffer) -> Result<(), Error> {
+    if let Some(expiration_timestamp) = offer.expiration_timestamp {
+        let current_timestamp = u64::try_from(now().unix_timestamp()).unwrap_or_default();
+        if expiration_timestamp <= current_timestamp {
+            return Err(swap_invalid("swap offer expired"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_validate_leg(leg: &OnchainSwapLeg) -> Result<(), Error> {
+    if leg.amount == 0 {
+        return Err(Error::InvalidAmountZero);
+    }
+    match leg.kind {
+        OnchainSwapLegKind::Btc => {
+            if leg.asset_id.is_some() {
+                return Err(swap_invalid("BTC swap legs must not include an asset ID"));
+            }
+        }
+        OnchainSwapLegKind::Rgb => {
+            let asset_id = leg
+                .asset_id
+                .as_ref()
+                .ok_or_else(|| swap_invalid("RGB swap legs require an asset ID"))?;
+            ContractId::from_str(asset_id)
+                .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_validate_legs(
+    gives: &OnchainSwapLeg,
+    receives: &OnchainSwapLeg,
+) -> Result<SwapDirection, Error> {
+    swap_validate_leg(gives)?;
+    swap_validate_leg(receives)?;
+    if gives == receives {
+        return Err(swap_invalid("swap legs cannot be identical"));
+    }
+    if matches!(gives.kind, OnchainSwapLegKind::Btc)
+        && matches!(receives.kind, OnchainSwapLegKind::Btc)
+    {
+        return Err(swap_invalid("BTC-for-BTC swaps are not supported"));
+    }
+    if matches!(gives.kind, OnchainSwapLegKind::Rgb)
+        && matches!(receives.kind, OnchainSwapLegKind::Rgb)
+        && gives.asset_id == receives.asset_id
+    {
+        return Err(swap_invalid(
+            "RGB-for-RGB swaps require different asset IDs",
+        ));
+    }
+    Ok(match (gives.kind, receives.kind) {
+        (OnchainSwapLegKind::Rgb, OnchainSwapLegKind::Btc) => SwapDirection::RgbForBtc,
+        (OnchainSwapLegKind::Btc, OnchainSwapLegKind::Rgb) => SwapDirection::BtcForRgb,
+        (OnchainSwapLegKind::Rgb, OnchainSwapLegKind::Rgb) => SwapDirection::RgbForRgb,
+        (OnchainSwapLegKind::Btc, OnchainSwapLegKind::Btc) => unreachable!("BTC-for-BTC rejected"),
+    })
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_parse_script(script_hex: &str) -> Result<ScriptBuf, Error> {
+    ScriptBuf::from_hex(script_hex).map_err(|e| swap_invalid(format!("invalid script: {e}")))
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_input_to_outpoint(input: &OnchainSwapInput) -> BdkOutPoint {
+    BdkOutPoint::from(input.outpoint.clone())
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_input_txout(input: &OnchainSwapInput) -> Result<TxOut, Error> {
+    Ok(TxOut {
+        value: BdkAmount::from_sat(input.amount_sat),
+        script_pubkey: swap_parse_script(&input.script_pubkey_hex)?,
+    })
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_build_input(local_output: &LocalOutput) -> OnchainSwapInput {
+    OnchainSwapInput {
+        outpoint: local_output.outpoint.into(),
+        amount_sat: local_output.txout.value.to_sat(),
+        script_pubkey_hex: local_output.txout.script_pubkey.to_hex_string(),
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_selected_inputs_total(inputs: &[OnchainSwapInput]) -> u64 {
+    inputs.iter().map(|i| i.amount_sat).sum()
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_require_rgb_destination(
+    leg: &OnchainSwapLeg,
+    script_hex: &Option<String>,
+    blinding: &Option<u64>,
+) -> Result<(), Error> {
+    if matches!(leg.kind, OnchainSwapLegKind::Rgb) && (script_hex.is_none() || blinding.is_none()) {
+        return Err(swap_invalid("missing RGB receive data"));
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_consignment_dir(wallet_dir: &Path, swap_id: &str) -> PathBuf {
+    wallet_dir.join("transfers").join(format!("swap-{swap_id}"))
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_state_path(wallet_dir: &Path, swap_id: &str, file_name: &str) -> PathBuf {
+    swap_consignment_dir(wallet_dir, swap_id).join(file_name)
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_save_state<T: Serialize>(
+    wallet_dir: &Path,
+    swap_id: &str,
+    file_name: &str,
+    state: &T,
+) -> Result<(), Error> {
+    let path = swap_state_path(wallet_dir, swap_id, file_name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let serialized = serde_json::to_string(state).map_err(InternalError::from)?;
+    fs::write(path, serialized)?;
+    Ok(())
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_load_state<T: serde::de::DeserializeOwned>(
+    wallet_dir: &Path,
+    swap_id: &str,
+    file_name: &str,
+) -> Result<T, Error> {
+    let path = swap_state_path(wallet_dir, swap_id, file_name);
+    if !path.exists() {
+        return Err(swap_invalid(format!(
+            "missing local swap state at {}",
+            path.display()
+        )));
+    }
+    let serialized = fs::read_to_string(path)?;
+    serde_json::from_str(&serialized)
+        .map_err(InternalError::from)
+        .map_err(Error::from)
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_ensure_state_matches<T: PartialEq>(
+    expected: &T,
+    actual: &T,
+    state_name: &str,
+) -> Result<(), Error> {
+    if expected != actual {
+        return Err(swap_invalid(format!(
+            "swap {state_name} does not match local state"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_consignment_path(base_dir: &Path, asset_id: &str) -> PathBuf {
+    let sanitized = asset_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let asset_id_hash = hash_bytes_hex(asset_id.as_bytes());
+    base_dir.join(format!(
+        "consignment-{sanitized}-{}.rgb",
+        &asset_id_hash[..16]
+    ))
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_history_recipient_id(swap_id: &str, asset_id: &str) -> String {
+    let asset_id_hash = hash_bytes_hex(asset_id.as_bytes());
+    format!("swap-history-{swap_id}-{}", &asset_id_hash[..16])
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_proxy_transport_endpoint(proxy_url: &str) -> Result<String, Error> {
+    let endpoint = if let Some(rest) = proxy_url.strip_prefix("http://") {
+        format!("rpc://{rest}")
+    } else if let Some(rest) = proxy_url.strip_prefix("https://") {
+        format!("rpcs://{rest}")
+    } else {
+        proxy_url.to_string()
+    };
+    let transport = RgbTransport::from_str(&endpoint)?;
+    TransportEndpoint::try_from(transport)?;
+    Ok(endpoint)
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_validate_proxy_url(proxy_url: &Option<String>) -> Result<(), Error> {
+    let proxy_url = proxy_url
+        .as_deref()
+        .ok_or_else(|| Error::InvalidTransportEndpoints {
+            details: s!("on-chain RGB swaps require a proxy URL"),
+        })?;
+    swap_proxy_transport_endpoint(proxy_url)?;
+    Ok(())
+}
+
+/// Build the coloring for a swap RGB leg: `leg.amount` goes to `recipient_vout` and everything
+/// else the inputs carry (`available`, per contract) goes back to `change_vout`. Vouts are final
+/// PSBT indices; the returned flag tells whether the map was shifted for an OP_RETURN-first PSBT.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_rgb_leg_coloring_info(
+    leg: &OnchainSwapLeg,
+    psbt: &Psbt,
+    recipient_vout: u32,
+    change_vout: Option<u32>,
+    blinding: u64,
+    available: &BTreeMap<ContractId, u64>,
+) -> Result<(ContractId, rust_only::ColoringInfo, bool), Error> {
+    let asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
+    let contract_id = ContractId::from_str(&asset_id)
+        .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
+    let outputs = &psbt.unsigned_tx.output;
+    let shift = outputs
+        .first()
+        .is_some_and(|o| o.script_pubkey.is_op_return())
+        && outputs.iter().any(|o| o.script_pubkey.is_p2tr());
+    let map_key = |vout: u32| -> Result<u32, Error> {
+        let output = outputs
+            .get(vout as usize)
+            .ok_or_else(|| swap_invalid(format!("swap vout {vout} does not exist in the PSBT")))?;
+        if output.script_pubkey.is_op_return() {
+            return Err(swap_invalid(format!(
+                "swap vout {vout} is the OP_RETURN output"
+            )));
+        }
+        vout.checked_sub(u32::from(shift))
+            .ok_or_else(|| swap_invalid("invalid RGB swap vout"))
+    };
+    let swap_available = available.get(&contract_id).copied().unwrap_or(0);
+    if swap_available < leg.amount {
+        return Err(swap_invalid(format!(
+            "swap inputs carry {swap_available} of {asset_id}, {} required",
+            leg.amount
+        )));
+    }
+    let mut asset_info_map = HashMap::new();
+    for (cid, amount) in available {
+        let mut output_map = HashMap::new();
+        let change = if *cid == contract_id {
+            output_map.insert(map_key(recipient_vout)?, leg.amount);
+            amount - leg.amount
+        } else {
+            *amount
+        };
+        if change > 0 {
+            let change_vout = change_vout.ok_or_else(|| {
+                swap_invalid("swap inputs carry RGB change but the swap has no change output")
+            })?;
+            if change_vout == recipient_vout {
+                return Err(swap_invalid("swap change vout is the recipient vout"));
+            }
+            output_map.insert(map_key(change_vout)?, change);
+        }
+        asset_info_map.insert(
+            *cid,
+            rust_only::AssetColoringInfo {
+                output_map,
+                static_blinding: (*cid == contract_id).then_some(blinding),
+            },
+        );
+    }
+    let coloring_info = rust_only::ColoringInfo {
+        asset_info_map,
+        static_blinding: Some(blinding),
+        nonce: None,
+    };
+    Ok((contract_id, coloring_info, shift))
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_side_btc_payment(leg: &OnchainSwapLeg) -> u64 {
+    if matches!(leg.kind, OnchainSwapLegKind::Btc) {
+        leg.amount
+    } else {
+        0
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_side_rgb_output_cost(receives: &OnchainSwapLeg, rgb_output_sat: u64) -> u64 {
+    if matches!(receives.kind, OnchainSwapLegKind::Rgb) {
+        rgb_output_sat
+    } else {
+        0
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_append_side_change(
+    outputs: &mut Vec<TxOut>,
+    inputs: &[OnchainSwapInput],
+    gives: &OnchainSwapLeg,
+    receives: &OnchainSwapLeg,
+    rgb_output_sat: u64,
+    fee_sat: u64,
+    change_script_hex: &str,
+) -> Result<(), Error> {
+    let input_total = swap_selected_inputs_total(inputs);
+    let required = swap_side_btc_payment(gives)
+        .checked_add(swap_side_rgb_output_cost(receives, rgb_output_sat))
+        .and_then(|v| v.checked_add(fee_sat))
+        .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+    if input_total < required {
+        return Err(Error::InsufficientBitcoins {
+            needed: required,
+            available: input_total,
+        });
+    }
+    let change = input_total - required;
+    if change == 0 {
+        return Ok(());
+    }
+    let script_pubkey = swap_parse_script(change_script_hex)?;
+    // Change below the script's dust limit would make the swap non-standard, so it goes to the
+    // fee. Maker and taker both build the transaction here, so they agree on leaving it out. A
+    // side whose RGB change needs this output then fails to color, before anyone signs.
+    if change < script_pubkey.minimal_non_dust().to_sat() {
+        return Ok(());
+    }
+    outputs.push(TxOut {
+        value: BdkAmount::from_sat(change),
+        script_pubkey,
+    });
+    Ok(())
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_build_psbt(
+    proposal: &OnchainSwapProposal,
+) -> Result<(Psbt, Option<u32>, Option<u32>), Error> {
+    let offer = &proposal.request.offer;
+    let maker_inputs = &proposal.maker_inputs;
+    let taker_inputs = &proposal.request.taker_inputs;
+    let maker_gives = &offer.maker_gives;
+    let maker_receives = &offer.maker_receives;
+    let taker_gives = maker_receives;
+    let taker_receives = maker_gives;
+
+    let mut tx_inputs = vec![];
+    for input in maker_inputs.iter().chain(taker_inputs.iter()) {
+        tx_inputs.push(TxIn {
+            previous_output: swap_input_to_outpoint(input),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        });
+    }
+
+    let mut outputs = vec![TxOut {
+        value: BdkAmount::ZERO,
+        script_pubkey: ScriptBuf::new_op_return([]),
+    }];
+    let mut maker_rgb_vout = None;
+    let mut taker_rgb_vout = None;
+
+    if matches!(maker_receives.kind, OnchainSwapLegKind::Btc) {
+        let address = offer
+            .maker_btc_address
+            .as_ref()
+            .ok_or_else(|| swap_invalid("missing maker BTC receive address"))?;
+        outputs.push(TxOut {
+            value: BdkAmount::from_sat(maker_receives.amount),
+            script_pubkey: parse_address_str(address, offer.bitcoin_network)?.script_pubkey(),
+        });
+    }
+    if matches!(taker_receives.kind, OnchainSwapLegKind::Btc) {
+        let address = proposal
+            .request
+            .taker_btc_address
+            .as_ref()
+            .ok_or_else(|| swap_invalid("missing taker BTC receive address"))?;
+        outputs.push(TxOut {
+            value: BdkAmount::from_sat(taker_receives.amount),
+            script_pubkey: parse_address_str(address, offer.bitcoin_network)?.script_pubkey(),
+        });
+    }
+    if matches!(maker_receives.kind, OnchainSwapLegKind::Rgb) {
+        maker_rgb_vout = Some(outputs.len() as u32);
+        outputs.push(TxOut {
+            value: BdkAmount::from_sat(offer.rgb_output_sat),
+            script_pubkey: swap_parse_script(
+                offer
+                    .maker_rgb_script_pubkey_hex
+                    .as_ref()
+                    .ok_or_else(|| swap_invalid("missing maker RGB receive script"))?,
+            )?,
+        });
+    }
+    if matches!(taker_receives.kind, OnchainSwapLegKind::Rgb) {
+        taker_rgb_vout = Some(outputs.len() as u32);
+        outputs.push(TxOut {
+            value: BdkAmount::from_sat(offer.rgb_output_sat),
+            script_pubkey: swap_parse_script(
+                proposal
+                    .request
+                    .taker_rgb_script_pubkey_hex
+                    .as_ref()
+                    .ok_or_else(|| swap_invalid("missing taker RGB receive script"))?,
+            )?,
+        });
+    }
+
+    if offer.platform_fee_sat > 0 {
+        outputs.push(TxOut {
+            value: BdkAmount::from_sat(offer.platform_fee_sat),
+            script_pubkey: swap_parse_script(
+                offer
+                    .fee_recipient_script_pubkey_hex
+                    .as_ref()
+                    .ok_or_else(|| swap_invalid("missing fee recipient script"))?,
+            )?,
+        });
+    }
+
+    // The taker funds the network fee and the platform fee, same convention as
+    // rgb-onchain-swaps-atomic's earlier PSBT-level design: the platform fee is charged
+    // alongside the miner fee, both funded by whoever is buying/taking the offer.
+    let taker_fee_sat = offer
+        .network_fee_sat
+        .checked_add(offer.platform_fee_sat)
+        .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+    swap_append_side_change(
+        &mut outputs,
+        maker_inputs,
+        maker_gives,
+        maker_receives,
+        offer.rgb_output_sat,
+        0,
+        &proposal.maker_change_script_pubkey_hex,
+    )?;
+    swap_append_side_change(
+        &mut outputs,
+        taker_inputs,
+        taker_gives,
+        taker_receives,
+        offer.rgb_output_sat,
+        taker_fee_sat,
+        &proposal.request.taker_change_script_pubkey_hex,
+    )?;
+
+    let mut psbt = Psbt::from_unsigned_tx(BdkTransaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: tx_inputs,
+        output: outputs,
+    })
+    .map_err(|e| Error::InvalidPsbt {
+        details: e.to_string(),
+    })?;
+    let all_inputs = maker_inputs
+        .iter()
+        .chain(taker_inputs.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    swap_restore_input_metadata(&mut psbt, &all_inputs)?;
+    Ok((psbt, maker_rgb_vout, taker_rgb_vout))
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_restore_input_metadata(
+    psbt: &mut Psbt,
+    inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    for (idx, input) in inputs.iter().enumerate() {
+        let psbt_input = psbt
+            .inputs
+            .get_mut(idx)
+            .ok_or_else(|| swap_invalid("PSBT input metadata mismatch"))?;
+        psbt_input.witness_utxo = Some(swap_input_txout(input)?);
+    }
+    Ok(())
+}
+
+/// After signing, make sure this wallet added signatures only to the inputs it declared. A
+/// counterparty that smuggles one of this wallet's coins into the PSBT as its own input would
+/// otherwise have it spent. Signatures the counterparty already put on its own inputs stay.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_ensure_only_own_inputs_signed(
+    before: &Psbt,
+    after: &Psbt,
+    own_inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    let own = own_inputs
+        .iter()
+        .map(swap_input_to_outpoint)
+        .collect::<HashSet<_>>();
+    for ((txin, was), now) in after
+        .unsigned_tx
+        .input
+        .iter()
+        .zip(before.inputs.iter())
+        .zip(after.inputs.iter())
+    {
+        if own.contains(&txin.previous_output) {
+            continue;
+        }
+        if was.partial_sigs != now.partial_sigs
+            || was.final_script_sig != now.final_script_sig
+            || was.final_script_witness != now.final_script_witness
+            || was.tap_key_sig != now.tap_key_sig
+            || was.tap_script_sigs != now.tap_script_sigs
+        {
+            return Err(swap_invalid(format!(
+                "signing the swap PSBT would sign {}, which is not one of this wallet's inputs",
+                txin.previous_output
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_validate_proposal_psbt(
+    proposal: &OnchainSwapProposal,
+    psbt: &Psbt,
+) -> Result<(), Error> {
+    let (expected_psbt, _, _) = swap_build_psbt(proposal)?;
+    let actual_tx = &psbt.unsigned_tx;
+    let expected_tx = &expected_psbt.unsigned_tx;
+
+    if actual_tx.version != expected_tx.version || actual_tx.lock_time != expected_tx.lock_time {
+        return Err(swap_invalid("swap PSBT transaction header mismatch"));
+    }
+    if actual_tx.input != expected_tx.input {
+        return Err(swap_invalid("swap PSBT inputs mismatch"));
+    }
+    if actual_tx.output.len() != expected_tx.output.len() {
+        return Err(swap_invalid("swap PSBT output count mismatch"));
+    }
+    if psbt.inputs.len() != expected_psbt.inputs.len() {
+        return Err(swap_invalid("swap PSBT input metadata count mismatch"));
+    }
+    for (idx, (actual, expected)) in psbt
+        .inputs
+        .iter()
+        .zip(expected_psbt.inputs.iter())
+        .enumerate()
+    {
+        if actual.witness_utxo != expected.witness_utxo {
+            return Err(swap_invalid(format!(
+                "swap PSBT input {idx} metadata mismatch"
+            )));
+        }
+    }
+    if actual_tx
+        .output
+        .first()
+        .is_none_or(|o| o.value != BdkAmount::ZERO || !o.script_pubkey.is_op_return())
+    {
+        return Err(swap_invalid("swap PSBT missing RGB OP_RETURN host"));
+    }
+    for (idx, (actual, expected)) in actual_tx
+        .output
+        .iter()
+        .zip(expected_tx.output.iter())
+        .enumerate()
+        .skip(1)
+    {
+        if actual != expected {
+            return Err(swap_invalid(format!("swap PSBT output {idx} mismatch")));
+        }
+    }
+    Ok(())
 }
 
 /// Offline operations for a wallet.

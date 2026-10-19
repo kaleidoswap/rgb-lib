@@ -3,6 +3,14 @@
 //! This module defines additional utility methods that are not exposed via FFI.
 
 use super::*;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use amplify::num::u5;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use rgbstd::{
+    containers::SealWitness,
+    opret::OpretProof,
+    rgbcore::commit_verify::mpc::{self, MPC_MINIMAL_DEPTH},
+};
 
 /// Marker left in the transfer dir once a prepared fascia has been consumed into the RGB stash,
 /// until the related SQL update is committed.
@@ -1072,6 +1080,113 @@ impl Wallet {
         info!(self.logger(), "Color PSBT prepare-consume completed");
         runtime.persist()?;
         Ok(result)
+    }
+
+    /// Stage coloring spending only `prev_outputs`, requiring every allocation they carry to be
+    /// reassigned (no implicit burn): inputs carrying contracts absent from `coloring_info` or
+    /// non-asset rights are rejected, as is an `output_map` that does not re-assign the full input
+    /// amount of each contract.
+    pub(crate) fn color_psbt_stage_for_inputs(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        prev_outputs: HashSet<OutPoint>,
+    ) -> Result<AssetBeneficiariesMap, Error> {
+        let runtime = self.rgb_runtime()?;
+        // checked before `prepare_psbt_for_coloring`, which would otherwise insert an OP_RETURN
+        // into the caller's PSBT on the way to failing
+        self.reject_uncolored_input_contracts(&runtime, &prev_outputs, &coloring_info)?;
+        let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
+        self.color_psbt_stage_runtime(
+            &runtime,
+            psbt,
+            coloring_info,
+            prev_outputs,
+            true,
+            shift_output_map_for_opreturn_first,
+        )
+    }
+
+    /// Reconstruct an RGB fascia from a PSBT whose RGB commitment has already been finalized
+    /// (e.g. by a counterparty, with [`Self::color_psbt_finalize`]).
+    pub(crate) fn fascia_from_finalized_psbt(&self, psbt: &Psbt) -> Result<Fascia, Error> {
+        let bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
+        let output = psbt
+            .outputs
+            .iter()
+            .find(|output| output.mpc_message_map().is_ok())
+            .ok_or_else(|| Error::InvalidColoringInfo {
+                details: s!("PSBT has no RGB MPC message host"),
+            })?;
+        let messages = output.mpc_message_map().map_err(InternalError::from)?;
+        let min_depth = output
+            .mpc_min_tree_depth()
+            .map(u5::with)
+            .unwrap_or(MPC_MINIMAL_DEPTH);
+        let source = mpc::MultiSource {
+            min_depth,
+            messages,
+            static_entropy: output.mpc_entropy(),
+        };
+        let merkle_tree =
+            mpc::MerkleTree::try_commit(&source).map_err(|e| Error::InvalidColoringInfo {
+                details: format!("failed to reconstruct RGB MPC proof: {e}"),
+            })?;
+        let merkle_block = mpc::MerkleBlock::from(merkle_tree);
+        let bundles = Confined::try_from(bundles).map_err(|_| Error::InvalidColoringInfo {
+            details: s!("PSBT has no RGB bundles"),
+        })?;
+        let seal_witness = SealWitness::new(
+            PubWitness::with(psbt.unsigned_tx.clone()),
+            merkle_block,
+            OpretProof::default().into(),
+        );
+        Ok(Fascia::new(seal_witness, bundles))
+    }
+
+    /// Record a colored PSBT as a [`TransferStatus::Initiated`] outgoing batch inside `txn`
+    /// without touching the RGB stash, writing the color-prepare recovery files first. The fascia
+    /// is applied later by [`Self::consume_transfer_fascia`], once the TX is known.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_consume_txn(
+        &self,
+        txn: &DbTxn,
+        psbt: &Psbt,
+        fascia: &Fascia,
+        coloring_info: &ColoringInfo,
+        prev_outputs: &HashSet<OutPoint>,
+        shift_output_map_for_opreturn_first: bool,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<i32, Error> {
+        let runtime = self.rgb_runtime()?;
+        let mut spent: HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>> = HashMap::new();
+        for contract_id in coloring_info.asset_info_map.keys() {
+            let by_outpoint = spent.entry(*contract_id).or_default();
+            for (explicit_seal, opout_state_map) in
+                runtime.contract_assignments_for(*contract_id, prev_outputs.iter().copied())?
+            {
+                for (opout, state) in opout_state_map {
+                    by_outpoint
+                        .entry(explicit_seal.to_outpoint())
+                        .or_default()
+                        .push(Assignment::from_opout_and_state(opout, &state));
+                }
+            }
+        }
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        self.write_color_prepare_files(psbt, &txid, fascia, true)?;
+        self.persist_color_prepare_batch_txn(
+            txn,
+            psbt,
+            &txid,
+            &spent,
+            coloring_info,
+            shift_output_map_for_opreturn_first,
+            min_confirmations,
+            expiration_timestamp,
+            &runtime,
+        )
     }
 
     /// Apply a fascia previously prepared by [`Self::color_psbt_and_prepare_consume`] into the RGB
