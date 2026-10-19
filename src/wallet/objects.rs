@@ -2034,7 +2034,7 @@ pub struct OnchainSwapRequest {
     pub taker_rgb_script_pubkey_hex: Option<String>,
     /// Taker RGB receive blinding, present if taker receives RGB
     pub taker_rgb_blinding: Option<u64>,
-    /// Taker BTC/RGB change script pubkey
+    /// Taker change script pubkey (colored keychain only when it carries RGB change)
     pub taker_change_script_pubkey_hex: String,
 }
 
@@ -2047,7 +2047,7 @@ pub struct OnchainSwapProposal {
     pub request: OnchainSwapRequest,
     /// Maker inputs serialized for coordinated PSBT construction
     pub maker_inputs: Vec<OnchainSwapInput>,
-    /// Maker BTC/RGB change script pubkey
+    /// Maker change script pubkey (colored keychain only when it carries RGB change)
     pub maker_change_script_pubkey_hex: String,
     /// PSBT after maker-side processing
     pub psbt: String,
