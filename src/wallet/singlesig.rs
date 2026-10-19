@@ -1639,7 +1639,7 @@ impl Wallet {
         }
         let taker_gives = offer.maker_receives.clone();
         let taker_receives = offer.maker_gives.clone();
-        let taker_inputs = swap_select_inputs(
+        let (taker_inputs, taker_change_keychain) = swap_select_inputs(
             self,
             &txn,
             online,
@@ -1684,12 +1684,7 @@ impl Wallet {
                 Some(blinding),
             )
         };
-        // RGB change is carried to the change output, which must then be colored
-        let taker_change_keychain = if matches!(taker_gives.kind, OnchainSwapLegKind::Rgb) {
-            KeychainKind::External
-        } else {
-            KeychainKind::Internal
-        };
+        // the change is colored only when it has to carry RGB change, else it stays vanilla
         let taker_change_script_pubkey_hex = self
             .get_new_addresses(taker_change_keychain, 1)?
             .script_pubkey()
@@ -1758,7 +1753,7 @@ impl Wallet {
             &offer.maker_rgb_script_pubkey_hex,
             &offer.maker_rgb_blinding,
         )?;
-        let maker_inputs = swap_select_inputs(
+        let (maker_inputs, maker_change_keychain) = swap_select_inputs(
             self,
             &txn,
             online,
@@ -1768,11 +1763,7 @@ impl Wallet {
             skip_sync,
             &exclude_outpoints,
         )?;
-        let maker_change_keychain = if matches!(offer.maker_gives.kind, OnchainSwapLegKind::Rgb) {
-            KeychainKind::External
-        } else {
-            KeychainKind::Internal
-        };
+        // the change is colored only when it has to carry RGB change, else it stays vanilla
         let maker_change_script_pubkey_hex = self
             .get_new_addresses(maker_change_keychain, 1)?
             .script_pubkey()
