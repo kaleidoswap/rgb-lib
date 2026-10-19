@@ -19,6 +19,15 @@ pub enum Error {
         asset_id: String,
     },
 
+    /// An outgoing batch already exists for the transaction.
+    #[error("Batch transfer {idx} already exists for {txid}")]
+    BatchTransferAlreadyExists {
+        /// Transaction identifier.
+        txid: String,
+        /// Existing batch index.
+        idx: i32,
+    },
+
     /// The requested batch transfer was not found
     #[error("Batch transfer with idx {idx} not found")]
     BatchTransferNotFound {
