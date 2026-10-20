@@ -20,7 +20,7 @@ use super::online::{
     swap_fetch_consignment_to_file, swap_finalize_psbt, swap_finalize_psbt_required,
     swap_import_asset_history, swap_input_rgb_amounts, swap_prepare_rgb_leg, swap_select_inputs,
     swap_sign_psbt, swap_stage_rgb_leg, swap_validate_fascia_received_leg,
-    swap_validate_received_swap_leg,
+    swap_validate_received_swap_leg, swap_validate_received_transfer,
 };
 use super::*;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -1584,6 +1584,7 @@ impl Wallet {
             maker_history = swap_emit_asset_history(
                 self,
                 &offer.maker_gives,
+                &proposal.maker_inputs,
                 offer.proxy_url.as_deref(),
                 &offer.swap_id,
             )?;
@@ -1763,10 +1764,11 @@ impl Wallet {
                     .maker_history
                     .as_ref()
                     .ok_or_else(|| swap_invalid("missing maker asset history"))?;
-                swap_import_asset_history(self, &txn, maker_history)?;
+                swap_import_asset_history(self, &txn, maker_history, &offer.maker_gives)?;
                 taker_history = swap_emit_asset_history(
                     self,
                     &offer.maker_receives,
+                    &proposal.request.taker_inputs,
                     offer.proxy_url.as_deref(),
                     &offer.swap_id,
                 )?;
@@ -1784,6 +1786,39 @@ impl Wallet {
                     &offer.maker_gives,
                     taker_recv_vout,
                     taker_recv_blinding,
+                )?;
+                // with the maker's history in the stash, the consignment of the received leg can
+                // be rebuilt from the committed PSBT and validated in full before signing
+                let taker_recv_recipient_id = proposal
+                    .request
+                    .taker_rgb_recipient_id
+                    .as_deref()
+                    .ok_or_else(|| swap_invalid("missing taker RGB recipient ID"))?;
+                let maker_contract_id = ContractId::from_str(
+                    offer
+                        .maker_gives
+                        .asset_id
+                        .as_deref()
+                        .expect("RGB leg has asset ID"),
+                )
+                .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
+                let received = self.generate_transfer(
+                    maker_contract_id,
+                    vec![BuilderSeal::Revealed(GraphSeal::with_blinded_vout(
+                        taker_recv_vout,
+                        taker_recv_blinding,
+                    ))],
+                    psbt.get_txid(),
+                    &fascia,
+                )?;
+                swap_validate_received_transfer(
+                    self,
+                    received,
+                    &offer.maker_gives,
+                    psbt.unsigned_tx.compute_txid().to_string(),
+                    taker_recv_vout,
+                    taker_recv_blinding,
+                    taker_recv_recipient_id,
                 )?;
                 let (leg_consignments, leg_outgoing) = swap_prepare_rgb_leg(
                     &txn,
@@ -1988,7 +2023,7 @@ impl Wallet {
                     .taker_history
                     .as_ref()
                     .ok_or_else(|| swap_invalid("missing taker asset history"))?;
-                swap_import_asset_history(self, &txn, taker_history)?;
+                swap_import_asset_history(self, &txn, taker_history, &offer.maker_receives)?;
                 // the taker finalizes the commitment: the maker's staged transitions must be
                 // committed unchanged
                 let staged_bundles = Psbt::from_str(&local_proposal.psbt)?
