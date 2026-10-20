@@ -1818,7 +1818,11 @@ pub struct OnchainSwapConsignment {
     pub recipient_id: String,
 }
 
-/// Asset history needed by a counterparty to validate/import an RGB asset before a swap step.
+/// History of the RGB allocations a swap party gives, posted to the proxy for the counterparty.
+///
+/// It is a transfer consignment exported from the giver's stash, leading from genesis to the
+/// allocations on the giver's declared inputs. The counterparty validates it and imports it into
+/// its stash before signing.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]

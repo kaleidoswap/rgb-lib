@@ -2974,6 +2974,18 @@ pub(crate) fn swap_ensure_state_matches<T: PartialEq>(
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) fn swap_consignment_path(base_dir: &Path, asset_id: &str) -> PathBuf {
+    swap_asset_file_path(base_dir, "consignment", asset_id)
+}
+
+/// Path of the asset history a swap giver exports, kept apart from the transfer consignment of
+/// the same asset, which shares the swap directory.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn swap_history_path(base_dir: &Path, asset_id: &str) -> PathBuf {
+    swap_asset_file_path(base_dir, "history", asset_id)
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn swap_asset_file_path(base_dir: &Path, prefix: &str, asset_id: &str) -> PathBuf {
     let sanitized = asset_id
         .chars()
         .map(|ch| {
@@ -2985,10 +2997,7 @@ pub(crate) fn swap_consignment_path(base_dir: &Path, asset_id: &str) -> PathBuf 
         })
         .collect::<String>();
     let asset_id_hash = hash_bytes_hex(asset_id.as_bytes());
-    base_dir.join(format!(
-        "consignment-{sanitized}-{}.rgb",
-        &asset_id_hash[..16]
-    ))
+    base_dir.join(format!("{prefix}-{sanitized}-{}.rgb", &asset_id_hash[..16]))
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]

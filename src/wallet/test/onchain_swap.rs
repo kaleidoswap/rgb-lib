@@ -507,6 +507,134 @@ fn maker_taker_rgb_for_rgb_balances() {
 
 #[test]
 #[parallel]
+fn maker_gives_received_asset_for_btc() {
+    initialize();
+
+    let (maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (mut taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let mut issuer = get_funded_party!();
+    // the maker only received the asset: it has no issuance contract file
+    let (mut maker, asset_id) = receive_swap_asset(
+        &mut issuer,
+        maker,
+        maker_online,
+        "SRCB",
+        "Swap Received For BTC",
+        SWAP_RGB_AMOUNT,
+    );
+    let maker_btc_before = total_btc(&mut maker, maker_online);
+    let taker_btc_before = total_btc(&mut taker, taker_online);
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+
+    assert_btc_delta(
+        &mut maker,
+        maker_online,
+        maker_btc_before,
+        &mut taker,
+        taker_online,
+        taker_btc_before,
+        ExpectedBtcDelta {
+            maker: SWAP_BTC_PRICE as i64,
+            taker: -((SWAP_BTC_PRICE + SWAP_FEE) as i64),
+        },
+    );
+    assert_asset_balances(
+        &maker,
+        &taker,
+        &[ExpectedAssetBalance {
+            asset_id: &asset_id,
+            maker: 0,
+            taker: SWAP_RGB_AMOUNT,
+        }],
+    );
+
+    // an asset received through a swap can be given in a swap too
+    refresh_settled(&mut taker, taker_online);
+    execute_swap(
+        &mut taker,
+        taker_online,
+        &mut maker,
+        maker_online,
+        rgb(&asset_id, SWAP_RGB_AMOUNT),
+        btc(SWAP_BTC_PRICE),
+        PROXY_URL,
+    );
+    assert_asset_balances(
+        &taker,
+        &maker,
+        &[ExpectedAssetBalance {
+            asset_id: &asset_id,
+            maker: 0,
+            taker: SWAP_RGB_AMOUNT,
+        }],
+    );
+}
+
+#[test]
+#[parallel]
+fn maker_and_taker_give_received_assets_rgb_for_rgb() {
+    initialize();
+
+    let (maker, maker_online) = get_funded_noutxo_wallet(true, None);
+    let (taker, taker_online) = get_funded_noutxo_wallet(true, None);
+    let mut issuer = get_funded_party!();
+    // neither party issued the asset it gives
+    let (mut maker, maker_asset_id) = receive_swap_asset(
+        &mut issuer,
+        maker,
+        maker_online,
+        "SRRA",
+        "Swap Received Maker Asset",
+        SWAP_RGB_AMOUNT,
+    );
+    let (mut taker, taker_asset_id) = receive_swap_asset(
+        &mut issuer,
+        taker,
+        taker_online,
+        "SRRB",
+        "Swap Received Taker Asset",
+        SWAP_RGB_AMOUNT,
+    );
+
+    execute_swap(
+        &mut maker,
+        maker_online,
+        &mut taker,
+        taker_online,
+        rgb(&maker_asset_id, SWAP_RGB_AMOUNT),
+        rgb(&taker_asset_id, SWAP_RGB_AMOUNT),
+        PROXY_URL,
+    );
+
+    assert_asset_balances(
+        &maker,
+        &taker,
+        &[
+            ExpectedAssetBalance {
+                asset_id: &maker_asset_id,
+                maker: 0,
+                taker: SWAP_RGB_AMOUNT,
+            },
+            ExpectedAssetBalance {
+                asset_id: &taker_asset_id,
+                maker: SWAP_RGB_AMOUNT,
+                taker: 0,
+            },
+        ],
+    );
+}
+
+#[test]
+#[parallel]
 fn maker_rejects_request_with_mutated_offer() {
     initialize();
 
@@ -2925,6 +3053,30 @@ fn issue_swap_asset(
         .unwrap();
     assert_eq!(asset_amount(wallet, &asset.asset_id), amount);
     asset.asset_id
+}
+
+/// Issue an asset from `issuer` and send `amount` of it to `wallet` with a normal transfer, so
+/// that `wallet` holds it without having issued it.
+fn receive_swap_asset(
+    issuer: &mut SinglesigParty,
+    mut wallet: Wallet,
+    online: Online,
+    ticker: &str,
+    name: &str,
+    amount: u64,
+) -> (Wallet, String) {
+    let asset_id = issuer
+        .wallet
+        .issue_asset_nia(ticker.to_string(), name.to_string(), 0, vec![amount])
+        .unwrap()
+        .asset_id;
+    wallet
+        .create_utxos(online, false, Some(1), Some(10_000), FEE_RATE, false)
+        .unwrap();
+    let mut rcv = party!(wallet, online);
+    normal_send(issuer, &mut rcv, &asset_id, amount);
+    assert_eq!(asset_amount(&rcv.wallet, &asset_id), amount);
+    (rcv.wallet, asset_id)
 }
 
 /// Like [`issue_swap_asset`], on a colored UTXO of the default size, whose sats can't cover the

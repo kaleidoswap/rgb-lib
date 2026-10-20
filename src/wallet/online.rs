@@ -4,9 +4,9 @@
 
 use super::offline::{
     SwapOutgoingState, swap_build_input, swap_consignment_dir, swap_consignment_path,
-    swap_ensure_only_own_inputs_signed, swap_history_recipient_id, swap_input_to_outpoint,
-    swap_invalid, swap_parse_script, swap_proxy_transport_endpoint, swap_rgb_leg_coloring_info,
-    swap_selected_inputs_total,
+    swap_ensure_only_own_inputs_signed, swap_history_path, swap_history_recipient_id,
+    swap_input_to_outpoint, swap_invalid, swap_parse_script, swap_proxy_transport_endpoint,
+    swap_rgb_leg_coloring_info, swap_selected_inputs_total,
 };
 use super::*;
 
@@ -4294,9 +4294,15 @@ pub(crate) fn swap_emit_consignments(
     Ok(consignments)
 }
 
+/// Export from the stash the history of the allocations of the leg's asset on `inputs` (the
+/// giver's declared inputs) and post it to the proxy, for the receiver to validate before it signs.
+///
+/// The history is a transfer consignment without terminals: its bundles lead from genesis to the
+/// allocations on `inputs`, so it works for any holder of the asset, not only its issuer.
 pub(crate) fn swap_emit_asset_history(
     wallet: &Wallet,
     leg: &OnchainSwapLeg,
+    inputs: &[OnchainSwapInput],
     proxy_url: Option<&str>,
     swap_id: &str,
 ) -> Result<Option<OnchainSwapAssetHistory>, Error> {
@@ -4304,13 +4310,25 @@ pub(crate) fn swap_emit_asset_history(
         return Ok(None);
     }
     let asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
-    let path = wallet.wallet_dir().join(ASSETS_DIR).join(&asset_id);
-    if !path.exists() {
-        return Err(swap_invalid(format!(
-            "swap asset history not found at {}",
-            path.display()
-        )));
-    }
+    let contract_id = ContractId::from_str(&asset_id)
+        .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
+    let history = {
+        let runtime = wallet.rgb_runtime()?;
+        let outputs = runtime
+            .contract_assignments_for(contract_id, inputs.iter().map(swap_input_to_outpoint))?
+            .into_keys()
+            .collect::<Vec<_>>();
+        if outputs.is_empty() {
+            return Err(swap_invalid(format!(
+                "swap inputs carry no allocation of {asset_id}"
+            )));
+        }
+        runtime.transfer(contract_id, outputs, [], None)?
+    };
+    let base_dir = swap_consignment_dir(wallet.wallet_dir(), swap_id);
+    fs::create_dir_all(&base_dir)?;
+    let path = swap_history_path(&base_dir, &asset_id);
+    history.save_file(&path)?;
     let endpoint = proxy_url.map(swap_proxy_transport_endpoint).transpose()?;
     let recipient_id = swap_history_recipient_id(swap_id, &asset_id);
     if let Some(proxy_url) = proxy_url {
@@ -4510,9 +4528,26 @@ pub(crate) fn swap_validate_received_transfer_from_file(
     if !matches!(leg.kind, OnchainSwapLegKind::Rgb) {
         return Ok(vec![]);
     }
+    let consignment = RgbTransfer::load_file(consignment_path).map_err(InternalError::from)?;
+    swap_validate_received_transfer(wallet, consignment, leg, txid, vout, blinding, recipient_id)
+}
+
+/// Validate the transfer consignment of a received swap leg, whose witness transaction may not be
+/// broadcast yet, and return the assignments it gives to `vout`.
+pub(crate) fn swap_validate_received_transfer(
+    wallet: &mut Wallet,
+    consignment: RgbTransfer,
+    leg: &OnchainSwapLeg,
+    txid: String,
+    vout: u32,
+    blinding: u64,
+    recipient_id: &str,
+) -> Result<Vec<Assignment>, Error> {
+    if !matches!(leg.kind, OnchainSwapLegKind::Rgb) {
+        return Ok(vec![]);
+    }
     let expected_asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
     let witness_id = RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;
-    let consignment = RgbTransfer::load_file(consignment_path).map_err(InternalError::from)?;
     let contract_id = consignment.contract_id();
     let asset_id = contract_id.to_string();
     if asset_id != expected_asset_id {
@@ -4680,62 +4715,72 @@ pub(crate) fn swap_finalize_psbt(wallet: &Wallet, psbt: &Psbt) -> Result<Option<
 
 // ─── On-chain swap: private helpers (concrete Wallet) ────────────────────────
 
-pub(crate) fn swap_import_contract(
+/// Fetch the counterparty's history of the asset of `leg`, validate it and accept it into the
+/// stash, so that this wallet knows the contract and the allocations the counterparty spends.
+pub(crate) fn swap_import_asset_history(
     wallet: &Wallet,
     txn: &DbTxn,
-    contract_path_str: &str,
+    history: &OnchainSwapAssetHistory,
+    leg: &OnchainSwapLeg,
 ) -> Result<(), Error> {
-    let contract_path = Path::new(contract_path_str);
-    if !contract_path.exists() {
+    let expected_asset_id = leg.asset_id.as_deref().expect("RGB leg has asset ID");
+    if history.asset_id != expected_asset_id {
         return Err(swap_invalid(format!(
-            "swap contract consignment not found at {}",
-            contract_path.display()
+            "swap asset history asset mismatch: expected {expected_asset_id}, got {}",
+            history.asset_id
         )));
     }
-    let valid_contract = ValidContract::load_file(contract_path).map_err(InternalError::from)?;
-    let contract_id = valid_contract.contract_id();
+    let path = swap_fetch_asset_history_to_file(wallet, history)?;
+    let consignment = RgbTransfer::load_file(&path).map_err(InternalError::from)?;
+    let contract_id = consignment.contract_id();
     let asset_id = contract_id.to_string();
+    if asset_id != expected_asset_id {
+        return Err(swap_invalid(format!(
+            "swap asset history contract mismatch: expected {expected_asset_id}, got {asset_id}"
+        )));
+    }
     info!(
         wallet.logger(),
-        "Importing swap contract {asset_id} from {}",
-        contract_path.display()
+        "Importing swap asset history of {asset_id}"
     );
-    let asset_schema: AssetSchema = valid_contract.schema_id().try_into()?;
+    let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
     wallet.check_schema_support(&asset_schema)?;
-    {
-        let mut runtime = wallet.rgb_runtime()?;
-        if runtime.contract_schema(contract_id).is_err() {
-            runtime.import_contract(valid_contract.clone(), &DumbResolver)?;
-        }
-    }
-    let local_path = wallet.wallet_dir().join(ASSETS_DIR).join(&asset_id);
-    if !local_path.exists() {
-        if let Some(parent) = local_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(contract_path, &local_path)?;
-    }
-    if txn.get_asset(asset_id.clone())?.is_none() {
-        let runtime = wallet.rgb_runtime()?;
+    let validation_config = ValidationConfig {
+        chain_net: wallet.chain_net(),
+        trusted_typesystem: asset_schema.types(),
+        ..Default::default()
+    };
+    let valid_consignment =
+        match consignment.validate(wallet.blockchain_resolver(), &validation_config) {
+            Ok(consignment) => consignment,
+            Err(ValidationError::InvalidConsignment(e)) => {
+                error!(wallet.logger(), "Swap asset history is invalid: {}", e);
+                return Err(Error::InvalidConsignment);
+            }
+            Err(ValidationError::ResolverError(e)) => {
+                warn!(
+                    wallet.logger(),
+                    "Network error during swap asset history validation"
+                );
+                return Err(Error::Network {
+                    details: e.to_string(),
+                });
+            }
+        };
+    let valid_contract = valid_consignment.clone().into_valid_contract();
+    let mut runtime = wallet.rgb_runtime()?;
+    runtime.accept_transfer(valid_consignment.clone(), wallet.blockchain_resolver())?;
+    if txn.get_asset(asset_id)?.is_none() {
         wallet.save_new_asset_internal(
             txn,
             &runtime,
             contract_id,
             asset_schema,
             valid_contract,
-            None,
+            Some(valid_consignment),
         )?;
     }
     Ok(())
-}
-
-pub(crate) fn swap_import_asset_history(
-    wallet: &Wallet,
-    txn: &DbTxn,
-    history: &OnchainSwapAssetHistory,
-) -> Result<(), Error> {
-    let path = swap_fetch_asset_history_to_file(wallet, history)?;
-    swap_import_contract(wallet, txn, &path.to_string_lossy())
 }
 
 pub(crate) fn swap_ensure_inputs_confirmed(
@@ -4940,7 +4985,7 @@ pub(crate) fn swap_fetch_asset_history_to_file(
         .join("swap-history")
         .join(&history.recipient_id);
     fs::create_dir_all(&target_dir)?;
-    let target_path = target_dir.join(&history.asset_id);
+    let target_path = swap_history_path(&target_dir, &history.asset_id);
     fs::write(&target_path, &history_bytes)?;
     Ok(target_path)
 }
