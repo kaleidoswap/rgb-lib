@@ -5,6 +5,8 @@
 use super::*;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use amplify::num::u5;
+use bdk_wallet::bitcoin::psbt::Output as PsbtOutput;
+use rgbstd::TransitionBundle;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use rgbstd::{
     containers::SealWitness,
@@ -20,6 +22,22 @@ pub(crate) const STASH_CONSUMED_FILE: &str = "stash_consumed";
 /// [`Wallet::consume_transfer_fascia`] on the related batch transfer.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 const COLOR_PREPARE_FILE: &str = "color_prepare";
+
+/// Maximum depth of an MPC tree built from, or committed into, a PSBT.
+///
+/// The depth comes from a proprietary PSBT key (or from protocol ID collisions) that whoever built
+/// the PSBT controls, and building a tree of depth `d` walks and allocates `2^d` leaves: unchecked,
+/// depths of 28-31 exhaust CPU or memory, and values above 31 panic in [`u5::with`]. RGB starts
+/// from [`MPC_MINIMAL_DEPTH`] (3) and only goes deeper to place protocol IDs without collisions,
+/// so a few contracts take a depth of 3-6; 16 (65536 leaves) leaves ample room while keeping the
+/// tree cheap to build.
+const MAX_PSBT_MPC_TREE_DEPTH: u8 = 16;
+
+/// Maximum number of MPC messages (one per RGB contract) in a PSBT's MPC tree.
+///
+/// This keeps placing them cheap and, being the birthday bound of a tree at
+/// [`MAX_PSBT_MPC_TREE_DEPTH`], lets them fit within it.
+const MAX_PSBT_MPC_MESSAGES: usize = 1 << (MAX_PSBT_MPC_TREE_DEPTH / 2);
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 fn persist_stash_consumed_marker(path: &Path) -> Result<(), Error> {
@@ -602,31 +620,7 @@ impl Wallet {
         static_blinding: Option<u64>,
     ) -> Result<Fascia, Error> {
         info!(self.logger(), "Finalizing RGB commitment on PSBT...");
-        let opreturn_index = psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .position(|o| o.script_pubkey.is_op_return())
-            .ok_or_else(|| Error::InvalidColoringInfo {
-                details: s!("PSBT has no OP_RETURN output to host the RGB commitment"),
-            })?;
-        let opreturn_output =
-            psbt.outputs
-                .get_mut(opreturn_index)
-                .ok_or_else(|| Error::InvalidPsbt {
-                    details: s!("PSBT outputs do not match its unsigned transaction"),
-                })?;
-        opreturn_output.set_opret_host();
-        if let Some(blinding) = static_blinding {
-            opreturn_output
-                .set_mpc_entropy(blinding)
-                .map_err(InternalError::from)?;
-        }
-
-        psbt.set_rgb_close_method(CloseMethod::OpretFirst);
-        psbt.set_as_unmodifiable();
-        let fascia = psbt.rgb_commit().map_err(InternalError::from)?;
-
+        let fascia = commit_staged_psbt(psbt, static_blinding)?;
         info!(self.logger(), "Finalize RGB commitment completed");
         Ok(fascia)
     }
@@ -1156,38 +1150,7 @@ impl Wallet {
     /// Reconstruct an RGB fascia from a PSBT whose RGB commitment has already been finalized
     /// (e.g. by a counterparty, with [`Self::color_psbt_finalize`]).
     pub(crate) fn fascia_from_finalized_psbt(&self, psbt: &Psbt) -> Result<Fascia, Error> {
-        let bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
-        let output = psbt
-            .outputs
-            .iter()
-            .find(|output| output.mpc_message_map().is_ok())
-            .ok_or_else(|| Error::InvalidColoringInfo {
-                details: s!("PSBT has no RGB MPC message host"),
-            })?;
-        let messages = output.mpc_message_map().map_err(InternalError::from)?;
-        let min_depth = output
-            .mpc_min_tree_depth()
-            .map(u5::with)
-            .unwrap_or(MPC_MINIMAL_DEPTH);
-        let source = mpc::MultiSource {
-            min_depth,
-            messages,
-            static_entropy: output.mpc_entropy(),
-        };
-        let merkle_tree =
-            mpc::MerkleTree::try_commit(&source).map_err(|e| Error::InvalidColoringInfo {
-                details: format!("failed to reconstruct RGB MPC proof: {e}"),
-            })?;
-        let merkle_block = mpc::MerkleBlock::from(merkle_tree);
-        let bundles = Confined::try_from(bundles).map_err(|_| Error::InvalidColoringInfo {
-            details: s!("PSBT has no RGB bundles"),
-        })?;
-        let seal_witness = SealWitness::new(
-            PubWitness::with(psbt.unsigned_tx.clone()),
-            merkle_block,
-            OpretProof::default().into(),
-        );
-        Ok(Fascia::new(seal_witness, bundles))
+        fascia_from_committed_psbt(psbt)
     }
 
     /// Record a colored PSBT as a [`TransferStatus::Initiated`] outgoing batch inside `txn`
@@ -1772,10 +1735,199 @@ impl Wallet {
     }
 }
 
+/// Read the MPC minimum tree depth an untrusted PSBT output carries, within the allowed bounds.
+fn psbt_mpc_min_depth(output: &PsbtOutput) -> Result<u5, Error> {
+    let Some(depth) = output.mpc_min_tree_depth() else {
+        return Ok(MPC_MINIMAL_DEPTH);
+    };
+    u5::try_from(depth)
+        .ok()
+        .filter(|d| d.to_u8() <= MAX_PSBT_MPC_TREE_DEPTH)
+        .ok_or_else(|| Error::InvalidColoringInfo {
+            details: format!(
+                "PSBT MPC tree depth {depth} exceeds the maximum of {MAX_PSBT_MPC_TREE_DEPTH}"
+            ),
+        })
+}
+
+/// Build an MPC tree from untrusted PSBT data, refusing any tree too large to build cheaply.
+///
+/// The returned tree has not been walked yet: computing its commitment or block is bounded too.
+fn bounded_mpc_tree(
+    min_depth: u5,
+    messages: mpc::MessageMap,
+    static_entropy: Option<u64>,
+) -> Result<mpc::MerkleTree, Error> {
+    if messages.len() > MAX_PSBT_MPC_MESSAGES {
+        return Err(Error::InvalidColoringInfo {
+            details: format!(
+                "PSBT has {} MPC messages, more than the maximum of {MAX_PSBT_MPC_MESSAGES}",
+                messages.len()
+            ),
+        });
+    }
+    let source = mpc::MultiSource {
+        min_depth,
+        messages,
+        static_entropy,
+    };
+    let merkle_tree =
+        mpc::MerkleTree::try_commit(&source).map_err(|e| Error::InvalidColoringInfo {
+            details: format!("failed to build RGB MPC tree: {e}"),
+        })?;
+    // placing the messages may have needed a deeper tree than the minimum
+    let depth = merkle_tree.depth().to_u8();
+    if depth > MAX_PSBT_MPC_TREE_DEPTH {
+        return Err(Error::InvalidColoringInfo {
+            details: format!(
+                "PSBT MPC tree depth {depth} exceeds the maximum of {MAX_PSBT_MPC_TREE_DEPTH}"
+            ),
+        });
+    }
+    Ok(merkle_tree)
+}
+
+/// Check that `messages` commit every bundle, under its contract, by its bundle ID.
+///
+/// The bundles and the MPC messages are separate PSBT keys: without this, whoever finalizes a
+/// PSBT can commit another bundle for a contract (e.g. one sending its inputs to them) while the
+/// PSBT still shows the expected one.
+fn check_bundles_committed<'a>(
+    bundles: impl IntoIterator<Item = (&'a ContractId, &'a TransitionBundle)>,
+    messages: &mpc::MessageMap,
+) -> Result<(), Error> {
+    for (contract_id, bundle) in bundles {
+        if messages.get(&ProtocolId::from(*contract_id)) != Some(&Message::from(bundle.bundle_id()))
+        {
+            return Err(Error::InvalidColoringInfo {
+                details: format!("PSBT MPC commitment does not commit the bundle of {contract_id}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Check that `rgb_commit` will build a bounded MPC tree for `psbt`, before it builds it unchecked.
+///
+/// `rgb_commit` writes the MPC messages to the first opret host and commits the first OP_RETURN
+/// output's tree, so this replays that on the PSBT as staged, possibly by a counterparty.
+fn check_psbt_mpc_commit_bounds(psbt: &Psbt, commit_idx: usize) -> Result<(), Error> {
+    // only the committed output's key is read, but a stager has no reason to set one elsewhere
+    for output in &psbt.outputs {
+        psbt_mpc_min_depth(output)?;
+    }
+    // a close method set while staging is kept by `set_rgb_close_method` and picks the output
+    if psbt.rgb_close_method().map_err(InternalError::from)? != Some(CloseMethod::OpretFirst) {
+        return Err(Error::InvalidColoringInfo {
+            details: s!("PSBT RGB close method must be opret"),
+        });
+    }
+    let output = &psbt.outputs[commit_idx];
+    let mut messages = output
+        .mpc_message_map()
+        .map_err(InternalError::from)?
+        .release();
+    if psbt.outputs.iter().position(|o| o.is_opret_host()) == Some(commit_idx) {
+        let bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
+        for (contract_id, bundle) in bundles {
+            messages.insert(
+                ProtocolId::from(contract_id),
+                Message::from(bundle.bundle_id()),
+            );
+        }
+    }
+    let messages = Confined::try_from(messages).map_err(|_| Error::InvalidColoringInfo {
+        details: s!("PSBT has too many MPC messages"),
+    })?;
+    bounded_mpc_tree(psbt_mpc_min_depth(output)?, messages, output.mpc_entropy())?;
+    Ok(())
+}
+
+/// Commit the RGB transitions staged on `psbt` in its first OP_RETURN output.
+fn commit_staged_psbt(psbt: &mut Psbt, static_blinding: Option<u64>) -> Result<Fascia, Error> {
+    let opreturn_index = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .enumerate()
+        .find(|(_, o)| o.script_pubkey.is_op_return())
+        .ok_or_else(|| Error::InvalidColoringInfo {
+            details: s!("PSBT has no OP_RETURN output to host the RGB commitment"),
+        })?
+        .0;
+    let opreturn_output = psbt.outputs.get_mut(opreturn_index).unwrap();
+    opreturn_output.set_opret_host();
+    if let Some(blinding) = static_blinding {
+        opreturn_output
+            .set_mpc_entropy(blinding)
+            .map_err(InternalError::from)?;
+    }
+
+    psbt.set_rgb_close_method(CloseMethod::OpretFirst);
+    psbt.set_as_unmodifiable();
+    check_psbt_mpc_commit_bounds(psbt, opreturn_index)?;
+    let fascia = psbt.rgb_commit().map_err(InternalError::from)?;
+    // the fascia's merkle block is built from the committed output's messages, so check these
+    // carry every bundle: staging may have sent them to another output flagged as opret host
+    let messages = psbt.outputs[opreturn_index]
+        .mpc_message_map()
+        .map_err(InternalError::from)?;
+    check_bundles_committed(fascia.bundles().iter(), &messages)?;
+    Ok(fascia)
+}
+
+/// Rebuild the fascia of a PSBT whose RGB commitment was finalized, possibly by a counterparty.
+fn fascia_from_committed_psbt(psbt: &Psbt) -> Result<Fascia, Error> {
+    let bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
+    // `rgb_commit` commits the MPC messages in the first OP_RETURN, which need not be vout 0.
+    // Its opret host flag is removed on commit, and any other output has an empty (not
+    // missing) message map, so look the output up by its script and check its commitment.
+    let opret_idx = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .position(|o| o.script_pubkey.is_op_return())
+        .ok_or_else(|| Error::InvalidColoringInfo {
+            details: s!("PSBT has no OP_RETURN output hosting the RGB commitment"),
+        })?;
+    let output = psbt
+        .outputs
+        .get(opret_idx)
+        .ok_or_else(|| Error::InvalidColoringInfo {
+            details: s!("PSBT has no map for its OP_RETURN output"),
+        })?;
+    let messages = output.mpc_message_map().map_err(InternalError::from)?;
+    if messages.is_empty() {
+        return Err(Error::InvalidColoringInfo {
+            details: s!("PSBT OP_RETURN output carries no RGB MPC messages"),
+        });
+    }
+    check_bundles_committed(&bundles, &messages)?;
+    let merkle_tree =
+        bounded_mpc_tree(psbt_mpc_min_depth(output)?, messages, output.mpc_entropy())?;
+    let expected_script = ScriptBuf::new_op_return(merkle_tree.commit_id().to_byte_array());
+    if psbt.unsigned_tx.output[opret_idx].script_pubkey != expected_script {
+        return Err(Error::InvalidColoringInfo {
+            details: s!("PSBT OP_RETURN output does not carry its RGB MPC commitment"),
+        });
+    }
+    let merkle_block = mpc::MerkleBlock::from(merkle_tree);
+    let bundles = Confined::try_from(bundles).map_err(|_| Error::InvalidColoringInfo {
+        details: s!("PSBT has no RGB bundles"),
+    })?;
+    let seal_witness = SealWitness::new(
+        PubWitness::with(psbt.unsigned_tx.clone()),
+        merkle_block,
+        OpretProof::default().into(),
+    );
+    Ok(Fascia::new(seal_witness, bundles))
+}
+
 #[cfg(test)]
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 mod tests {
     use super::*;
+    use psrgbt::RgbPropKeyExt;
 
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     #[test]
@@ -1921,5 +2073,178 @@ mod tests {
         assert!(marker.exists());
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A PSBT with an empty OP_RETURN host at vout 0 and one staged (placeholder) RGB transition.
+    fn staged_psbt() -> Psbt {
+        let tx = BdkTransaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn::default()],
+            output: vec![
+                TxOut {
+                    value: BdkAmount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return([]),
+                },
+                TxOut {
+                    value: BdkAmount::from_sat(1_000),
+                    script_pubkey: ScriptBuf::new(),
+                },
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.push_rgb_transition(Transition::strict_dumb()).unwrap();
+        psbt
+    }
+
+    /// Plant the MPC minimum tree depth key, as a counterparty controlling the PSBT can.
+    fn set_mpc_min_depth(psbt: &mut Psbt, vout: usize, depth: u8) {
+        psbt.outputs[vout]
+            .proprietary
+            .insert(ProprietaryKey::mpc_min_tree_depth(), vec![depth]);
+    }
+
+    /// A PSBT committed by an honest finalizer, whose depth key is then rewritten.
+    fn committed_psbt_with_depth(depth: u8) -> Psbt {
+        let mut psbt = staged_psbt();
+        commit_staged_psbt(&mut psbt, Some(7)).unwrap();
+        set_mpc_min_depth(&mut psbt, 0, depth);
+        psbt
+    }
+
+    #[track_caller]
+    fn assert_rejected<T>(result: Result<T, Error>, expected: &str) {
+        match result {
+            Err(Error::InvalidColoringInfo { details }) => {
+                assert!(details.contains(expected), "unexpected error: {details}")
+            }
+            Err(e) => panic!("expected an error containing {expected:?}, got {e:?}"),
+            Ok(_) => panic!("expected an error containing {expected:?}, got Ok"),
+        }
+    }
+
+    #[test]
+    fn fascia_rebuild_rejects_invalid_mpc_depth() {
+        for depth in [32, 255] {
+            let psbt = committed_psbt_with_depth(depth);
+            assert_rejected(fascia_from_committed_psbt(&psbt), "MPC tree depth");
+        }
+    }
+
+    #[test]
+    fn fascia_rebuild_rejects_over_cap_mpc_depth() {
+        // 31 would make the tree 2^31 leaves wide: this must fail fast instead of exhausting memory
+        for depth in [MAX_PSBT_MPC_TREE_DEPTH + 1, 31] {
+            let psbt = committed_psbt_with_depth(depth);
+            assert_rejected(fascia_from_committed_psbt(&psbt), "MPC tree depth");
+        }
+    }
+
+    #[test]
+    fn commit_rejects_invalid_mpc_depth() {
+        // the key is checked on every output, since the stager also controls the host flags
+        for (vout, depth) in [(0, 32), (0, 255), (1, 32), (1, 255)] {
+            let mut psbt = staged_psbt();
+            set_mpc_min_depth(&mut psbt, vout, depth);
+            assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "MPC tree depth");
+        }
+    }
+
+    #[test]
+    fn commit_rejects_over_cap_mpc_depth() {
+        for depth in [MAX_PSBT_MPC_TREE_DEPTH + 1, 31] {
+            let mut psbt = staged_psbt();
+            set_mpc_min_depth(&mut psbt, 0, depth);
+            assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "MPC tree depth");
+        }
+    }
+
+    #[test]
+    fn commit_rejects_too_many_mpc_messages() {
+        let mut psbt = staged_psbt();
+        for i in 0..MAX_PSBT_MPC_MESSAGES as u16 {
+            let mut protocol_id = [0xffu8; 32];
+            protocol_id[..2].copy_from_slice(&i.to_le_bytes());
+            psbt.outputs[0]
+                .set_mpc_message(
+                    ProtocolId::copy_from_slice(&protocol_id).unwrap(),
+                    Message::copy_from_slice(&[0u8; 32]).unwrap(),
+                )
+                .unwrap();
+        }
+        // with the staged transition's own message there is one too many
+        assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "MPC messages");
+    }
+
+    #[test]
+    fn commit_rejects_staged_close_method() {
+        let mut psbt = staged_psbt();
+        psbt.set_rgb_close_method(CloseMethod::TapretFirst);
+        assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "close method");
+    }
+
+    #[test]
+    fn fascia_rebuild_rejects_uncommitted_bundle() {
+        let mut psbt = staged_psbt();
+        let fascia = commit_staged_psbt(&mut psbt, Some(7)).unwrap();
+        let contract_id = *fascia.bundles().keys().next().unwrap();
+        let protocol_id = ProtocolId::from(contract_id);
+        // commit another bundle ID for the contract, e.g. one moving its inputs to the attacker
+        psbt.outputs[0]
+            .proprietary
+            .insert(ProprietaryKey::mpc_message(protocol_id), vec![0x42u8; 32]);
+        let output = &psbt.outputs[0];
+        let tree = bounded_mpc_tree(
+            MPC_MINIMAL_DEPTH,
+            output.mpc_message_map().unwrap(),
+            output.mpc_entropy(),
+        )
+        .unwrap();
+        psbt.unsigned_tx.output[0].script_pubkey =
+            ScriptBuf::new_op_return(tree.commit_id().to_byte_array());
+        assert_rejected(fascia_from_committed_psbt(&psbt), "does not commit");
+
+        // without any message for the contract
+        psbt.outputs[0]
+            .proprietary
+            .remove(&ProprietaryKey::mpc_message(protocol_id));
+        let other_protocol_id = ProtocolId::copy_from_slice(&[0x11u8; 32]).unwrap();
+        psbt.outputs[0].proprietary.insert(
+            ProprietaryKey::mpc_message(other_protocol_id),
+            vec![0x42u8; 32],
+        );
+        let output = &psbt.outputs[0];
+        let tree = bounded_mpc_tree(
+            MPC_MINIMAL_DEPTH,
+            output.mpc_message_map().unwrap(),
+            output.mpc_entropy(),
+        )
+        .unwrap();
+        psbt.unsigned_tx.output[0].script_pubkey =
+            ScriptBuf::new_op_return(tree.commit_id().to_byte_array());
+        assert_rejected(fascia_from_committed_psbt(&psbt), "does not commit");
+    }
+
+    #[test]
+    fn commit_rejects_bundles_left_off_the_commitment() {
+        // the OP_RETURN is not the first output, and staging flagged an earlier one as opret
+        // host: the bundles' messages would go there while the OP_RETURN commits none of them
+        let mut psbt = staged_psbt();
+        psbt.unsigned_tx.output.swap(0, 1);
+        psbt.outputs[0].set_opret_host();
+        assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "does not commit");
+    }
+
+    #[test]
+    fn max_mpc_depth_commits_and_rebuilds() {
+        let mut psbt = staged_psbt();
+        set_mpc_min_depth(&mut psbt, 0, MAX_PSBT_MPC_TREE_DEPTH);
+        let fascia = commit_staged_psbt(&mut psbt, Some(7)).unwrap();
+        assert_eq!(
+            fascia.seal_witness().merkle_block.width_limit(),
+            1 << MAX_PSBT_MPC_TREE_DEPTH
+        );
+        let received = Psbt::from_str(&psbt.to_string()).unwrap();
+        assert_eq!(fascia_from_committed_psbt(&received).unwrap(), fascia);
     }
 }
