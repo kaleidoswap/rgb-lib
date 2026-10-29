@@ -869,6 +869,7 @@ dictionary OnchainSwapProposal {
   string txid;
   sequence<OnchainSwapConsignment> consignments;
   OnchainSwapAssetHistory? maker_history;
+  u32 lock_time;
 };
 
 [Remote]

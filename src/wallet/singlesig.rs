@@ -7,11 +7,11 @@ use super::offline::{
     SWAP_ACCEPTED_FILE, SWAP_BROADCAST_FILE, SWAP_CANCELLED_EXTENSION, SWAP_COMPLETION_FILE,
     SWAP_INVALIDATION_FILE, SWAP_OFFER_FILE, SWAP_OUTGOING_FILE, SWAP_PROPOSAL_FILE,
     SWAP_REQUEST_FILE, SwapDirection, SwapInvalidationState, SwapOutgoingState, swap_build_psbt,
-    swap_consignment_dir, swap_ensure_not_expired, swap_ensure_state_matches,
-    swap_input_to_outpoint, swap_invalid, swap_load_state, swap_mpc_entropy, swap_random_blinding,
-    swap_require_rgb_destination, swap_restore_input_metadata, swap_save_state,
-    swap_side_rgb_output_cost, swap_state_path, swap_tx_fee, swap_validate_legs,
-    swap_validate_proposal_psbt, swap_validate_proxy_url,
+    swap_consignment_dir, swap_ensure_lock_time_current, swap_ensure_not_expired,
+    swap_ensure_state_matches, swap_input_to_outpoint, swap_invalid, swap_load_state,
+    swap_mpc_entropy, swap_random_blinding, swap_require_rgb_destination,
+    swap_restore_input_metadata, swap_save_state, swap_side_rgb_output_cost, swap_state_path,
+    swap_tx_fee, swap_validate_legs, swap_validate_proposal_psbt, swap_validate_proxy_url,
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use super::online::{
@@ -1575,6 +1575,7 @@ impl Wallet {
             txid: String::new(),
             consignments: vec![],
             maker_history: None,
+            lock_time: self.indexer().get_latest_block_height()?,
         };
         let (mut psbt, _maker_rgb_vout, taker_rgb_vout) = swap_build_psbt(&proposal)?;
         let mut consignments = vec![];
@@ -1659,8 +1660,8 @@ impl Wallet {
     /// a restart.
     ///
     /// **Residual risk**: the completion carries this wallet's signatures on a transaction with
-    /// `lock_time = 0` and no other expiry, which stays valid for as long as the inputs this wallet
-    /// declared are unspent. An honest maker refuses to sign once the offer has expired, but a
+    /// no expiry (its lock time, the maker's chain tip, only sets the earliest block it can be
+    /// mined in): it stays valid for as long as the inputs this wallet declared are unspent. An honest maker refuses to sign once the offer has expired, but a
     /// dishonest one can keep the completion and broadcast it later, e.g. once the price has moved
     /// in its favour. If the maker hasn't broadcast the swap in time, call
     /// [`invalidate_swap`](Wallet::invalidate_swap): [`cancel_swap`](Wallet::cancel_swap) only
@@ -1685,6 +1686,7 @@ impl Wallet {
         if offer.bitcoin_network != self.bitcoin_network() {
             return Err(Error::BitcoinNetworkMismatch);
         }
+        swap_ensure_lock_time_current(&proposal, self.indexer().get_latest_block_height()?)?;
         let mut psbt = Psbt::from_str(&proposal.psbt)?;
         swap_validate_proposal_psbt(&proposal, &psbt)?;
         if proposal.txid != psbt.unsigned_tx.compute_txid().to_string() {
@@ -1773,7 +1775,7 @@ impl Wallet {
                     &offer.swap_id,
                 )?;
                 swap_stage_rgb_leg(self, &mut psbt, &taker_send)?;
-                let mpc_entropy = swap_mpc_entropy(&offer.swap_id);
+                let mpc_entropy = swap_mpc_entropy(self.wallet_dir(), &offer.swap_id)?;
                 let fascia = self.color_psbt_finalize(&mut psbt, Some(mpc_entropy))?;
                 let taker_recv_vout =
                     taker_rgb_vout.ok_or_else(|| swap_invalid("missing taker RGB vout"))?;
@@ -1840,12 +1842,7 @@ impl Wallet {
         swap_ensure_inputs_confirmed(self, &proposal.maker_inputs, min_confirmations)?;
         swap_ensure_inputs_confirmed(self, &proposal.request.taker_inputs, min_confirmations)?;
         swap_ensure_inputs_unspent(self, &proposal.request.taker_inputs, &proposal.maker_inputs)?;
-        swap_sign_psbt(
-            self,
-            &mut psbt,
-            &proposal.request.taker_inputs,
-            &proposal.maker_inputs,
-        )?;
+        swap_sign_psbt(self, &mut psbt, &proposal, OnchainSwapRole::Taker)?;
         let finalized_psbt = swap_finalize_psbt(self, &psbt)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         let completion = OnchainSwapCompletion {
@@ -1931,8 +1928,8 @@ impl Wallet {
                 swap_sign_psbt(
                     self,
                     &mut psbt,
-                    &completion.proposal.maker_inputs,
-                    &completion.proposal.request.taker_inputs,
+                    &completion.proposal,
+                    OnchainSwapRole::Maker,
                 )?;
                 let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
@@ -1976,8 +1973,8 @@ impl Wallet {
                 swap_sign_psbt(
                     self,
                     &mut psbt,
-                    &completion.proposal.maker_inputs,
-                    &completion.proposal.request.taker_inputs,
+                    &completion.proposal,
+                    OnchainSwapRole::Maker,
                 )?;
                 let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
@@ -2079,8 +2076,8 @@ impl Wallet {
                 swap_sign_psbt(
                     self,
                     &mut psbt,
-                    &completion.proposal.maker_inputs,
-                    &completion.proposal.request.taker_inputs,
+                    &completion.proposal,
+                    OnchainSwapRole::Maker,
                 )?;
                 let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
