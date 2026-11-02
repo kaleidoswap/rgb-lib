@@ -1602,9 +1602,7 @@ pub trait WalletOnline: WalletOffline {
                     );
                 }
 
-                runtime
-                    .import_contract(valid_contract.clone(), self.blockchain_resolver())
-                    .expect("failure importing received contract");
+                runtime.import_contract(valid_contract.clone(), self.blockchain_resolver())?;
                 debug!(self.logger(), "Contract registered");
                 self.save_new_asset_internal(
                     txn,
@@ -1739,7 +1737,9 @@ pub trait WalletOnline: WalletOffline {
             {
                 continue;
             }
-            // Include proxy invoices when checking ambiguity on reused scripts.
+            // transport is intentionally NOT filtered here: proxy invoices on a reused script must
+            // stay visible to the ambiguity guard below (they settle via refresh, not here), so the
+            // two guards agree on the candidate set
 
             // check if the provided consignment matches the transfer
             let matched = match transfer.receive_matcher()? {
@@ -1810,7 +1810,8 @@ pub trait WalletOnline: WalletOffline {
         // chokepoint), so it covers this OOB path and the proxy path alike.
 
         // a single consignment (for one asset) can pay more than one of this wallet's pending
-        // invoices (e.g. a sender batched a send to two of them), so process every matched receive
+        // invoices (e.g. a sender batched a send to two of them), so process every matched receive.
+        // Only out-of-band invoices settle here; proxy ones are settled by refresh.
         let mut results: RefreshResult = HashMap::new();
         for (batch_transfer, asset_transfer, transfer, txid, vout) in matches {
             if !transfer.uses_out_of_band_exchange() {
@@ -1858,6 +1859,14 @@ pub trait WalletOnline: WalletOffline {
                     failure: None,
                 },
             );
+        }
+
+        // matches may hold only proxy invoices (settled via refresh, not here); surface the same
+        // error as no match at all
+        if results.is_empty() {
+            return Err(Error::CannotProvideOutOfBandConsignment {
+                details: s!("no pending receive transfer matches the provided consignment"),
+            });
         }
 
         Ok(results)
@@ -4913,6 +4922,9 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        if res.transfers_changed() {
+            self.trigger_auto_backup();
+        }
         info!(self.logger(), "Refresh completed");
         Ok(res)
     }

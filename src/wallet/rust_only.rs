@@ -43,7 +43,10 @@ fn persist_stash_consumed_marker(path: &Path) -> Result<(), Error> {
 }
 
 #[cfg(all(unix, any(feature = "electrum", feature = "esplora")))]
-fn fsync_parent_dir(_path: &Path) -> Result<(), Error> {
+fn fsync_parent_dir(path: &Path) -> Result<(), Error> {
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -3478,6 +3481,24 @@ mod tests {
     fn display_indexer_protocol() {
         assert_eq!(IndexerProtocol::Electrum.to_string(), "Electrum");
         assert_eq!(IndexerProtocol::Esplora.to_string(), "Esplora");
+    }
+
+    #[test]
+    fn fsync_parent_dir_smoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STASH_CONSUMED_FILE);
+        persist_stash_consumed_marker(&path).unwrap();
+        assert!(path.exists());
+        fsync_parent_dir(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsync_parent_dir_opens_parent_on_unix() {
+        // the parent is really opened and synced (not a no-op): a missing parent must error
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join(STASH_CONSUMED_FILE);
+        assert!(fsync_parent_dir(&path).is_err());
     }
 
     #[test]
