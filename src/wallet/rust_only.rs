@@ -3,16 +3,12 @@
 //! This module defines additional utility methods that are not exposed via FFI.
 
 use super::*;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 use amplify::num::u5;
 use bdk_wallet::bitcoin::psbt::Output as PsbtOutput;
 use rgbstd::TransitionBundle;
+use rgbstd::rgbcore::commit_verify::mpc::{self, MPC_MINIMAL_DEPTH};
 #[cfg(any(feature = "electrum", feature = "esplora"))]
-use rgbstd::{
-    containers::SealWitness,
-    opret::OpretProof,
-    rgbcore::commit_verify::mpc::{self, MPC_MINIMAL_DEPTH},
-};
+use rgbstd::{containers::SealWitness, opret::OpretProof};
 
 /// Marker left in the transfer dir once a prepared fascia has been consumed into the RGB stash,
 /// until the related SQL update is committed.
@@ -1877,6 +1873,7 @@ fn commit_staged_psbt(psbt: &mut Psbt, static_blinding: Option<u64>) -> Result<F
 }
 
 /// Rebuild the fascia of a PSBT whose RGB commitment was finalized, possibly by a counterparty.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 fn fascia_from_committed_psbt(psbt: &Psbt) -> Result<Fascia, Error> {
     let bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
     // `rgb_commit` commits the MPC messages in the first OP_RETURN, which need not be vout 0.
