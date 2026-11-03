@@ -194,6 +194,27 @@ impl Indexer {
         })
     }
 
+    /// The transaction with `txid` if the indexer knows it (mined or in the mempool), `None`
+    /// otherwise.
+    pub(crate) fn get_tx(&self, txid: &str) -> Result<Option<BdkTransaction>, Error> {
+        let txid = Txid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
+        Ok(match self {
+            #[cfg(feature = "electrum")]
+            Indexer::Electrum(client) => match client.inner.transaction_get(&txid) {
+                Ok(tx) => Some(tx),
+                Err(e)
+                    if e.to_string()
+                        .contains("No such mempool or blockchain transaction") =>
+                {
+                    None
+                }
+                Err(e) => return Err(IndexerError::from(e).into()),
+            },
+            #[cfg(feature = "esplora")]
+            Indexer::Esplora(client) => client.get_tx(&txid).map_err(IndexerError::from)?,
+        })
+    }
+
     /// The amount (in sats) of `outpoint` if it exists, locks `script` and is unspent, counting
     /// mempool spends, `None` otherwise.
     pub(crate) fn unspent_txo_amount(

@@ -7,11 +7,12 @@ use super::offline::{
     SWAP_ACCEPTED_FILE, SWAP_BROADCAST_FILE, SWAP_CANCELLED_EXTENSION, SWAP_COMPLETION_FILE,
     SWAP_INVALIDATION_FILE, SWAP_OFFER_FILE, SWAP_OUTGOING_FILE, SWAP_PROPOSAL_FILE,
     SWAP_REQUEST_FILE, SwapDirection, SwapInvalidationState, SwapOutgoingState, swap_build_psbt,
-    swap_consignment_dir, swap_ensure_not_expired, swap_ensure_state_matches,
-    swap_input_to_outpoint, swap_invalid, swap_load_state, swap_mpc_entropy, swap_random_blinding,
-    swap_require_rgb_destination, swap_restore_input_metadata, swap_save_state,
-    swap_side_rgb_output_cost, swap_state_path, swap_tx_fee, swap_validate_legs,
-    swap_validate_proposal_psbt, swap_validate_proxy_url,
+    swap_consignment_dir, swap_ensure_lock_time_current, swap_ensure_not_expired,
+    swap_ensure_state_matches, swap_extra_funded_by, swap_input_to_outpoint, swap_invalid,
+    swap_load_state, swap_mpc_entropy, swap_random_blinding, swap_require_rgb_destination,
+    swap_restore_input_metadata, swap_save_state, swap_side_rgb_output_cost, swap_state_path,
+    swap_tx_fee, swap_validate_extra_outputs, swap_validate_legs, swap_validate_proposal_psbt,
+    swap_validate_proxy_url,
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use super::online::{
@@ -1377,9 +1378,9 @@ impl Wallet {
     /// posted there so the counterparty can fetch them, and it is also used to publish the current
     /// asset history so the taker can validate the asset before accepting.
     ///
-    /// `platform_fee_sat`/`fee_recipient` reserve an additional output for a third-party
-    /// facilitator, funded by the taker alongside `network_fee_sat`. Pass `0`/`None` when there
-    /// is no facilitator.
+    /// `extra_outputs` are further Bitcoin outputs the swap transaction pays, such as a fee owed
+    /// to a third party. Each names the side that funds it. The offer commits to them, so the
+    /// taker and the maker both build and verify them. Pass an empty list for none.
     ///
     /// This method is **offline** — no network connection is required.
     #[allow(clippy::too_many_arguments)]
@@ -1390,8 +1391,7 @@ impl Wallet {
         network_fee_sat: u64,
         expiration_timestamp: Option<u64>,
         proxy_url: Option<String>,
-        platform_fee_sat: u64,
-        fee_recipient: Option<String>,
+        extra_outputs: Vec<OnchainSwapExtraOutput>,
     ) -> Result<OnchainSwapOffer, Error> {
         info!(self.logger(), "Creating on-chain swap offer...");
         let txn = self.database().begin_transaction()?;
@@ -1402,8 +1402,7 @@ impl Wallet {
             network_fee_sat,
             expiration_timestamp,
             proxy_url,
-            platform_fee_sat,
-            fee_recipient,
+            extra_outputs,
         )?;
         swap_save_state(self.wallet_dir(), &offer.swap_id, SWAP_OFFER_FILE, &offer)?;
         self.update_backup_info(&txn, false)?;
@@ -1434,6 +1433,7 @@ impl Wallet {
         if offer.bitcoin_network != self.bitcoin_network() {
             return Err(Error::BitcoinNetworkMismatch);
         }
+        swap_validate_extra_outputs(&offer.extra_outputs, offer.bitcoin_network)?;
         let taker_gives = offer.maker_receives.clone();
         let taker_receives = offer.maker_gives.clone();
         let (taker_inputs, taker_change_keychain) = swap_select_inputs(
@@ -1443,7 +1443,11 @@ impl Wallet {
             &taker_gives,
             swap_side_rgb_output_cost(&taker_receives, offer.rgb_output_sat)
                 .checked_add(offer.network_fee_sat)
-                .and_then(|v| v.checked_add(offer.platform_fee_sat))
+                .and_then(|v| {
+                    v.checked_add(
+                        swap_extra_funded_by(&offer.extra_outputs, OnchainSwapRole::Taker).ok()?,
+                    )
+                })
                 .ok_or_else(|| swap_invalid("swap amounts overflow"))?,
             min_confirmations,
             skip_sync,
@@ -1535,6 +1539,7 @@ impl Wallet {
         if offer.bitcoin_network != self.bitcoin_network() {
             return Err(Error::BitcoinNetworkMismatch);
         }
+        swap_validate_extra_outputs(&offer.extra_outputs, offer.bitcoin_network)?;
         // Correctness: verify the taker's inputs are unspent and sufficiently confirmed before the
         // maker commits resources to building the PSBT.
         swap_ensure_inputs_foreign(self, &request.taker_inputs, &[])?;
@@ -1555,7 +1560,12 @@ impl Wallet {
             &txn,
             online,
             &offer.maker_gives,
-            swap_side_rgb_output_cost(&offer.maker_receives, offer.rgb_output_sat),
+            swap_side_rgb_output_cost(&offer.maker_receives, offer.rgb_output_sat)
+                .checked_add(swap_extra_funded_by(
+                    &offer.extra_outputs,
+                    OnchainSwapRole::Maker,
+                )?)
+                .ok_or_else(|| swap_invalid("swap amounts overflow"))?,
             min_confirmations,
             skip_sync,
             &exclude_outpoints,
@@ -1575,6 +1585,7 @@ impl Wallet {
             txid: String::new(),
             consignments: vec![],
             maker_history: None,
+            lock_time: self.indexer().get_latest_block_height()?,
         };
         let (mut psbt, _maker_rgb_vout, taker_rgb_vout) = swap_build_psbt(&proposal)?;
         let mut consignments = vec![];
@@ -1659,8 +1670,8 @@ impl Wallet {
     /// a restart.
     ///
     /// **Residual risk**: the completion carries this wallet's signatures on a transaction with
-    /// `lock_time = 0` and no other expiry, which stays valid for as long as the inputs this wallet
-    /// declared are unspent. An honest maker refuses to sign once the offer has expired, but a
+    /// no expiry (its lock time, the maker's chain tip, only sets the earliest block it can be
+    /// mined in): it stays valid for as long as the inputs this wallet declared are unspent. An honest maker refuses to sign once the offer has expired, but a
     /// dishonest one can keep the completion and broadcast it later, e.g. once the price has moved
     /// in its favour. If the maker hasn't broadcast the swap in time, call
     /// [`invalidate_swap`](Wallet::invalidate_swap): [`cancel_swap`](Wallet::cancel_swap) only
@@ -1685,6 +1696,7 @@ impl Wallet {
         if offer.bitcoin_network != self.bitcoin_network() {
             return Err(Error::BitcoinNetworkMismatch);
         }
+        swap_ensure_lock_time_current(&proposal, self.indexer().get_latest_block_height()?)?;
         let mut psbt = Psbt::from_str(&proposal.psbt)?;
         swap_validate_proposal_psbt(&proposal, &psbt)?;
         if proposal.txid != psbt.unsigned_tx.compute_txid().to_string() {
@@ -1773,7 +1785,7 @@ impl Wallet {
                     &offer.swap_id,
                 )?;
                 swap_stage_rgb_leg(self, &mut psbt, &taker_send)?;
-                let mpc_entropy = swap_mpc_entropy(&offer.swap_id);
+                let mpc_entropy = swap_mpc_entropy(self.wallet_dir(), &offer.swap_id)?;
                 let fascia = self.color_psbt_finalize(&mut psbt, Some(mpc_entropy))?;
                 let taker_recv_vout =
                     taker_rgb_vout.ok_or_else(|| swap_invalid("missing taker RGB vout"))?;
@@ -1840,12 +1852,7 @@ impl Wallet {
         swap_ensure_inputs_confirmed(self, &proposal.maker_inputs, min_confirmations)?;
         swap_ensure_inputs_confirmed(self, &proposal.request.taker_inputs, min_confirmations)?;
         swap_ensure_inputs_unspent(self, &proposal.request.taker_inputs, &proposal.maker_inputs)?;
-        swap_sign_psbt(
-            self,
-            &mut psbt,
-            &proposal.request.taker_inputs,
-            &proposal.maker_inputs,
-        )?;
+        swap_sign_psbt(self, &mut psbt, &proposal, OnchainSwapRole::Taker)?;
         let finalized_psbt = swap_finalize_psbt(self, &psbt)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         let completion = OnchainSwapCompletion {
@@ -1931,8 +1938,8 @@ impl Wallet {
                 swap_sign_psbt(
                     self,
                     &mut psbt,
-                    &completion.proposal.maker_inputs,
-                    &completion.proposal.request.taker_inputs,
+                    &completion.proposal,
+                    OnchainSwapRole::Maker,
                 )?;
                 let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
@@ -1976,8 +1983,8 @@ impl Wallet {
                 swap_sign_psbt(
                     self,
                     &mut psbt,
-                    &completion.proposal.maker_inputs,
-                    &completion.proposal.request.taker_inputs,
+                    &completion.proposal,
+                    OnchainSwapRole::Maker,
                 )?;
                 let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
@@ -2079,8 +2086,8 @@ impl Wallet {
                 swap_sign_psbt(
                     self,
                     &mut psbt,
-                    &completion.proposal.maker_inputs,
-                    &completion.proposal.request.taker_inputs,
+                    &completion.proposal,
+                    OnchainSwapRole::Maker,
                 )?;
                 let finalized_psbt = Some(swap_finalize_psbt_required(self, &psbt)?);
                 let completion = OnchainSwapCompletion {
@@ -2557,13 +2564,30 @@ impl Wallet {
     /// Make the broadcast swap TX known to BDK: parties that did not broadcast it would not
     /// discover it with a colored sync, leaving their swap outputs unknown.
     fn swap_apply_witness_tx(&mut self, completion: &OnchainSwapCompletion) -> Result<(), Error> {
-        let finalized_psbt = completion
-            .finalized_psbt
-            .as_deref()
-            .ok_or_else(|| swap_invalid("swap completion is not finalized"))?;
-        let psbt = Psbt::from_str(finalized_psbt)?;
-        swap_validate_proposal_psbt(&completion.proposal, &psbt)?;
-        let tx = psbt.extract_tx().map_err(InternalError::from)?;
+        let tx = match completion.finalized_psbt.as_deref() {
+            Some(finalized_psbt) => {
+                let psbt = Psbt::from_str(finalized_psbt)?;
+                swap_validate_proposal_psbt(&completion.proposal, &psbt)?;
+                psbt.extract_tx().map_err(InternalError::from)?
+            }
+            // the maker broadcast the swap without sending back its finalized completion (e.g.
+            // after the taker stopped waiting): the taker only has the one it signed. Its PSBT
+            // must be the proposal's transaction, and the txid commits to everything in it but
+            // the witnesses, which the network has checked
+            None => {
+                let psbt = Psbt::from_str(&completion.psbt)?;
+                swap_validate_proposal_psbt(&completion.proposal, &psbt)?;
+                if psbt.unsigned_tx.compute_txid().to_string() != completion.txid {
+                    return Err(swap_invalid("swap completion txid mismatch"));
+                }
+                self.indexer().get_tx(&completion.txid)?.ok_or_else(|| {
+                    swap_invalid(
+                        "swap completion is not finalized and its transaction is not known to \
+                         the indexer",
+                    )
+                })?
+            }
+        };
         if tx.compute_txid().to_string() != completion.txid {
             return Err(swap_invalid("swap completion txid mismatch"));
         }
@@ -2826,7 +2850,9 @@ impl Wallet {
     ///
     /// Each party calls this method with their own `role` once the swap transaction has been
     /// broadcast (or confirmed, depending on `min_confirmations`). The consignments embedded in
-    /// the completion are validated and accepted into the wallet's RGB state.
+    /// the completion are validated and accepted into the wallet's RGB state. The taker may pass
+    /// the completion it signed itself when the maker broadcast without sending back its own: the
+    /// swap transaction is then taken from the indexer.
     ///
     /// Returns the list of [`Assignment`]s received, or an empty list if this party is receiving
     /// only BTC.
