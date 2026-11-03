@@ -2677,9 +2677,9 @@ fn layout_index_mixup_psbt(psbt: &mut Psbt, amt_sat: u64) -> u32 {
 #[cfg(feature = "electrum")]
 fn fascia_seal_vouts(fascia: &Fascia) -> Vec<u32> {
     let mut vouts = vec![];
-    for (_, bundle) in fascia.bundles().iter() {
+    for bundle in fascia.bundles().values() {
         for known in bundle.known_transitions.iter() {
-            for (_, assignments) in known.transition.assignments.iter() {
+            for assignments in known.transition.assignments.values() {
                 for assignment in assignments.as_fungible() {
                     vouts.push(assignment.revealed_seal().unwrap().vout.into_u32());
                 }
