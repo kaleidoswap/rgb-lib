@@ -722,8 +722,8 @@ fn signet_esplora_success() {
     let bitcoin_network = BitcoinNetwork::Signet;
     let mut party = offline_party!(get_test_wallet_with_net(true, None, bitcoin_network));
     check_wallet(&party, bitcoin_network, None);
-    // UTEXO Signet Esplora (electrs REST API on Hetzner)
-    let indexer_url = "https://esplora-api.utexo.com";
+    // public Signet Esplora API (the UTEXO-hosted esplora-api.utexo.com fails the indexer check)
+    let indexer_url = "https://mempool.space/signet/api";
     party.go_online(false, Some(indexer_url));
     assert!(!party.wallet.watch_only());
     assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
