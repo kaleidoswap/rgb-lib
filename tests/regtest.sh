@@ -47,8 +47,8 @@ COMPOSE="$COMPOSE -f ${COMPOSE_FPATH}"
 EXPOSED_PORTS=(3000 50001) # see compose.yaml for the exposed ports
 TIMEOUT=100
 
-BCLI="$COMPOSE exec -T -u blits bitcoind bitcoin-cli -regtest"
-BCLI_SIGNET="$COMPOSE exec -T -u blits bitcoind_signet_custom bitcoin-cli -signet"
+BCLI="$COMPOSE exec -T -u blits bitcoind bitcoin-cli -regtest -rpcwait -rpcwaittimeout=$TIMEOUT"
+BCLI_SIGNET="$COMPOSE exec -T -u blits bitcoind_signet_custom bitcoin-cli -signet -rpcwait -rpcwaittimeout=$TIMEOUT"
 BCLI_ESPLORA="$COMPOSE exec -T esplora cli"
 
 _prepare_bitcoin_funds() {
