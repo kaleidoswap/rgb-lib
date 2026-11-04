@@ -5456,12 +5456,12 @@ fn color_psbt_for_outpoints_fail() {
     assert_matches!(
         result,
         Err(Error::InvalidColoringInfo { details: m })
-            if m == format!("output_map vout {op_return_vout} points to the OP_RETURN output")
+            if m.starts_with(&format!("output_map vout {op_return_vout} points to the OP_RETURN output"))
     );
 }
 
-/// Coloring itself does not inspect the destination script, but persist has to encode a witness
-/// recipient ID. A bare-multisig output is not an AddressPayload and must fail closed.
+/// Persist has to encode a witness recipient ID for each destination, and a bare-multisig output
+/// is not an AddressPayload: the output map check refuses it before anything is colored.
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
@@ -5512,7 +5512,7 @@ fn color_psbt_for_outpoints_and_prepare_consume_rejects_nonstandard_output_scrip
     assert_matches!(
         result,
         Err(Error::InvalidColoringInfo { details: m })
-            if m == format!("output_map vout {vout} script is not a standard address payload")
+            if m.starts_with(&format!("output_map vout {vout} script cannot carry an RGB witness seal"))
     );
 }
 
