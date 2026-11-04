@@ -36,6 +36,30 @@ fn proxy_routing_id_for_transfer(transfer: &DbTransfer) -> String {
     crate::utils::derive_proxy_recipient_id(&recipient_id, nonce)
 }
 
+/// GET the consignment posted under `recipient_id` from the proxy at `proxy_url`. A failed
+/// request or an empty result is [`Error::NoConsignment`].
+pub(crate) fn proxy_get_consignment(
+    proxy_url: &str,
+    recipient_id: &str,
+    logger: &Logger,
+) -> Result<GetConsignmentResponse, Error> {
+    let proxy_client = ProxyClient::new(proxy_url)?;
+    let consignment_res = proxy_client.get_consignment(recipient_id);
+    if consignment_res.is_err() || consignment_res.as_ref().unwrap().result.as_ref().is_none() {
+        debug!(
+            logger,
+            "Consignment GET response error: {:?}", &consignment_res
+        );
+        return Err(Error::NoConsignment);
+    }
+
+    let consignment_res = consignment_res.unwrap().result.unwrap();
+    #[cfg(test)]
+    debug!(logger, "Consignment GET response: {:?}", consignment_res);
+
+    Ok(consignment_res)
+}
+
 pub trait WalletOnline: WalletOffline {
     fn blockchain_resolver(&self) -> &AnyResolver {
         &self.online_data().as_ref().unwrap().resolver
@@ -486,7 +510,8 @@ pub trait WalletOnline: WalletOffline {
         // color-consume flow), so failing it would misreport state that already landed: once the
         // indexer knows the TX its inputs are spent for good, and once the fascia is in the stash
         // (marker left behind by a consume that crashed before its commit) the SQL side is the only
-        // thing still rollable back, which would diverge the two
+        // thing still rollable back, which would diverge the two; likewise, while it has not
+        // expired, the batch of an HTLC operation whose broadcast was attempted may still land
         if batch_transfer.status == TransferStatus::Initiated
             && let Some(txid) = batch_transfer.txid.as_deref()
             && (self
@@ -515,8 +540,10 @@ pub trait WalletOnline: WalletOffline {
         }
     }
 
-    /// Persist SQL Failed rows without triggering VSS backup. Caller heals HTLC
-    /// metadata (if any) and backs up only after SQL and files are coherent.
+    /// Fail the eligible transfers (see [`Self::fail_transfers_impl`]) and commit the SQL changes.
+    ///
+    /// Callers then run [`Self::fail_transfers_finish`] to align the file-backed HTLC operations
+    /// (if any) with the batches just marked as failed.
     fn fail_transfers_commit(
         &mut self,
         online: Online,
@@ -541,6 +568,7 @@ pub trait WalletOnline: WalletOffline {
     }
 
     /// Refuse failing a batch whose linked HTLC operation has a live broadcast state.
+    /// Default: no HTLC ops.
     fn psbt_op_live_broadcast_blocks_fail(
         &self,
         _batch_transfer: &DbBatchTransfer,
@@ -548,6 +576,8 @@ pub trait WalletOnline: WalletOffline {
         Ok(false)
     }
 
+    /// Complete a [`Self::fail_transfers_commit`] call: heal the HTLC operations linked to the
+    /// failed batches, then report the outcome.
     fn fail_transfers_finish(&self, outcome: FailTransfersOutcome) -> Result<bool, Error> {
         let healed = match self.heal_psbt_ops_after_failed_transfers() {
             Ok(healed) => healed,
@@ -905,24 +935,7 @@ pub trait WalletOnline: WalletOffline {
         proxy_url: &str,
         recipient_id: String,
     ) -> Result<GetConsignmentResponse, Error> {
-        let proxy_client = ProxyClient::new(proxy_url)?;
-        let consignment_res = proxy_client.get_consignment(&recipient_id);
-        if consignment_res.is_err() || consignment_res.as_ref().unwrap().result.as_ref().is_none() {
-            debug!(
-                self.logger(),
-                "Consignment GET response error: {:?}", &consignment_res
-            );
-            return Err(Error::NoConsignment);
-        }
-
-        let consignment_res = consignment_res.unwrap().result.unwrap();
-        #[cfg(test)]
-        debug!(
-            self.logger(),
-            "Consignment GET response: {:?}", consignment_res
-        );
-
-        Ok(consignment_res)
+        proxy_get_consignment(proxy_url, &recipient_id, self.logger())
     }
 
     fn extract_received_assignments(
@@ -956,30 +969,16 @@ pub trait WalletOnline: WalletOffline {
                     let opout = Opout::new(*opid, *ass_type, no as u16);
                     if let Assign::ConfidentialSeal { seal, state, .. } = fungible_assignment
                         && Some(*seal) == known_concealed
+                        && let Some(assignment) = Assignment::fungible(*ass_type, state.as_u64())
                     {
-                        match *ass_type {
-                            OS_ASSET => {
-                                received.insert(opout, Assignment::Fungible(state.as_u64()));
-                            }
-                            OS_INFLATION => {
-                                received.insert(opout, Assignment::InflationRight(state.as_u64()));
-                            }
-                            _ => {}
-                        }
+                        received.insert(opout, assignment);
                     };
                     if let Assign::Revealed { seal, state, .. } = fungible_assignment
                         && seal.txid == TxPtr::WitnessTx
                         && Some(seal.vout.into_u32()) == vout
+                        && let Some(assignment) = Assignment::fungible(*ass_type, state.as_u64())
                     {
-                        match *ass_type {
-                            OS_ASSET => {
-                                received.insert(opout, Assignment::Fungible(state.as_u64()));
-                            }
-                            OS_INFLATION => {
-                                received.insert(opout, Assignment::InflationRight(state.as_u64()));
-                            }
-                            _ => {}
-                        }
+                        received.insert(opout, assignment);
                     };
                 }
                 for (no, structured_assignment) in typed_assigns.as_structured().iter().enumerate()

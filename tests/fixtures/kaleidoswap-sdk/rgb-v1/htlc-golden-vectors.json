@@ -1,0 +1,147 @@
+{
+  "_source": {
+    "repository": "kaleidoswap/kaleidoswap-sdk",
+    "branch": "trunk",
+    "trunkCommit": "660779a3c1ec9f0bb7c32c9d9cdb276b7cbaff86",
+    "fixtureCommit": "3b034ac7fefe7a3388ba5fefb1d52fe33b1dce0a",
+    "fetched": "2026-10-14",
+    "files": {
+      "tests/fixtures/rgb-v1/wire-contract.json": {
+        "gitBlob": "a1a6c7e802f1f7408c8268dd6f703fc4043a7741",
+        "sha256": "6c543d54d144d20faf3eacaf7cb6d195ba95478cd59c9705b472e89534427b6e"
+      },
+      "tests/fixtures/rgb-v1/rgb-golden-vectors.json": {
+        "gitBlob": "b9defcd30c721cd172f6724a2e22f4bca56defd3",
+        "sha256": "d42329bc09bbebf123b54f12d8ccc26cd1688f65aac7a098921b86fdc2b54125"
+      }
+    },
+    "note": "Subset copied verbatim; values are unchanged, only unrelated fields are dropped. See README.md."
+  },
+  "provenance": {
+    "makerRevision": "49c6ce2e9554eea0d819fd3bbd267af6db45b1c0",
+    "rgbLibRevision": "96f039d975cf2a83712c3c0a90e703621d445425",
+    "rgbInvoicingVersion": "0.11.1-rc.11",
+    "capture": "maker-api axum router; isolated PostgreSQL; mock node, chain and wallet; real rgb-lib recipient encoder",
+    "network": "regtest",
+    "assetPrecision": 6,
+    "assetIssued": false
+  },
+  "wireContract": {
+    "preimage": "0303030303030303030303030303030303030303030303030303030303030303",
+    "create": {
+      "submarine": {
+        "request": {
+          "refundPublicKey": "02d4e4d88e467ce9e1991d5d0125b39ba5ca6ca53e45c69135d7d862e689daea02"
+        },
+        "response": {
+          "claimPublicKey": "02b459e397884574edcb90214723a86621072fb27c2817b8243a816d1608e97a00",
+          "address": "bcrt1p5pjferapnjzfsl4uwlq996l0nrk8hmkzcfujqr0dhsyvaqmnv77qldqzjc",
+          "swapTree": {
+            "claimLeaf": {
+              "version": 192,
+              "output": "a9148a486ff2e31d6158bf39e2608864d63fefd09d5b8820b459e397884574edcb90214723a86621072fb27c2817b8243a816d1608e97a00ac"
+            },
+            "refundLeaf": {
+              "version": 192,
+              "output": "20d4e4d88e467ce9e1991d5d0125b39ba5ca6ca53e45c69135d7d862e689daea02ad029000b1"
+            }
+          },
+          "timeoutBlockHeight": 144,
+          "rgb": {
+            "recipientId": "bcrt:wvout:BaBknI_h-nISYfrx-3wFLr75-jse_7Cw-nkgDe28-CM6Dc2e-8xzQ0FA",
+            "scriptPubkey": "5120a0649c8fa19c84987ebc77c052ebef98ec7beec2c279200dedbc08ce837367bc"
+          }
+        }
+      },
+      "reverse": {
+        "request": {
+          "claimPublicKey": "03b0f78f9879c37d49c96f12c73b6601d362862c8c8dddd530addc661e19fbe141",
+          "preimageHash": "648aa5c579fb30f38af744d97d6ec840c7a91277a499a0d780f3e7314eca090b"
+        },
+        "response": {
+          "refundPublicKey": "0342fda8e9951f85317524d74e033458090032ea9e359fd55448e70915b18d9a64",
+          "lockupAddress": "bcrt1p06rvg6chjtm9z2kp7ttr049xg4mmy2lf8nukkyc3z3y6w0r5un6ssh0fmv",
+          "swapTree": {
+            "claimLeaf": {
+              "version": 192,
+              "output": "82012088a9148a486ff2e31d6158bf39e2608864d63fefd09d5b8820b0f78f9879c37d49c96f12c73b6601d362862c8c8dddd530addc661e19fbe141ac"
+            },
+            "refundLeaf": {
+              "version": 192,
+              "output": "2042fda8e9951f85317524d74e033458090032ea9e359fd55448e70915b18d9a64ad0118b1"
+            }
+          },
+          "timeoutBlockHeight": 24,
+          "rgb": {
+            "recipientId": "bcrt:wvout:BX6GxGsX-kvZRKsH-y1jfUpk-V3sivpP-PlrExEU-Sac8dOT-1MB8ffQ",
+            "scriptPubkey": "51207e86c46b1792f6512ac1f2d637d4a64577b22be93cf96b13111449a73c74e4f5"
+          }
+        }
+      }
+    }
+  },
+  "goldenVectors": {
+    "recipients": [
+      {
+        "scriptPubkey": "5120a0649c8fa19c84987ebc77c052ebef98ec7beec2c279200dedbc08ce837367bc",
+        "network": "bc",
+        "recipientId": "bc:wvout:BaBknI_h-nISYfrx-3wFLr75-jse_7Cw-nkgDe28-CM6Dc2e-8xzQ0FA"
+      },
+      {
+        "scriptPubkey": "5120a0649c8fa19c84987ebc77c052ebef98ec7beec2c279200dedbc08ce837367bc",
+        "network": "tb3",
+        "recipientId": "tb3:wvout:BaBknI_h-nISYfrx-3wFLr75-jse_7Cw-nkgDe28-CM6Dc2e-8xzQ0FA"
+      },
+      {
+        "scriptPubkey": "5120a0649c8fa19c84987ebc77c052ebef98ec7beec2c279200dedbc08ce837367bc",
+        "network": "tb4",
+        "recipientId": "tb4:wvout:BaBknI_h-nISYfrx-3wFLr75-jse_7Cw-nkgDe28-CM6Dc2e-8xzQ0FA"
+      },
+      {
+        "scriptPubkey": "5120a0649c8fa19c84987ebc77c052ebef98ec7beec2c279200dedbc08ce837367bc",
+        "network": "sb",
+        "recipientId": "sb:wvout:BaBknI_h-nISYfrx-3wFLr75-jse_7Cw-nkgDe28-CM6Dc2e-8xzQ0FA"
+      },
+      {
+        "scriptPubkey": "5120a0649c8fa19c84987ebc77c052ebef98ec7beec2c279200dedbc08ce837367bc",
+        "network": "sbc",
+        "recipientId": "sbc:wvout:BaBknI_h-nISYfrx-3wFLr75-jse_7Cw-nkgDe28-CM6Dc2e-8xzQ0FA"
+      },
+      {
+        "scriptPubkey": "5120a0649c8fa19c84987ebc77c052ebef98ec7beec2c279200dedbc08ce837367bc",
+        "network": "bcrt",
+        "recipientId": "bcrt:wvout:BaBknI_h-nISYfrx-3wFLr75-jse_7Cw-nkgDe28-CM6Dc2e-8xzQ0FA"
+      },
+      {
+        "scriptPubkey": "51207e86c46b1792f6512ac1f2d637d4a64577b22be93cf96b13111449a73c74e4f5",
+        "network": "bc",
+        "recipientId": "bc:wvout:BX6GxGsX-kvZRKsH-y1jfUpk-V3sivpP-PlrExEU-Sac8dOT-1MB8ffQ"
+      },
+      {
+        "scriptPubkey": "51207e86c46b1792f6512ac1f2d637d4a64577b22be93cf96b13111449a73c74e4f5",
+        "network": "tb3",
+        "recipientId": "tb3:wvout:BX6GxGsX-kvZRKsH-y1jfUpk-V3sivpP-PlrExEU-Sac8dOT-1MB8ffQ"
+      },
+      {
+        "scriptPubkey": "51207e86c46b1792f6512ac1f2d637d4a64577b22be93cf96b13111449a73c74e4f5",
+        "network": "tb4",
+        "recipientId": "tb4:wvout:BX6GxGsX-kvZRKsH-y1jfUpk-V3sivpP-PlrExEU-Sac8dOT-1MB8ffQ"
+      },
+      {
+        "scriptPubkey": "51207e86c46b1792f6512ac1f2d637d4a64577b22be93cf96b13111449a73c74e4f5",
+        "network": "sb",
+        "recipientId": "sb:wvout:BX6GxGsX-kvZRKsH-y1jfUpk-V3sivpP-PlrExEU-Sac8dOT-1MB8ffQ"
+      },
+      {
+        "scriptPubkey": "51207e86c46b1792f6512ac1f2d637d4a64577b22be93cf96b13111449a73c74e4f5",
+        "network": "sbc",
+        "recipientId": "sbc:wvout:BX6GxGsX-kvZRKsH-y1jfUpk-V3sivpP-PlrExEU-Sac8dOT-1MB8ffQ"
+      },
+      {
+        "scriptPubkey": "51207e86c46b1792f6512ac1f2d637d4a64577b22be93cf96b13111449a73c74e4f5",
+        "network": "bcrt",
+        "recipientId": "bcrt:wvout:BX6GxGsX-kvZRKsH-y1jfUpk-V3sivpP-PlrExEU-Sac8dOT-1MB8ffQ"
+      }
+    ]
+  }
+}
