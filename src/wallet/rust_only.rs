@@ -13,16 +13,12 @@
 use super::*;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use crate::wallet::online::proxy_get_consignment;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 use amplify::num::u5;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 use bdk_wallet::bitcoin::psbt::Output as PsbtOutput;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use rgbstd::AssignmentType;
 use rgbstd::Operation as _;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 use rgbstd::TransitionBundle;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 use rgbstd::rgbcore::commit_verify::mpc::{self, MPC_MINIMAL_DEPTH};
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use rgbstd::{containers::SealWitness, opret::OpretProof};
@@ -35,14 +31,12 @@ use rgbstd::{containers::SealWitness, opret::OpretProof};
 /// from [`MPC_MINIMAL_DEPTH`] (3) and only goes deeper to place protocol IDs without collisions,
 /// so a few contracts take a depth of 3-6; 16 (65536 leaves) leaves ample room while keeping the
 /// tree cheap to build.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 const MAX_PSBT_MPC_TREE_DEPTH: u8 = 16;
 
 /// Maximum number of MPC messages (one per RGB contract) in a PSBT's MPC tree.
 ///
 /// This keeps placing them cheap and, being the birthday bound of a tree at
 /// [`MAX_PSBT_MPC_TREE_DEPTH`], lets them fit within it.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 const MAX_PSBT_MPC_MESSAGES: usize = 1 << (MAX_PSBT_MPC_TREE_DEPTH / 2);
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -166,7 +160,12 @@ thread_local! {
 /// RGB asset-specific information to color a transaction
 #[derive(Debug, Clone)]
 pub struct AssetColoringInfo {
-    /// Map of vouts and asset amounts to color the transaction outputs
+    /// Map of vouts and asset amounts to color the transaction outputs.
+    ///
+    /// Keys are pre-OP_RETURN indices, shifted by +1 when the PSBT has a P2TR output (see
+    /// [`Wallet::color_psbt`]). Every coloring method rejects a key that does not resolve to an
+    /// existing, non-OP_RETURN output with a witness-seal script (P2PKH, P2SH, P2WPKH, P2WSH or
+    /// P2TR), naming the convention it expected.
     pub output_map: HashMap<u32, u64>,
     /// Static blinding to keep the transaction construction deterministic
     pub static_blinding: Option<u64>,
@@ -672,6 +671,60 @@ pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
     check_proxy(proxy_url)
 }
 
+/// Resolve an `output_map` key to the vout of the (already OP_RETURN-prepared) PSBT it seals,
+/// failing unless that output exists, is not the OP_RETURN commitment host and can carry a
+/// witness seal (P2PKH, P2SH, P2WPKH, P2WSH or P2TR, the scripts a witness recipient can name).
+///
+/// Keys are pre-OP_RETURN indices: on a P2TR PSBT, where the OP_RETURN is vout 0, they are
+/// shifted by +1 (`shift_output_map_for_opreturn_first`). A final vout passed by mistake is off by
+/// one, so errors name the convention the key was read with.
+fn output_map_seal_vout(
+    psbt: &Psbt,
+    key: u32,
+    shift_output_map_for_opreturn_first: bool,
+) -> Result<u32, Error> {
+    let outputs = &psbt.unsigned_tx.output;
+    let vout = if shift_output_map_for_opreturn_first {
+        key.checked_add(1)
+            .ok_or_else(|| Error::InvalidColoringInfo {
+                details: s!("vout in output_map is too large"),
+            })?
+    } else {
+        key
+    };
+    let convention = if shift_output_map_for_opreturn_first {
+        "keys are pre-OP_RETURN indices: this PSBT has a P2TR output, so the OP_RETURN is vout 0 \
+         and every key is shifted by +1; do not pass final vouts"
+    } else {
+        "keys are final vout indices (without a P2TR output both index conventions coincide)"
+    };
+    let Some(txout) = outputs.get(vout as usize) else {
+        return Err(Error::InvalidColoringInfo {
+            details: format!(
+                "invalid vout in output_map, does not exist in the given PSBT: key {key} seals \
+                 vout {vout} of {}; {convention}",
+                outputs.len()
+            ),
+        });
+    };
+    if txout.script_pubkey.is_op_return() {
+        return Err(Error::InvalidColoringInfo {
+            details: format!(
+                "output_map vout {vout} points to the OP_RETURN output (key {key}); {convention}"
+            ),
+        });
+    }
+    if AddressPayload::from_script(&txout.script_pubkey).is_err() {
+        return Err(Error::InvalidColoringInfo {
+            details: format!(
+                "output_map vout {vout} script cannot carry an RGB witness seal (not P2PKH, P2SH, \
+                 P2WPKH, P2WSH or P2TR) (key {key}); {convention}"
+            ),
+        });
+    }
+    Ok(vout)
+}
+
 /// Rust-only APIs of the wallet.
 impl Wallet {
     /// Color a PSBT.
@@ -683,7 +736,13 @@ impl Wallet {
     /// they are shifted by +1 internally. That applies even if OP_RETURN was already present at
     /// vout 0. With P2TR, a pre-existing OP_RETURN at index > 0 is rejected (would silently
     /// mis-seal under the +1 rule). With no P2TR, OP_RETURN is appended and keys are final.
-    /// A key must not point to the OP_RETURN output.
+    ///
+    /// Each (shifted) key must resolve to an existing output that is not the OP_RETURN and has a
+    /// witness-seal script (P2PKH, P2SH, P2WPKH, P2WSH or P2TR), otherwise
+    /// [`Error::InvalidColoringInfo`] names the expected convention. These checks catch a final
+    /// vout passed by mistake only when the shift lands on the end of the PSBT or on an output that
+    /// cannot carry a seal; shifting onto another valid output cannot be told apart from a correct
+    /// key.
     ///
     /// Coloring must happen **before** any input is signed. Partial signatures are rejected
     /// because embedding the RGB commitment rewrites the OP_RETURN output and invalidates existing
@@ -786,6 +845,9 @@ impl Wallet {
     /// is `shift_output_map_for_opreturn_first`. With `require_full_allocation`, the `output_map`
     /// of each contract must re-assign exactly the amount found on the inputs, and inputs carrying
     /// non-asset assignments (e.g. inflation rights) are rejected, since they would be destroyed.
+    ///
+    /// This is [`Self::color_psbt_stage_runtime`] followed by [`Self::color_psbt_finalize`] with
+    /// the `coloring_info` static blinding as MPC entropy.
     pub(crate) fn color_psbt_with_prevouts_runtime(
         &self,
         runtime: &RgbRuntime,
@@ -795,6 +857,35 @@ impl Wallet {
         require_full_allocation: bool,
         shift_output_map_for_opreturn_first: bool,
     ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
+        let static_blinding = coloring_info.static_blinding;
+        let asset_beneficiaries = self.color_psbt_stage_runtime(
+            runtime,
+            psbt,
+            coloring_info,
+            prev_outputs,
+            require_full_allocation,
+            shift_output_map_for_opreturn_first,
+        )?;
+        let fascia = self.color_psbt_finalize(psbt, static_blinding)?;
+        info!(self.logger(), "Color PSBT completed");
+        Ok((fascia, asset_beneficiaries))
+    }
+
+    /// Build the RGB transitions for `coloring_info`, spending the allocations found on
+    /// `prev_outputs`, and push them into the PSBT without committing them.
+    ///
+    /// Same preconditions and checks as [`Self::color_psbt_with_prevouts_runtime`]. The PSBT stays
+    /// modifiable: further contracts can be staged on it (e.g. by a counterparty) before
+    /// [`Self::color_psbt_finalize`] commits all of them at once.
+    pub(crate) fn color_psbt_stage_runtime(
+        &self,
+        runtime: &RgbRuntime,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        prev_outputs: HashSet<OutPoint>,
+        require_full_allocation: bool,
+        shift_output_map_for_opreturn_first: bool,
+    ) -> Result<AssetBeneficiariesMap, Error> {
         let mut all_transitions: HashMap<ContractId, Transition> = HashMap::new();
         let mut asset_beneficiaries: AssetBeneficiariesMap = bmap![];
         let assignment_name = FieldName::from(RGB_STATE_ASSET_OWNER);
@@ -851,16 +942,9 @@ impl Wallet {
             let mut sending_amt: u64 = 0;
             // walk vouts in ascending order: iterating the HashMap directly would let the reported
             // validation error and the beneficiary ordering vary between otherwise identical calls
-            for (mut vout, amount) in BTreeMap::from_iter(asset_coloring_info.output_map) {
+            for (key, amount) in BTreeMap::from_iter(asset_coloring_info.output_map) {
                 if amount == 0 {
                     continue;
-                }
-                if shift_output_map_for_opreturn_first {
-                    vout = vout
-                        .checked_add(1)
-                        .ok_or_else(|| Error::InvalidColoringInfo {
-                            details: s!("vout in output_map is too large"),
-                        })?;
                 }
                 sending_amt =
                     sending_amt
@@ -868,19 +952,7 @@ impl Wallet {
                         .ok_or_else(|| Error::InvalidColoringInfo {
                             details: s!("total amount in output_map exceeds u64::MAX"),
                         })?;
-                if vout as usize >= psbt.unsigned_tx.output.len() {
-                    return Err(Error::InvalidColoringInfo {
-                        details: s!("invalid vout in output_map, does not exist in the given PSBT"),
-                    });
-                }
-                if psbt.unsigned_tx.output[vout as usize]
-                    .script_pubkey
-                    .is_op_return()
-                {
-                    return Err(Error::InvalidColoringInfo {
-                        details: format!("output_map vout {vout} points to the OP_RETURN output"),
-                    });
-                }
+                let vout = output_map_seal_vout(psbt, key, shift_output_map_for_opreturn_first)?;
                 let graph_seal = if let Some(blinding) = asset_coloring_info.static_blinding {
                     GraphSeal::with_blinded_vout(vout, blinding)
                 } else {
@@ -938,22 +1010,6 @@ impl Wallet {
             asset_beneficiaries.insert(contract_id, beneficiaries);
         }
 
-        let opreturn_index = psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .enumerate()
-            .find(|(_, o)| o.script_pubkey.is_op_return())
-            .expect("psbt should have an op_return output")
-            .0;
-        let opreturn_output = psbt.outputs.get_mut(opreturn_index).unwrap();
-        opreturn_output.set_opret_host();
-        if let Some(blinding) = coloring_info.static_blinding {
-            opreturn_output
-                .set_mpc_entropy(blinding)
-                .map_err(InternalError::from)?;
-        }
-
         for (contract_id, transition) in all_transitions {
             for opout in transition.inputs() {
                 psbt.set_rgb_contract_consumer(contract_id, opout, transition.id())
@@ -963,12 +1019,94 @@ impl Wallet {
                 .map_err(InternalError::from)?;
         }
 
-        psbt.set_rgb_close_method(CloseMethod::OpretFirst);
-        psbt.set_as_unmodifiable();
-        let fascia = psbt.rgb_commit().map_err(InternalError::from)?;
+        info!(self.logger(), "Stage RGB coloring completed");
+        Ok(asset_beneficiaries)
+    }
 
-        info!(self.logger(), "Color PSBT completed");
-        Ok((fascia, asset_beneficiaries))
+    /// Stage RGB coloring information onto a PSBT without finalizing the MPC commitment.
+    ///
+    /// Multiple parties may each call this method on the same PSBT (each for their own contracts),
+    /// in which case [`Self::color_psbt_finalize`] must be invoked once after all staging is
+    /// complete to produce the [`Fascia`]. `output_map` indexing (pre-OP_RETURN), its checks and
+    /// the signed-PSBT rejection follow [`Self::color_psbt`].
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn color_psbt_stage(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+    ) -> Result<AssetBeneficiariesMap, Error> {
+        info!(self.logger(), "Staging RGB coloring onto PSBT...");
+        let prev_outputs = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|txin| txin.previous_output)
+            .collect::<HashSet<OutPoint>>();
+        let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
+        let runtime = self.rgb_runtime()?;
+        self.color_psbt_stage_runtime(
+            &runtime,
+            psbt,
+            coloring_info,
+            prev_outputs,
+            false,
+            shift_output_map_for_opreturn_first,
+        )
+    }
+
+    /// Finalize the RGB commitment on a PSBT that has had one or more contracts staged via
+    /// [`Self::color_psbt_stage`]: the first OP_RETURN output becomes the opret host (with
+    /// `static_blinding` as MPC entropy, if given) and the PSBT is made unmodifiable. Must be
+    /// called exactly once per PSBT, after all staging is complete.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn color_psbt_finalize(
+        &self,
+        psbt: &mut Psbt,
+        static_blinding: Option<u64>,
+    ) -> Result<Fascia, Error> {
+        info!(self.logger(), "Finalizing RGB commitment on PSBT...");
+        let fascia = commit_staged_psbt(psbt, static_blinding)?;
+        info!(self.logger(), "Finalize RGB commitment completed");
+        Ok(fascia)
+    }
+
+    /// Produce an [`RgbTransfer`] consignment for a single contract given its beneficiaries
+    /// (typically obtained from a prior [`Self::color_psbt_stage`] call) and the witness
+    /// transaction ID of the PSBT being colored, built from the colored PSBT's `fascia` without
+    /// consuming it into the RGB stash.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn generate_transfer(
+        &self,
+        contract_id: ContractId,
+        beneficiaries: Vec<BuilderSeal<GraphSeal>>,
+        witness_txid: RgbTxid,
+        fascia: &Fascia,
+    ) -> Result<RgbTransfer, Error> {
+        let runtime = self.rgb_runtime()?;
+        let mut beneficiaries_witness = vec![];
+        let mut beneficiaries_blinded = vec![];
+        for builder_seal in beneficiaries {
+            match builder_seal {
+                BuilderSeal::Revealed(seal) => {
+                    beneficiaries_witness.push(ExplicitSeal::with(witness_txid, seal.vout));
+                }
+                BuilderSeal::Concealed(secret_seal) => {
+                    beneficiaries_blinded.push(secret_seal);
+                }
+            };
+        }
+        Ok(runtime.transfer_from_fascia(
+            contract_id,
+            beneficiaries_witness,
+            beneficiaries_blinded,
+            fascia,
+        )?)
     }
 
     /// Validate a counterparty's colored HTLC spend without reserving inputs or
@@ -1677,8 +1815,8 @@ impl Wallet {
 impl Wallet {
     /// Color a PSBT and persist recovery data before broadcast and stash consumption.
     ///
-    /// `output_map` indexing follows [`Self::color_psbt`] (legacy P2TR / `OpretFirst` +1 shift).
-    /// Every allocation found on the PSBT inputs must be re-assigned: each contract with
+    /// `output_map` indexing (pre-OP_RETURN, legacy P2TR / `OpretFirst` +1 shift) and its checks
+    /// follow [`Self::color_psbt`]. Every allocation found on the PSBT inputs must be re-assigned: each contract with
     /// allocations on the inputs must be listed in `coloring_info`, its `output_map` must assign
     /// the full input amount, and inputs carrying non-asset rights are rejected.
     ///
@@ -1734,6 +1872,82 @@ impl Wallet {
         drop(runtime);
         self.trigger_auto_backup();
         Ok(result)
+    }
+
+    /// Stage coloring spending only `prev_outputs`, requiring every allocation they carry to be
+    /// reassigned (no implicit burn): inputs carrying contracts absent from `coloring_info` or
+    /// non-asset rights are rejected, as is an `output_map` that does not re-assign the full input
+    /// amount of each contract.
+    pub(crate) fn color_psbt_stage_for_inputs(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        prev_outputs: HashSet<OutPoint>,
+    ) -> Result<AssetBeneficiariesMap, Error> {
+        let runtime = self.rgb_runtime()?;
+        // checked before `prepare_psbt_for_coloring`, which would otherwise insert an OP_RETURN
+        // into the caller's PSBT on the way to failing
+        self.reject_uncolored_input_contracts(&runtime, &prev_outputs, &coloring_info)?;
+        let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
+        self.color_psbt_stage_runtime(
+            &runtime,
+            psbt,
+            coloring_info,
+            prev_outputs,
+            true,
+            shift_output_map_for_opreturn_first,
+        )
+    }
+
+    /// Reconstruct an RGB fascia from a PSBT whose RGB commitment has already been finalized
+    /// (e.g. by a counterparty, with [`Self::color_psbt_finalize`]).
+    pub(crate) fn fascia_from_finalized_psbt(&self, psbt: &Psbt) -> Result<Fascia, Error> {
+        fascia_from_committed_psbt(psbt)
+    }
+
+    /// Record a colored PSBT as a [`TransferStatus::Initiated`] outgoing batch inside `txn`
+    /// without touching the RGB stash, writing the color-prepare recovery files first. The fascia
+    /// is applied later by [`Self::consume_transfer_fascia`], once the TX is known.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_consume_txn(
+        &self,
+        txn: &DbTxn,
+        psbt: &Psbt,
+        fascia: &Fascia,
+        coloring_info: &ColoringInfo,
+        prev_outputs: &HashSet<OutPoint>,
+        shift_output_map_for_opreturn_first: bool,
+        min_confirmations: u8,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<i32, Error> {
+        let runtime = self.rgb_runtime()?;
+        let mut spent: HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>> = HashMap::new();
+        for contract_id in coloring_info.asset_info_map.keys() {
+            let by_outpoint = spent.entry(*contract_id).or_default();
+            for (explicit_seal, opout_state_map) in
+                runtime.contract_assignments_for(*contract_id, prev_outputs.iter().copied())?
+            {
+                for (opout, state) in opout_state_map {
+                    by_outpoint
+                        .entry(explicit_seal.to_outpoint())
+                        .or_default()
+                        .push(Assignment::from_opout_and_state(opout, &state));
+                }
+            }
+        }
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        self.write_color_prepare_files(psbt, &txid, fascia, true)?;
+        self.persist_color_prepare_batch_txn(
+            txn,
+            psbt,
+            &txid,
+            &spent,
+            coloring_info,
+            shift_output_map_for_opreturn_first,
+            min_confirmations,
+            expiration_timestamp,
+            &runtime,
+        )
     }
 
     /// Apply a fascia previously prepared by [`Self::color_psbt_and_prepare_consume`] into the RGB
@@ -2128,34 +2342,15 @@ impl Wallet {
             let mut external_destinations: Vec<(u32, u64, String)> = Vec::new();
             let mut change_destinations: Vec<(u32, u64, String)> = Vec::new();
             if let Some(asset_coloring) = coloring_info.asset_info_map.get(contract_id) {
-                for (mut vout, amount) in BTreeMap::from_iter(asset_coloring.output_map.clone()) {
+                for (key, amount) in BTreeMap::from_iter(asset_coloring.output_map.clone()) {
                     if amount == 0 {
                         continue;
                     }
-                    if shift_output_map_for_opreturn_first {
-                        vout += 1;
-                    }
-                    if vout as usize >= psbt.unsigned_tx.output.len() {
-                        return Err(Error::InvalidColoringInfo {
-                            details: s!(
-                                "invalid vout in output_map, does not exist in the given PSBT"
-                            ),
-                        });
-                    }
+                    let vout =
+                        output_map_seal_vout(psbt, key, shift_output_map_for_opreturn_first)?;
                     let txout = &psbt.unsigned_tx.output[vout as usize];
-                    if txout.script_pubkey.is_op_return() {
-                        return Err(Error::InvalidColoringInfo {
-                            details: format!(
-                                "output_map vout {vout} points to the OP_RETURN output"
-                            ),
-                        });
-                    }
                     let address_payload = AddressPayload::from_script(&txout.script_pubkey)
-                        .map_err(|_| Error::InvalidColoringInfo {
-                            details: format!(
-                                "output_map vout {vout} script is not a standard address payload"
-                            ),
-                        })?;
+                        .expect("checked by output_map_seal_vout");
                     let beneficiary =
                         Beneficiary::WitnessVout(Pay2Vout::new(address_payload), None);
                     let recipient_id =
@@ -2735,13 +2930,6 @@ impl Wallet {
             rand::rng().random::<u64>(),
             rand::rng().random::<u64>()
         )
-    }
-
-    /// Reconstruct an RGB fascia from a PSBT whose RGB commitment has already been finalized
-    /// (e.g. by a counterparty).
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
-    pub(crate) fn fascia_from_finalized_psbt(&self, psbt: &Psbt) -> Result<Fascia, Error> {
-        fascia_from_committed_psbt(psbt)
     }
 
     /// Color an HTLC (or other external) PSBT for explicit input outpoints, write file-backed
@@ -3803,7 +3991,6 @@ impl Wallet {
 }
 
 /// Read the MPC minimum tree depth an untrusted PSBT output carries, within the allowed bounds.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 fn psbt_mpc_min_depth(output: &PsbtOutput) -> Result<u5, Error> {
     let Some(depth) = output.mpc_min_tree_depth() else {
         return Ok(MPC_MINIMAL_DEPTH);
@@ -3821,7 +4008,6 @@ fn psbt_mpc_min_depth(output: &PsbtOutput) -> Result<u5, Error> {
 /// Build an MPC tree from untrusted PSBT data, refusing any tree too large to build cheaply.
 ///
 /// The returned tree has not been walked yet: computing its commitment or block is bounded too.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 fn bounded_mpc_tree(
     min_depth: u5,
     messages: mpc::MessageMap,
@@ -3861,7 +4047,6 @@ fn bounded_mpc_tree(
 /// The bundles and the MPC messages are separate PSBT keys: without this, whoever finalizes a
 /// PSBT can commit another bundle for a contract (e.g. one sending its inputs to them) while the
 /// PSBT still shows the expected one.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
 fn check_bundles_committed<'a>(
     bundles: impl IntoIterator<Item = (&'a ContractId, &'a TransitionBundle)>,
     messages: &mpc::MessageMap,
@@ -3875,6 +4060,75 @@ fn check_bundles_committed<'a>(
         }
     }
     Ok(())
+}
+
+/// Check that `rgb_commit` will build a bounded MPC tree for `psbt`, before it builds it unchecked.
+///
+/// `rgb_commit` writes the MPC messages to the first opret host and commits the first OP_RETURN
+/// output's tree, so this replays that on the PSBT as staged, possibly by a counterparty.
+fn check_psbt_mpc_commit_bounds(psbt: &Psbt, commit_idx: usize) -> Result<(), Error> {
+    // only the committed output's key is read, but a stager has no reason to set one elsewhere
+    for output in &psbt.outputs {
+        psbt_mpc_min_depth(output)?;
+    }
+    // a close method set while staging is kept by `set_rgb_close_method` and picks the output
+    if psbt.rgb_close_method().map_err(InternalError::from)? != Some(CloseMethod::OpretFirst) {
+        return Err(Error::InvalidColoringInfo {
+            details: s!("PSBT RGB close method must be opret"),
+        });
+    }
+    let output = &psbt.outputs[commit_idx];
+    let mut messages = output
+        .mpc_message_map()
+        .map_err(InternalError::from)?
+        .release();
+    if psbt.outputs.iter().position(|o| o.is_opret_host()) == Some(commit_idx) {
+        let bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
+        for (contract_id, bundle) in bundles {
+            messages.insert(
+                ProtocolId::from(contract_id),
+                Message::from(bundle.bundle_id()),
+            );
+        }
+    }
+    let messages = Confined::try_from(messages).map_err(|_| Error::InvalidColoringInfo {
+        details: s!("PSBT has too many MPC messages"),
+    })?;
+    bounded_mpc_tree(psbt_mpc_min_depth(output)?, messages, output.mpc_entropy())?;
+    Ok(())
+}
+
+/// Commit the RGB transitions staged on `psbt` in its first OP_RETURN output.
+fn commit_staged_psbt(psbt: &mut Psbt, static_blinding: Option<u64>) -> Result<Fascia, Error> {
+    let opreturn_index = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .enumerate()
+        .find(|(_, o)| o.script_pubkey.is_op_return())
+        .ok_or_else(|| Error::InvalidColoringInfo {
+            details: s!("PSBT has no OP_RETURN output to host the RGB commitment"),
+        })?
+        .0;
+    let opreturn_output = psbt.outputs.get_mut(opreturn_index).unwrap();
+    opreturn_output.set_opret_host();
+    if let Some(blinding) = static_blinding {
+        opreturn_output
+            .set_mpc_entropy(blinding)
+            .map_err(InternalError::from)?;
+    }
+
+    psbt.set_rgb_close_method(CloseMethod::OpretFirst);
+    psbt.set_as_unmodifiable();
+    check_psbt_mpc_commit_bounds(psbt, opreturn_index)?;
+    let fascia = psbt.rgb_commit().map_err(InternalError::from)?;
+    // the fascia's merkle block is built from the committed output's messages, so check these
+    // carry every bundle: staging may have sent them to another output flagged as opret host
+    let messages = psbt.outputs[opreturn_index]
+        .mpc_message_map()
+        .map_err(InternalError::from)?;
+    check_bundles_committed(fascia.bundles().iter(), &messages)?;
+    Ok(fascia)
 }
 
 /// Rebuild the fascia of a PSBT whose RGB commitment was finalized, possibly by a counterparty.
@@ -4307,24 +4561,33 @@ mod tests {
     }
 
     #[test]
-    fn fascia_rebuild_rejects_out_of_bounds_mpc_depth() {
-        // invalid u5 values, and depths that would make the tree too large to build
-        for depth in [32, 255, MAX_PSBT_MPC_TREE_DEPTH + 1, 31] {
-            let (mut psbt, _) = committed_psbt();
-            psbt.outputs[0]
-                .proprietary
-                .insert(ProprietaryKey::mpc_min_tree_depth(), vec![depth]);
-            assert_rejected(fascia_from_committed_psbt(&psbt), "MPC tree depth");
-        }
-    }
-
-    #[test]
     fn fascia_rebuild_rejects_uncommitted_bundle() {
-        let (mut psbt, fascia) = committed_psbt();
+        let mut psbt = staged_psbt();
+        let fascia = commit_staged_psbt(&mut psbt, Some(7)).unwrap();
         let contract_id = *fascia.bundles().keys().next().unwrap();
+        let protocol_id = ProtocolId::from(contract_id);
         // commit another bundle ID for the contract, e.g. one moving its inputs to the attacker
+        psbt.outputs[0]
+            .proprietary
+            .insert(ProprietaryKey::mpc_message(protocol_id), vec![0x42u8; 32]);
+        let output = &psbt.outputs[0];
+        let tree = bounded_mpc_tree(
+            MPC_MINIMAL_DEPTH,
+            output.mpc_message_map().unwrap(),
+            output.mpc_entropy(),
+        )
+        .unwrap();
+        psbt.unsigned_tx.output[0].script_pubkey =
+            ScriptBuf::new_op_return(tree.commit_id().to_byte_array());
+        assert_rejected(fascia_from_committed_psbt(&psbt), "does not commit");
+
+        // without any message for the contract
+        psbt.outputs[0]
+            .proprietary
+            .remove(&ProprietaryKey::mpc_message(protocol_id));
+        let other_protocol_id = ProtocolId::copy_from_slice(&[0x11u8; 32]).unwrap();
         psbt.outputs[0].proprietary.insert(
-            ProprietaryKey::mpc_message(ProtocolId::from(contract_id)),
+            ProprietaryKey::mpc_message(other_protocol_id),
             vec![0x42u8; 32],
         );
         let output = &psbt.outputs[0];
@@ -4368,5 +4631,125 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing").join(STASH_CONSUMED_FILE);
         assert!(fsync_parent_dir(&path).is_err());
+    }
+
+    /// A PSBT with an empty OP_RETURN host at vout 0 and one staged (placeholder) RGB transition.
+    fn staged_psbt() -> Psbt {
+        let tx = BdkTransaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn::default()],
+            output: vec![
+                TxOut {
+                    value: BdkAmount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return([]),
+                },
+                TxOut {
+                    value: BdkAmount::from_sat(1_000),
+                    script_pubkey: ScriptBuf::new(),
+                },
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.push_rgb_transition(Transition::strict_dumb()).unwrap();
+        psbt
+    }
+
+    /// Plant the MPC minimum tree depth key, as a counterparty controlling the PSBT can.
+    fn set_mpc_min_depth(psbt: &mut Psbt, vout: usize, depth: u8) {
+        psbt.outputs[vout]
+            .proprietary
+            .insert(ProprietaryKey::mpc_min_tree_depth(), vec![depth]);
+    }
+
+    /// A PSBT committed by an honest finalizer, whose depth key is then rewritten.
+    fn committed_psbt_with_depth(depth: u8) -> Psbt {
+        let mut psbt = staged_psbt();
+        commit_staged_psbt(&mut psbt, Some(7)).unwrap();
+        set_mpc_min_depth(&mut psbt, 0, depth);
+        psbt
+    }
+
+    #[test]
+    fn fascia_rebuild_rejects_invalid_mpc_depth() {
+        for depth in [32, 255] {
+            let psbt = committed_psbt_with_depth(depth);
+            assert_rejected(fascia_from_committed_psbt(&psbt), "MPC tree depth");
+        }
+    }
+
+    #[test]
+    fn fascia_rebuild_rejects_over_cap_mpc_depth() {
+        // 31 would make the tree 2^31 leaves wide: this must fail fast instead of exhausting memory
+        for depth in [MAX_PSBT_MPC_TREE_DEPTH + 1, 31] {
+            let psbt = committed_psbt_with_depth(depth);
+            assert_rejected(fascia_from_committed_psbt(&psbt), "MPC tree depth");
+        }
+    }
+
+    #[test]
+    fn commit_rejects_invalid_mpc_depth() {
+        // the key is checked on every output, since the stager also controls the host flags
+        for (vout, depth) in [(0, 32), (0, 255), (1, 32), (1, 255)] {
+            let mut psbt = staged_psbt();
+            set_mpc_min_depth(&mut psbt, vout, depth);
+            assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "MPC tree depth");
+        }
+    }
+
+    #[test]
+    fn commit_rejects_over_cap_mpc_depth() {
+        for depth in [MAX_PSBT_MPC_TREE_DEPTH + 1, 31] {
+            let mut psbt = staged_psbt();
+            set_mpc_min_depth(&mut psbt, 0, depth);
+            assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "MPC tree depth");
+        }
+    }
+
+    #[test]
+    fn commit_rejects_too_many_mpc_messages() {
+        let mut psbt = staged_psbt();
+        for i in 0..MAX_PSBT_MPC_MESSAGES as u16 {
+            let mut protocol_id = [0xffu8; 32];
+            protocol_id[..2].copy_from_slice(&i.to_le_bytes());
+            psbt.outputs[0]
+                .set_mpc_message(
+                    ProtocolId::copy_from_slice(&protocol_id).unwrap(),
+                    Message::copy_from_slice(&[0u8; 32]).unwrap(),
+                )
+                .unwrap();
+        }
+        // with the staged transition's own message there is one too many
+        assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "MPC messages");
+    }
+
+    #[test]
+    fn commit_rejects_staged_close_method() {
+        let mut psbt = staged_psbt();
+        psbt.set_rgb_close_method(CloseMethod::TapretFirst);
+        assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "close method");
+    }
+
+    #[test]
+    fn commit_rejects_bundles_left_off_the_commitment() {
+        // the OP_RETURN is not the first output, and staging flagged an earlier one as opret
+        // host: the bundles' messages would go there while the OP_RETURN commits none of them
+        let mut psbt = staged_psbt();
+        psbt.unsigned_tx.output.swap(0, 1);
+        psbt.outputs[0].set_opret_host();
+        assert_rejected(commit_staged_psbt(&mut psbt, Some(7)), "does not commit");
+    }
+
+    #[test]
+    fn max_mpc_depth_commits_and_rebuilds() {
+        let mut psbt = staged_psbt();
+        set_mpc_min_depth(&mut psbt, 0, MAX_PSBT_MPC_TREE_DEPTH);
+        let fascia = commit_staged_psbt(&mut psbt, Some(7)).unwrap();
+        assert_eq!(
+            fascia.seal_witness().merkle_block.width_limit(),
+            1 << MAX_PSBT_MPC_TREE_DEPTH
+        );
+        let received = Psbt::from_str(&psbt.to_string()).unwrap();
+        assert_eq!(fascia_from_committed_psbt(&received).unwrap(), fascia);
     }
 }
