@@ -11,6 +11,38 @@
 //! `consume_transfer_fascia` and the unchecked fetch/accept halves stay Rust-only.
 
 use super::*;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use crate::wallet::online::proxy_get_consignment;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use amplify::num::u5;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use bdk_wallet::bitcoin::psbt::Output as PsbtOutput;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use rgbstd::AssignmentType;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use rgbstd::TransitionBundle;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use rgbstd::rgbcore::commit_verify::mpc::{self, MPC_MINIMAL_DEPTH};
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+use rgbstd::{containers::SealWitness, opret::OpretProof};
+
+/// Maximum depth of an MPC tree built from, or committed into, a PSBT.
+///
+/// The depth comes from a proprietary PSBT key (or from protocol ID collisions) that whoever built
+/// the PSBT controls, and building a tree of depth `d` walks and allocates `2^d` leaves: unchecked,
+/// depths of 28-31 exhaust CPU or memory, and values above 31 panic in [`u5::with`]. RGB starts
+/// from [`MPC_MINIMAL_DEPTH`] (3) and only goes deeper to place protocol IDs without collisions,
+/// so a few contracts take a depth of 3-6; 16 (65536 leaves) leaves ample room while keeping the
+/// tree cheap to build.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const MAX_PSBT_MPC_TREE_DEPTH: u8 = 16;
+
+/// Maximum number of MPC messages (one per RGB contract) in a PSBT's MPC tree.
+///
+/// This keeps placing them cheap and, being the birthday bound of a tree at
+/// [`MAX_PSBT_MPC_TREE_DEPTH`], lets them fit within it.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+const MAX_PSBT_MPC_MESSAGES: usize = 1 << (MAX_PSBT_MPC_TREE_DEPTH / 2);
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 const PSBT_OPS_DIR: &str = "psbt_ops";
@@ -96,6 +128,26 @@ pub(crate) fn psbt_op_consignment_path(op_dir: &Path, asset_id: &str) -> PathBuf
 const PSBT_OP_ID_LEN: usize = 32;
 /// Expiration applied by `psbt_op_prepare` when the caller gives none.
 pub const PSBT_OP_DEFAULT_EXPIRATION_SECS: u64 = 24 * 60 * 60;
+
+/// When a prepared PSBT operation may be failed by the expiry sweep.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsbtOpExpiry {
+    /// [`PSBT_OP_DEFAULT_EXPIRATION_SECS`] from now.
+    Default,
+    /// At this unix timestamp.
+    At(u64),
+    /// Never: the caller broadcasts the transaction itself and applies or aborts the operation
+    /// explicitly, so an operation whose transaction the indexer hasn't seen yet is never failed.
+    Never,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl From<Option<u64>> for PsbtOpExpiry {
+    fn from(expiration_timestamp: Option<u64>) -> Self {
+        expiration_timestamp.map_or(Self::Default, Self::At)
+    }
+}
 
 #[cfg(all(test, any(feature = "electrum", feature = "esplora")))]
 thread_local! {
@@ -186,6 +238,131 @@ pub struct PsbtOpPrepareResult {
     pub colored_psbt: String,
     /// Wallet-relative directory containing file-backed payloads.
     pub operation_dir: String,
+    /// What the operation's RGB transitions assign, read back from the committed fascia.
+    pub allocations: Vec<PsbtOpAllocation>,
+}
+
+/// One assignment a PSBT operation's RGB transitions make, read back from its committed fascia
+/// (not from the [`ColoringInfo`] the operation was prepared with).
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PsbtOpAllocation {
+    /// Contract the assignment belongs to, in its canonical spelling.
+    pub asset_id: String,
+    /// Output of the witness transaction the assignment is sealed to; `None` when the seal is
+    /// concealed or points to another transaction.
+    pub vout: Option<u32>,
+    /// The assigned state.
+    pub assignment: Assignment,
+}
+
+/// A consignment fetched from a proxy, before any validation.
+///
+/// **Unchecked:** `txid` and `vout` are what the proxy reported. Pass it to
+/// [`Wallet::accept_transfer_pinned`], which pins the witness output before accepting.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone)]
+pub struct FetchedConsignment {
+    /// The consignment.
+    pub consignment: RgbTransfer,
+    /// Witness transaction ID reported by the proxy.
+    pub txid: String,
+    /// Witness output reported by the proxy.
+    pub vout: u32,
+}
+
+/// Result of [`Wallet::accept_transfer_pinned`].
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[derive(Debug, Clone)]
+pub struct AcceptedTransfer {
+    /// The accepted consignment.
+    pub consignment: RgbTransfer,
+    /// Assignments received on the pinned witness output.
+    pub assignments: Vec<Assignment>,
+    /// The pinned witness output.
+    pub outpoint: Outpoint,
+}
+
+/// Fetch an RGB consignment by recipient_id (proxy lookup key), without a wallet: what
+/// [`Wallet::fetch_consignment_by_recipient_id_unchecked`] does, so it can run off the thread
+/// that owns the wallet.
+///
+/// **Unchecked:** `txid` and `vout` come from the proxy and are **not** validated here. Accept
+/// the result with [`Wallet::accept_transfer_pinned`], which pins the witness output first.
+///
+/// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub fn fetch_consignment_by_recipient_id_unchecked(
+    recipient_id: String,
+    consignment_endpoint: &str,
+) -> Result<FetchedConsignment, Error> {
+    let proxy_url = TransportEndpoint::new(consignment_endpoint.to_string())?.endpoint;
+    let consignment_res = proxy_get_consignment(
+        &proxy_url,
+        &recipient_id,
+        &Logger::root(slog::Discard, o!()),
+    )?;
+    let vout = consignment_res.vout.ok_or_else(|| Error::Internal {
+        details: s!("missing vout in consignment response"),
+    })?;
+    let consignment_bytes = general_purpose::STANDARD
+        .decode(consignment_res.consignment)
+        .map_err(InternalError::from)?;
+    let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
+    Ok(FetchedConsignment {
+        consignment,
+        txid: consignment_res.txid,
+        vout,
+    })
+}
+
+/// What `fascia`'s transitions assign. Every owned-state type the wallet's schemas define is
+/// reported; any other is an error rather than left out.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn fascia_allocations(fascia: &Fascia) -> Result<Vec<PsbtOpAllocation>, Error> {
+    fn witness_vout(seal: Option<GraphSeal>) -> Option<u32> {
+        seal.filter(|seal| seal.txid == TxPtr::WitnessTx)
+            .map(|seal| seal.vout.into_u32())
+    }
+    let mut allocations = vec![];
+    for (contract_id, bundle) in fascia.bundles() {
+        let asset_id = contract_id.to_string();
+        let unknown = |ass_type: &AssignmentType| Error::Inconsistency {
+            details: format!("fascia for {asset_id} assigns unknown owned state {ass_type}"),
+        };
+        for KnownTransition { transition, .. } in bundle.known_transitions.iter() {
+            for (ass_type, typed_assigns) in transition.assignments.iter() {
+                let mut found = vec![];
+                for assign in typed_assigns.as_fungible() {
+                    let amount = assign.as_revealed_state().as_u64();
+                    let assignment =
+                        Assignment::fungible(*ass_type, amount).ok_or_else(|| unknown(ass_type))?;
+                    found.push((witness_vout(assign.revealed_seal()), assignment));
+                }
+                for assign in typed_assigns.as_structured() {
+                    found.push((
+                        witness_vout(assign.revealed_seal()),
+                        Assignment::NonFungible,
+                    ));
+                }
+                // no schema this wallet supports assigns declarative (void) owned state
+                if !typed_assigns.as_declarative().is_empty() {
+                    return Err(unknown(ass_type));
+                }
+                allocations.extend(
+                    found
+                        .into_iter()
+                        .map(|(vout, assignment)| PsbtOpAllocation {
+                            asset_id: asset_id.clone(),
+                            vout,
+                            assignment,
+                        }),
+                );
+            }
+        }
+    }
+    allocations.sort();
+    Ok(allocations)
 }
 
 /// Recovered HTLC operation (lookup after a lost `psbt_op_prepare` response).
@@ -204,6 +381,8 @@ pub struct PsbtOperation {
     pub broadcast: PsbtBroadcastState,
     /// Witness txid committed at prepare.
     pub txid: String,
+    /// What the operation's RGB transitions assign, read back from the committed fascia.
+    pub allocations: Vec<PsbtOpAllocation>,
 }
 
 /// Caller intent for HTLC / special accept paths.
@@ -774,6 +953,129 @@ impl Wallet {
         Ok((fascia, asset_beneficiaries))
     }
 
+    /// Validate a counterparty's colored HTLC spend without reserving inputs or
+    /// consuming its transitions. The wallet must already know the lock's RGB history.
+    /// Only one contract/transition, consuming all state on `locked_outpoint`
+    /// and assigning exactly `amount` to `payment_vout`, is accepted.
+    /// Bitcoin prevout identity, fee policy and signing authorization are the caller's job.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn validate_htlc_spend(
+        &self,
+        psbt: &Psbt,
+        contract_id: ContractId,
+        locked_outpoint: OutPoint,
+        amount: u64,
+        payment_vout: u32,
+        indexer_url: &str,
+    ) -> Result<Vec<PsbtOpAllocation>, Error> {
+        let invalid = |details: &str| Error::InvalidColoringInfo {
+            details: details.to_owned(),
+        };
+        if psbt.unsigned_tx.output.get(payment_vout as usize).is_none()
+            || psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .filter(|i| i.previous_output == locked_outpoint)
+                .count()
+                != 1
+        {
+            return Err(invalid(
+                "HTLC spend must contain the pinned input and payment output",
+            ));
+        }
+        let fascia = self.fascia_from_finalized_psbt(psbt)?;
+        let bundles: Vec<_> = fascia.bundles().iter().collect();
+        if bundles.len() != 1
+            || *bundles[0].0 != contract_id
+            || bundles[0].1.known_transitions.len() != 1
+        {
+            return Err(invalid(
+                "HTLC spend must contain exactly one known contract transition",
+            ));
+        }
+        let allocations = fascia_allocations(&fascia)?;
+        if allocations
+            != vec![PsbtOpAllocation {
+                asset_id: contract_id.to_string(),
+                vout: Some(payment_vout),
+                assignment: Assignment::Fungible(amount),
+            }]
+        {
+            return Err(invalid(
+                "HTLC spend does not preserve the exact allocation at the payment output",
+            ));
+        }
+        let runtime = self.rgb_runtime()?;
+        let other_inputs: Vec<_> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|i| i.previous_output)
+            .filter(|outpoint| *outpoint != locked_outpoint)
+            .collect();
+        if !runtime.contracts_assigning(other_inputs)?.is_empty()
+            || runtime.contracts_assigning([locked_outpoint])? != BTreeSet::from([contract_id])
+        {
+            return Err(invalid(
+                "HTLC spend would leave another known RGB allocation uncolored",
+            ));
+        }
+        let mut expected = BTreeSet::new();
+        for (_, states) in runtime.contract_assignments_for(contract_id, [locked_outpoint])? {
+            expected.extend(states.keys().copied());
+        }
+        let bundle = bundles[0].1;
+        let consumed: BTreeSet<_> = bundle.known_transitions[0]
+            .transition
+            .inputs
+            .iter()
+            .copied()
+            .collect();
+        let mapped: BTreeSet<_> = bundle.input_map.keys().copied().collect();
+        if expected.is_empty() || consumed != expected || mapped != expected {
+            return Err(invalid(
+                "HTLC transition must consume precisely the pinned lock's known RGB state",
+            ));
+        }
+        let witness_id = fascia.witness_id();
+        let consignment = runtime.transfer_from_fascia(
+            contract_id,
+            vec![ExplicitSeal::with(witness_id, payment_vout)],
+            Vec::new(),
+            &fascia,
+        )?;
+        let (_, fallback) = get_indexer_and_resolver(indexer_url, self.bitcoin_network())?;
+        let resolver = crate::utils::OffchainResolver {
+            witness_id,
+            consignment: &consignment,
+            fallback: &fallback,
+        };
+        let schema: AssetSchema = consignment.schema_id().try_into()?;
+        let config = ValidationConfig {
+            chain_net: self.bitcoin_network().into(),
+            trusted_typesystem: schema.types(),
+            ..Default::default()
+        };
+        consignment
+            .clone()
+            .validate(&resolver, &config)
+            .map_err(|e| match e {
+                ValidationError::ResolverError(e) => Error::Network {
+                    details: e.to_string(),
+                },
+                ValidationError::InvalidConsignment(e) => Error::InvalidColoringInfo {
+                    details: format!("invalid HTLC spend proof: {e}"),
+                },
+            })?;
+        Ok(allocations)
+    }
+
+    /// Stage RGB coloring information onto a PSBT without finalizing the MPC commitment.
+    ///
+    /// Multiple parties may each call this method on the same PSBT (each for their own contracts),
+    /// in which case [`Wallet::color_psbt_finalize`] must be invoked once after all staging is
+    /// complete to produce the [`Fascia`]. `output_map` indexing follows [`Self::color_psbt`].
     /// Color a PSBT, consume the RGB fascia and return the related consignment.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
@@ -2178,7 +2480,7 @@ impl Wallet {
     }
 
     fn psbt_op_from_meta(&self, meta: &PsbtOpMeta) -> Result<PsbtOperation, Error> {
-        let (psbt, _) = self.psbt_op_verify_committed_payloads(meta)?;
+        let (psbt, fascia) = self.psbt_op_verify_committed_payloads(meta)?;
         let operation_dir = PathBuf::from(PSBT_OPS_DIR)
             .join(&meta.operation_id)
             .to_string_lossy()
@@ -2190,6 +2492,7 @@ impl Wallet {
             status: meta.status,
             broadcast: meta.broadcast,
             txid: meta.txid.clone(),
+            allocations: fascia_allocations(&fascia)?,
         })
     }
 
@@ -2222,9 +2525,17 @@ impl Wallet {
         )
     }
 
+    /// Reconstruct an RGB fascia from a PSBT whose RGB commitment has already been finalized
+    /// (e.g. by a counterparty).
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub(crate) fn fascia_from_finalized_psbt(&self, psbt: &Psbt) -> Result<Fascia, Error> {
+        fascia_from_committed_psbt(psbt)
+    }
+
     /// Color an HTLC (or other external) PSBT for explicit input outpoints, write file-backed
     /// payloads under `psbt_ops/{operation_id}/`, and persist SQL accounting for colored contracts.
-    /// `expiration_timestamp` defaults to [`PSBT_OP_DEFAULT_EXPIRATION_SECS`] from now.
+    /// `expiration_timestamp` defaults to [`PSBT_OP_DEFAULT_EXPIRATION_SECS`] from now; see
+    /// [`Self::psbt_op_prepare_with_expiry`] to disable expiry.
     ///
     /// `output_map` keys are **final** PSBT vouts (same as [`Self::color_psbt_for_outpoints`]).
     /// Foreign escrow outpoints are listed in `foreign_inputs.json` (audit log for integrators; the
@@ -2247,11 +2558,36 @@ impl Wallet {
         min_confirmations: u8,
         expiration_timestamp: Option<u64>,
     ) -> Result<PsbtOpPrepareResult, Error> {
+        self.psbt_op_prepare_with_expiry(
+            psbt,
+            coloring_info,
+            input_outpoints,
+            min_confirmations,
+            expiration_timestamp.into(),
+        )
+    }
+
+    /// [`Self::psbt_op_prepare`] with an explicit [`PsbtOpExpiry`].
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn psbt_op_prepare_with_expiry(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        input_outpoints: Vec<OutPoint>,
+        min_confirmations: u8,
+        expiry: PsbtOpExpiry,
+    ) -> Result<PsbtOpPrepareResult, Error> {
         info!(self.logger(), "Preparing HTLC color operation...");
-        let expiration_timestamp =
-            Some(expiration_timestamp.unwrap_or_else(|| {
-                now().unix_timestamp() as u64 + PSBT_OP_DEFAULT_EXPIRATION_SECS
-            }));
+        let expiration_timestamp = match expiry {
+            PsbtOpExpiry::Default => {
+                Some(now().unix_timestamp() as u64 + PSBT_OP_DEFAULT_EXPIRATION_SECS)
+            }
+            PsbtOpExpiry::At(timestamp) => Some(timestamp),
+            PsbtOpExpiry::Never => None,
+        };
         let (runtime, override_set) =
             self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
         let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(
@@ -2304,6 +2640,7 @@ impl Wallet {
         }
 
         let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let allocations = fascia_allocations(&fascia)?;
         let foreign_inputs = self.collect_foreign_input_entries(&spent)?;
 
         let operation_id = Self::new_psbt_op_id();
@@ -2391,6 +2728,7 @@ impl Wallet {
             operation_id,
             colored_psbt: psbt.to_string(),
             operation_dir,
+            allocations,
         })
     }
 
@@ -2822,6 +3160,103 @@ impl Wallet {
         }
     }
 
+    /// List the HTLC operations whose colored PSBT spends `outpoint`, in any status, ordered by
+    /// creation time (to the second).
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn psbt_ops_spending(&self, outpoint: Outpoint) -> Result<Vec<PsbtOperation>, Error> {
+        let spent = OutPoint::from_str(&outpoint.to_string()).map_err(|_| Error::InvalidTxid)?;
+        let mut metas = self.psbt_op_scan()?;
+        metas.sort_by(|a, b| (a.created_at, &a.operation_id).cmp(&(b.created_at, &b.operation_id)));
+        let mut ops = vec![];
+        for meta in metas {
+            // Cheap filter on the PSBT alone; matches are fully verified below. An unreadable
+            // PSBT is an error: skipping it could hide an operation spending `outpoint`.
+            let path = self
+                .psbt_op_dir(&meta.operation_id)?
+                .join(PSBT_OP_COLORED_PSBT_FILE);
+            let psbt =
+                Psbt::from_str(&fs::read_to_string(&path)?).map_err(|e| Error::Inconsistency {
+                    details: format!(
+                        "HTLC operation {} has an unreadable colored PSBT: {e}",
+                        meta.operation_id
+                    ),
+                })?;
+            if psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .any(|i| i.previous_output == spent)
+            {
+                ops.push(self.psbt_op_from_meta(&meta)?);
+            }
+        }
+        Ok(ops)
+    }
+
+    /// Hand the consignment an applied HTLC operation produced for `asset_id` to the wallet's
+    /// pending receive it pays (e.g. the witness receive a claim spends to), as
+    /// [`provide_out_of_band_consignment`](Wallet::provide_out_of_band_consignment) would.
+    ///
+    /// `asset_id` may be in any spelling rgb-lib parses. The operation must be applied: the
+    /// consignment of an operation that may never confirm, or was aborted, is never handed over.
+    /// As with `provide_out_of_band_consignment`, it is an error when no pending receive matches,
+    /// including once the receive has already been handed the consignment.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn psbt_op_provide_receive_consignment(
+        &mut self,
+        online: Online,
+        operation_id: &str,
+        asset_id: &str,
+    ) -> Result<RefreshResult, Error> {
+        info!(
+            self.logger(),
+            "Providing HTLC operation {operation_id} consignment to its receive..."
+        );
+        self.check_online(online)?;
+        let asset_id = ContractId::from_str(asset_id)
+            .map_err(|_| Error::AssetNotFound {
+                asset_id: asset_id.to_string(),
+            })?
+            .to_string();
+        let meta = self.psbt_op_read_meta(operation_id)?;
+        if !matches!(
+            meta.status,
+            PsbtOperationStatus::Applied | PsbtOperationStatus::Settled
+        ) {
+            return Err(Error::InvalidPsbtOperationStatus {
+                details: format!(
+                    "operation {operation_id} is {:?}, expected Applied or Settled",
+                    meta.status
+                ),
+            });
+        }
+        self.psbt_op_verify_committed_payloads(&meta)?;
+        if !meta.hashes.consignments.contains_key(&asset_id) {
+            return Err(Error::CannotProvideOutOfBandConsignment {
+                details: format!("operation {operation_id} has no consignment for {asset_id}"),
+            });
+        }
+        let path = psbt_op_consignment_path(&self.psbt_op_dir(operation_id)?, &asset_id);
+        let path = path
+            .to_str()
+            .ok_or_else(|| Error::Internal {
+                details: s!("consignment path is not valid UTF-8"),
+            })?
+            .to_owned();
+        let res = self.provide_out_of_band_consignment(online, path, vec![])?;
+        info!(
+            self.logger(),
+            "Provide HTLC operation consignment completed"
+        );
+        Ok(res)
+    }
+
     /// Read HTLC operation status; marks Settled when a linked batch has settled.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
@@ -2866,18 +3301,9 @@ impl Wallet {
         recipient_id: String,
         consignment_endpoint: &str,
     ) -> Result<(RgbTransfer, String, u32), Error> {
-        let proxy_url = TransportEndpoint::new(consignment_endpoint.to_string())?.endpoint;
-        let consignment_res = self.get_consignment(&proxy_url, recipient_id)?;
-        let vout = consignment_res.vout.ok_or_else(|| Error::Internal {
-            details: s!("missing vout in consignment response"),
-        })?;
-
-        let consignment_bytes = general_purpose::STANDARD
-            .decode(consignment_res.consignment)
-            .map_err(InternalError::from)?;
-        let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
-
-        Ok((consignment, consignment_res.txid, vout))
+        let fetched =
+            self::fetch_consignment_by_recipient_id_unchecked(recipient_id, consignment_endpoint)?;
+        Ok((fetched.consignment, fetched.txid, fetched.vout))
     }
 
     /// Fetch a consignment by proxy key, pin the witness output to `witness_recipient_id`, and
@@ -2908,27 +3334,69 @@ impl Wallet {
         expected: ExpectedTransfer,
     ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
         self.check_online(online)?;
-        let (consignment, txid, vout) = self.fetch_consignment_by_recipient_id_unchecked(
+        let fetched = self::fetch_consignment_by_recipient_id_unchecked(
             proxy_recipient_id,
             consignment_endpoint,
         )?;
+        let accepted = self.accept_transfer_pinned(
+            online,
+            fetched,
+            witness_recipient_id,
+            blinding,
+            min_confirmations,
+            expected,
+        )?;
+        Ok((accepted.consignment, accepted.assignments))
+    }
+
+    /// Accept a consignment fetched with [`fetch_consignment_by_recipient_id_unchecked`]: pin
+    /// `output[vout]` of the witness transaction to `witness_recipient_id` with at least
+    /// `min_confirmations`, check the transfer matches `expected`, and accept it.
+    ///
+    /// [`Self::fetch_and_accept_transfer_by_recipient_id`] is the fetch followed by this. Neither
+    /// saves the asset: a wallet that never held it calls [`Self::save_new_asset`] before coloring
+    /// a spend of the received allocation.
+    ///
+    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn accept_transfer_pinned(
+        &mut self,
+        online: Online,
+        fetched: FetchedConsignment,
+        witness_recipient_id: String,
+        blinding: u64,
+        min_confirmations: u8,
+        expected: ExpectedTransfer,
+    ) -> Result<AcceptedTransfer, Error> {
+        info!(self.logger(), "Accepting pinned transfer...");
+        self.check_online(online)?;
         pin_witness_output_to_recipient_id(
             self.blockchain_resolver(),
             self.indexer(),
             self.chain_net(),
             &witness_recipient_id,
-            &txid,
-            vout,
+            &fetched.txid,
+            fetched.vout,
             min_confirmations,
         )?;
-        self.accept_transfer_from_consignment_unchecked(
+        let outpoint = Outpoint {
+            txid: fetched.txid.clone(),
+            vout: fetched.vout,
+        };
+        let (consignment, assignments) = self.accept_transfer_from_consignment_unchecked(
             online,
-            consignment,
-            txid,
-            vout,
+            fetched.consignment,
+            fetched.txid,
+            fetched.vout,
             blinding,
             expected,
-        )
+        )?;
+        info!(self.logger(), "Accept pinned transfer completed");
+        Ok(AcceptedTransfer {
+            consignment,
+            assignments,
+            outpoint,
+        })
     }
 
     /// Accept an RGB transfer from a pre-fetched consignment.
@@ -3115,10 +3583,134 @@ impl Wallet {
     }
 }
 
+/// Read the MPC minimum tree depth an untrusted PSBT output carries, within the allowed bounds.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn psbt_mpc_min_depth(output: &PsbtOutput) -> Result<u5, Error> {
+    let Some(depth) = output.mpc_min_tree_depth() else {
+        return Ok(MPC_MINIMAL_DEPTH);
+    };
+    u5::try_from(depth)
+        .ok()
+        .filter(|d| d.to_u8() <= MAX_PSBT_MPC_TREE_DEPTH)
+        .ok_or_else(|| Error::InvalidColoringInfo {
+            details: format!(
+                "PSBT MPC tree depth {depth} exceeds the maximum of {MAX_PSBT_MPC_TREE_DEPTH}"
+            ),
+        })
+}
+
+/// Build an MPC tree from untrusted PSBT data, refusing any tree too large to build cheaply.
+///
+/// The returned tree has not been walked yet: computing its commitment or block is bounded too.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn bounded_mpc_tree(
+    min_depth: u5,
+    messages: mpc::MessageMap,
+    static_entropy: Option<u64>,
+) -> Result<mpc::MerkleTree, Error> {
+    if messages.len() > MAX_PSBT_MPC_MESSAGES {
+        return Err(Error::InvalidColoringInfo {
+            details: format!(
+                "PSBT has {} MPC messages, more than the maximum of {MAX_PSBT_MPC_MESSAGES}",
+                messages.len()
+            ),
+        });
+    }
+    let source = mpc::MultiSource {
+        min_depth,
+        messages,
+        static_entropy,
+    };
+    let merkle_tree =
+        mpc::MerkleTree::try_commit(&source).map_err(|e| Error::InvalidColoringInfo {
+            details: format!("failed to build RGB MPC tree: {e}"),
+        })?;
+    // placing the messages may have needed a deeper tree than the minimum
+    let depth = merkle_tree.depth().to_u8();
+    if depth > MAX_PSBT_MPC_TREE_DEPTH {
+        return Err(Error::InvalidColoringInfo {
+            details: format!(
+                "PSBT MPC tree depth {depth} exceeds the maximum of {MAX_PSBT_MPC_TREE_DEPTH}"
+            ),
+        });
+    }
+    Ok(merkle_tree)
+}
+
+/// Check that `messages` commit every bundle, under its contract, by its bundle ID.
+///
+/// The bundles and the MPC messages are separate PSBT keys: without this, whoever finalizes a
+/// PSBT can commit another bundle for a contract (e.g. one sending its inputs to them) while the
+/// PSBT still shows the expected one.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn check_bundles_committed<'a>(
+    bundles: impl IntoIterator<Item = (&'a ContractId, &'a TransitionBundle)>,
+    messages: &mpc::MessageMap,
+) -> Result<(), Error> {
+    for (contract_id, bundle) in bundles {
+        if messages.get(&ProtocolId::from(*contract_id)) != Some(&Message::from(bundle.bundle_id()))
+        {
+            return Err(Error::InvalidColoringInfo {
+                details: format!("PSBT MPC commitment does not commit the bundle of {contract_id}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild the fascia of a PSBT whose RGB commitment was finalized, possibly by a counterparty.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+fn fascia_from_committed_psbt(psbt: &Psbt) -> Result<Fascia, Error> {
+    let bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
+    // `rgb_commit` commits the MPC messages in the first OP_RETURN, which need not be vout 0.
+    // Its opret host flag is removed on commit, and any other output has an empty (not
+    // missing) message map, so look the output up by its script and check its commitment.
+    let opret_idx = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .position(|o| o.script_pubkey.is_op_return())
+        .ok_or_else(|| Error::InvalidColoringInfo {
+            details: s!("PSBT has no OP_RETURN output hosting the RGB commitment"),
+        })?;
+    let output = psbt
+        .outputs
+        .get(opret_idx)
+        .ok_or_else(|| Error::InvalidColoringInfo {
+            details: s!("PSBT has no map for its OP_RETURN output"),
+        })?;
+    let messages = output.mpc_message_map().map_err(InternalError::from)?;
+    if messages.is_empty() {
+        return Err(Error::InvalidColoringInfo {
+            details: s!("PSBT OP_RETURN output carries no RGB MPC messages"),
+        });
+    }
+    check_bundles_committed(&bundles, &messages)?;
+    let merkle_tree =
+        bounded_mpc_tree(psbt_mpc_min_depth(output)?, messages, output.mpc_entropy())?;
+    let expected_script = ScriptBuf::new_op_return(merkle_tree.commit_id().to_byte_array());
+    if psbt.unsigned_tx.output[opret_idx].script_pubkey != expected_script {
+        return Err(Error::InvalidColoringInfo {
+            details: s!("PSBT OP_RETURN output does not carry its RGB MPC commitment"),
+        });
+    }
+    let merkle_block = mpc::MerkleBlock::from(merkle_tree);
+    let bundles = Confined::try_from(bundles).map_err(|_| Error::InvalidColoringInfo {
+        details: s!("PSBT has no RGB bundles"),
+    })?;
+    let seal_witness = SealWitness::new(
+        PubWitness::with(psbt.unsigned_tx.clone()),
+        merkle_block,
+        OpretProof::default().into(),
+    );
+    Ok(Fascia::new(seal_witness, bundles))
+}
+
 #[cfg(test)]
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 mod tests {
     use super::*;
+    use psrgbt::RgbPropKeyExt;
 
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     #[test]
@@ -3287,5 +3879,96 @@ mod tests {
         assert!(marker.exists());
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A one-transition PSBT committed by an honest finalizer, in its first (OP_RETURN) output.
+    fn committed_psbt() -> (Psbt, Fascia) {
+        let tx = BdkTransaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![
+                TxOut {
+                    value: BdkAmount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return([]),
+                },
+                TxOut {
+                    value: BdkAmount::from_sat(1_000),
+                    script_pubkey: ScriptBuf::new(),
+                },
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.push_rgb_transition(Transition::strict_dumb()).unwrap();
+        psbt.outputs[0].set_opret_host();
+        psbt.outputs[0].set_mpc_entropy(7).unwrap();
+        psbt.set_rgb_close_method(CloseMethod::OpretFirst);
+        psbt.set_as_unmodifiable();
+        let fascia = psbt.rgb_commit().unwrap();
+        (psbt, fascia)
+    }
+
+    #[track_caller]
+    fn assert_rejected<T>(result: Result<T, Error>, expected: &str) {
+        match result {
+            Err(Error::InvalidColoringInfo { details }) => {
+                assert!(details.contains(expected), "unexpected error: {details}")
+            }
+            Err(e) => panic!("expected an error containing {expected:?}, got {e:?}"),
+            Ok(_) => panic!("expected an error containing {expected:?}, got Ok"),
+        }
+    }
+
+    #[test]
+    fn fascia_rebuild_round_trips_an_honest_commitment() {
+        let (psbt, fascia) = committed_psbt();
+        let received = Psbt::from_str(&psbt.to_string()).unwrap();
+        assert_eq!(fascia_from_committed_psbt(&received).unwrap(), fascia);
+    }
+
+    #[test]
+    fn fascia_rebuild_rejects_out_of_bounds_mpc_depth() {
+        // invalid u5 values, and depths that would make the tree too large to build
+        for depth in [32, 255, MAX_PSBT_MPC_TREE_DEPTH + 1, 31] {
+            let (mut psbt, _) = committed_psbt();
+            psbt.outputs[0]
+                .proprietary
+                .insert(ProprietaryKey::mpc_min_tree_depth(), vec![depth]);
+            assert_rejected(fascia_from_committed_psbt(&psbt), "MPC tree depth");
+        }
+    }
+
+    #[test]
+    fn fascia_rebuild_rejects_uncommitted_bundle() {
+        let (mut psbt, fascia) = committed_psbt();
+        let contract_id = *fascia.bundles().keys().next().unwrap();
+        // commit another bundle ID for the contract, e.g. one moving its inputs to the attacker
+        psbt.outputs[0].proprietary.insert(
+            ProprietaryKey::mpc_message(ProtocolId::from(contract_id)),
+            vec![0x42u8; 32],
+        );
+        let output = &psbt.outputs[0];
+        let tree = bounded_mpc_tree(
+            MPC_MINIMAL_DEPTH,
+            output.mpc_message_map().unwrap(),
+            output.mpc_entropy(),
+        )
+        .unwrap();
+        psbt.unsigned_tx.output[0].script_pubkey =
+            ScriptBuf::new_op_return(tree.commit_id().to_byte_array());
+        assert_rejected(fascia_from_committed_psbt(&psbt), "does not commit");
+    }
+
+    #[test]
+    fn fascia_rebuild_needs_the_op_return_commitment() {
+        // the commitment host is found by script, not by the first output with a message map
+        let (mut psbt, _) = committed_psbt();
+        psbt.unsigned_tx.output.swap(0, 1);
+        psbt.outputs.swap(0, 1);
+        let received = Psbt::from_str(&psbt.to_string()).unwrap();
+        assert!(fascia_from_committed_psbt(&received).is_ok());
+        // an OP_RETURN that doesn't carry the commitment is refused
+        psbt.unsigned_tx.output[1].script_pubkey = ScriptBuf::new_op_return([0u8; 32]);
+        assert_rejected(fascia_from_committed_psbt(&psbt), "does not carry");
     }
 }
