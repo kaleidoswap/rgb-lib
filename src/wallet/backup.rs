@@ -67,6 +67,116 @@ impl BackupPubData {
     }
 }
 
+/// A wallet's data zipped for a backup, before encryption.
+///
+/// Taken with [`backup_snapshot`](crate::wallet::WalletOffline::backup_snapshot) on the thread that
+/// owns the wallet; [`seal_backup`] encrypts and writes it without the wallet.
+pub struct BackupSnapshot {
+    paths: BackupPaths,
+    backup_file: PathBuf,
+    wallet_dir: PathBuf,
+    taken_at: i128,
+    logger: Logger,
+}
+
+impl fmt::Debug for BackupSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("BackupSnapshot")
+            .field("backup_file", &self.backup_file)
+            .field("wallet_dir", &self.wallet_dir)
+            .field("taken_at", &self.taken_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A backup file written by [`seal_backup`], to record with
+/// [`backup_mark_done`](crate::wallet::WalletOffline::backup_mark_done) once it is safely stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedBackup {
+    pub(crate) wallet_dir: PathBuf,
+    pub(crate) taken_at: i128,
+}
+
+/// Encrypt the [`BackupSnapshot`] with `password` and write it to the backup path it was taken
+/// for, in the format [`backup`](crate::wallet::WalletOffline::backup) writes and
+/// [`restore_backup`] reads.
+///
+/// This doesn't touch the wallet, so it can run on another thread while the wallet keeps
+/// working. Nothing is recorded as backed up: pass the result to
+/// [`backup_mark_done`](crate::wallet::WalletOffline::backup_mark_done) once the file is safely
+/// stored.
+pub fn seal_backup(snapshot: BackupSnapshot, password: &str) -> Result<SealedBackup, Error> {
+    seal_snapshot(snapshot, password, None)
+}
+
+pub(crate) fn seal_snapshot(
+    snapshot: BackupSnapshot,
+    password: &str,
+    scrypt_params: Option<ScryptParams>,
+) -> Result<SealedBackup, Error> {
+    let BackupSnapshot {
+        paths,
+        backup_file,
+        wallet_dir,
+        taken_at,
+        logger,
+    } = snapshot;
+    // it may have appeared since the snapshot was taken
+    if backup_file.exists() {
+        return Err(Error::FileAlreadyExists {
+            path: backup_file.to_string_lossy().to_string(),
+        });
+    }
+    let scrypt_params = scrypt_params.unwrap_or_default();
+    let salt: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(24)
+        .map(char::from)
+        .collect();
+    let str_params = serde_json::to_string(&scrypt_params).map_err(InternalError::from)?;
+    debug!(logger, "using generated scrypt params: {}", str_params);
+    let nonce: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(BACKUP_NONCE_LENGTH)
+        .map(char::from)
+        .collect();
+    debug!(logger, "using generated nonce: {}", &nonce);
+    let backup_pub_data = BackupPubData {
+        scrypt_params,
+        salt,
+        nonce,
+        version: BACKUP_VERSION,
+    };
+
+    // encrypt the backup file
+    debug!(
+        logger,
+        "\nencrypting {:?} to {:?}", &paths.zip, &paths.encrypted
+    );
+    encrypt_file(&paths.zip, &paths.encrypted, password, &backup_pub_data)?;
+
+    // add backup nonce + salt + version to final zip file
+    fs::write(
+        &paths.backup_pub_data,
+        serde_json::to_string(&backup_pub_data).unwrap(),
+    )?;
+    debug!(
+        logger,
+        "\nzipping {:?} to {:?}", &paths.tempdir, &backup_file
+    );
+    zip_dir(
+        &PathBuf::from(paths.tempdir.path()),
+        &backup_file,
+        false,
+        &logger,
+    )?;
+
+    Ok(SealedBackup {
+        wallet_dir,
+        taken_at,
+    })
+}
+
 #[allow(async_fn_in_trait)]
 pub trait WalletBackup: WalletCore {
     /// For now setting the scrypt params is done only for testing purposes,
@@ -105,8 +215,16 @@ pub trait WalletBackup: WalletCore {
         password: &str,
         scrypt_params: Option<ScryptParams>,
     ) -> Result<(), Error> {
-        // setup
         info!(self.logger(), "starting backup...");
+        let snapshot = self.backup_snapshot_raw(backup_path)?;
+        seal_snapshot(snapshot, password, scrypt_params)?;
+        info!(self.logger(), "backup completed");
+        Ok(())
+    }
+
+    /// Zip the wallet data for a backup at `backup_path`. The snapshot is stamped before zipping,
+    /// so any later change counts as not backed up.
+    fn backup_snapshot_raw(&self, backup_path: &str) -> Result<BackupSnapshot, Error> {
         let backup_file = PathBuf::from(&backup_path);
         if backup_file.exists() {
             Err(Error::FileAlreadyExists {
@@ -114,64 +232,54 @@ pub trait WalletBackup: WalletCore {
             })?;
         }
         let tmp_base_path = get_parent_path(&backup_file)?;
-        let files = get_backup_paths(&tmp_base_path)?;
-        let scrypt_params = scrypt_params.unwrap_or_default();
-        let salt: String = rand::rng()
-            .sample_iter(&Alphanumeric)
-            .take(24)
-            .map(char::from)
-            .collect();
-        let str_params = serde_json::to_string(&scrypt_params).map_err(InternalError::from)?;
-        debug!(
-            self.logger(),
-            "using generated scrypt params: {}", str_params
-        );
-        let nonce: String = rand::rng()
-            .sample_iter(&Alphanumeric)
-            .take(BACKUP_NONCE_LENGTH)
-            .map(char::from)
-            .collect();
-        debug!(self.logger(), "using generated nonce: {}", &nonce);
-        let backup_pub_data = BackupPubData {
-            scrypt_params,
-            salt,
-            nonce,
-            version: BACKUP_VERSION,
-        };
+        let paths = get_backup_paths(&tmp_base_path)?;
+        let taken_at = now().unix_timestamp_nanos();
 
         // create zip archive of wallet data
         debug!(
             self.logger(),
             "\nzipping {:?} to {:?}",
             &self.wallet_dir(),
-            &files.zip
+            &paths.zip
         );
-        zip_dir(self.wallet_dir(), &files.zip, true, self.logger())?;
+        zip_dir(self.wallet_dir(), &paths.zip, true, self.logger())?;
 
-        // encrypt the backup file
-        debug!(
-            self.logger(),
-            "\nencrypting {:?} to {:?}", &files.zip, &files.encrypted
-        );
-        encrypt_file(&files.zip, &files.encrypted, password, &backup_pub_data)?;
+        Ok(BackupSnapshot {
+            paths,
+            backup_file,
+            wallet_dir: self.wallet_dir().clone(),
+            taken_at,
+            logger: self.logger().clone(),
+        })
+    }
 
-        // add backup nonce + salt + version to final zip file
-        fs::write(
-            files.backup_pub_data,
-            serde_json::to_string(&backup_pub_data).unwrap(),
-        )?;
-        debug!(
-            self.logger(),
-            "\nzipping {:?} to {:?}", &files.tempdir, &backup_file
-        );
-        zip_dir(
-            &PathBuf::from(files.tempdir.path()),
-            &backup_file,
-            false,
-            self.logger(),
-        )?;
-
-        info!(self.logger(), "backup completed");
+    /// Record a backup of the wallet state as of `taken_at`. A later backup already recorded is
+    /// kept.
+    fn record_backup_taken_at(&self, txn: &DbTxn, taken_at: i128) -> Result<(), Error> {
+        let taken_at_str = ActiveValue::Set(taken_at.to_string());
+        match txn.get_backup_info()? {
+            Some(backup_info) => {
+                let last_backup =
+                    backup_info
+                        .last_backup_timestamp
+                        .parse::<i128>()
+                        .map_err(|e| Error::Internal {
+                            details: format!("invalid last backup timestamp: {e}"),
+                        })?;
+                if last_backup < taken_at {
+                    let mut backup_info: DbBackupInfoActMod = backup_info.into();
+                    backup_info.last_backup_timestamp = taken_at_str;
+                    txn.update_backup_info(&mut backup_info)?;
+                }
+            }
+            None => {
+                txn.set_backup_info(DbBackupInfoActMod {
+                    last_backup_timestamp: taken_at_str,
+                    last_operation_timestamp: ActiveValue::Set(s!("0")),
+                    ..Default::default()
+                })?;
+            }
+        }
         Ok(())
     }
 
