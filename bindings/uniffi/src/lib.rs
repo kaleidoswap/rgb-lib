@@ -36,20 +36,24 @@ use rgb_lib::{
         InflateBeginResult, InflateDetails, InitOperationResult, Invoice as RgbLibInvoice,
         InvoiceData as RgbLibInvoiceData, Media, Metadata, MultisigKeys, MultisigOnlineOptions,
         MultisigVotingStatus as RgbLibMultisigVotingStatus, MultisigWallet as RgbLibMultisigWallet,
-        Online, OnlineOptions, Operation as RgbLibOperation, OperationInfo as RgbLibOperationInfo,
-        OperationResult, Outpoint, PendingVanillaTx, ProofOfReserves, PsbtInputInfo,
-        PsbtInspection, PsbtOutputInfo, ReceiveData, Recipient as RgbLibRecipient,
-        RecipientInfo as RgbLibRecipientInfo, RecipientType, RefreshFilter, RefreshTransferStatus,
-        RefreshedTransfer, RespondToOperation as RgbLibRespondToOperation,
-        RgbAllocation as RgbLibRgbAllocation, RgbInputInfo as RgbLibRgbInputInfo,
-        RgbInspection as RgbLibRgbInspection, RgbOperationInfo as RgbLibRgbOperationInfo,
-        RgbOutputInfo as RgbLibRgbOutputInfo, RgbTransitionInfo as RgbLibRgbTransitionInfo,
-        RgbWalletOpsOffline, RgbWalletOpsOnline, SendBeginResult, SendDetails, SinglesigKeys,
-        SyncKeychain as RgbLibSyncKeychain, SyncOptions as RgbLibSyncOptions, SyncStrategy, Token,
-        TokenLight, Transaction, TransactionType, Transfer as RgbLibTransfer, TransferKind,
-        TransferTransportEndpoint, TransportEndpoint as RgbLibTransportEndpoint, TypeOfTransition,
-        Unspent as RgbLibUnspent, UserRole, Utxo, Wallet as RgbLibWallet, WalletData,
-        WalletDescriptors, WitnessData,
+        OnchainSwapAssetHistory, OnchainSwapCompletion, OnchainSwapConsignment,
+        OnchainSwapExtraOutput, OnchainSwapInput, OnchainSwapLeg, OnchainSwapLegKind,
+        OnchainSwapOffer, OnchainSwapProposal,
+        OnchainSwapReceiveResult as RgbLibOnchainSwapReceiveResult, OnchainSwapRequest,
+        OnchainSwapRole, Online, OnlineOptions, Operation as RgbLibOperation,
+        OperationInfo as RgbLibOperationInfo, OperationResult, Outpoint, PendingVanillaTx,
+        ProofOfReserves, PsbtInputInfo, PsbtInspection, PsbtOutputInfo, ReceiveData,
+        Recipient as RgbLibRecipient, RecipientInfo as RgbLibRecipientInfo, RecipientType,
+        RefreshFilter, RefreshTransferStatus, RefreshedTransfer,
+        RespondToOperation as RgbLibRespondToOperation, RgbAllocation as RgbLibRgbAllocation,
+        RgbInputInfo as RgbLibRgbInputInfo, RgbInspection as RgbLibRgbInspection,
+        RgbOperationInfo as RgbLibRgbOperationInfo, RgbOutputInfo as RgbLibRgbOutputInfo,
+        RgbTransitionInfo as RgbLibRgbTransitionInfo, RgbWalletOpsOffline, RgbWalletOpsOnline,
+        SendBeginResult, SendDetails, SinglesigKeys, SyncKeychain as RgbLibSyncKeychain,
+        SyncOptions as RgbLibSyncOptions, SyncStrategy, Token, TokenLight, Transaction,
+        TransactionType, Transfer as RgbLibTransfer, TransferKind, TransferTransportEndpoint,
+        TransportEndpoint as RgbLibTransportEndpoint, TypeOfTransition, Unspent as RgbLibUnspent,
+        UserRole, Utxo, Wallet as RgbLibWallet, WalletData, WalletDescriptors, WitnessData,
         rust_only::{
             AssetColoringInfo as RgbAssetColoringInfo, ColoringInfo as RgbColoringInfo,
             ExpectedTransfer as RgbExpectedTransfer,
@@ -158,6 +162,17 @@ impl From<ExpectedTransfer> for RgbExpectedTransfer {
             asset_id: orig.asset_id,
             asset_schema: orig.asset_schema,
             assignment: orig.assignment.into(),
+        }
+    }
+}
+
+pub struct OnchainSwapReceiveResult {
+    pub assignments: Vec<Assignment>,
+}
+impl From<RgbLibOnchainSwapReceiveResult> for OnchainSwapReceiveResult {
+    fn from(orig: RgbLibOnchainSwapReceiveResult) -> Self {
+        Self {
+            assignments: orig.assignments.into_iter().map(|a| a.into()).collect(),
         }
     }
 }
@@ -1793,6 +1808,94 @@ impl Wallet {
         self._get_wallet().send_btc_end(online, signed_psbt)
     }
 
+    fn create_swap_offer(
+        &self,
+        maker_gives: OnchainSwapLeg,
+        maker_receives: OnchainSwapLeg,
+        network_fee_sat: u64,
+        expiration_timestamp: Option<u64>,
+        proxy_url: Option<String>,
+        extra_outputs: Vec<OnchainSwapExtraOutput>,
+    ) -> Result<OnchainSwapOffer, RgbLibError> {
+        self._get_wallet().create_swap_offer(
+            maker_gives,
+            maker_receives,
+            network_fee_sat,
+            expiration_timestamp,
+            proxy_url,
+            extra_outputs,
+        )
+    }
+
+    fn accept_swap_offer(
+        &self,
+        online: Online,
+        offer: OnchainSwapOffer,
+        min_confirmations: u8,
+        skip_sync: bool,
+    ) -> Result<OnchainSwapRequest, RgbLibError> {
+        self._get_wallet()
+            .accept_swap_offer(online, offer, min_confirmations, skip_sync, vec![])
+    }
+
+    fn accept_swap_request(
+        &self,
+        online: Online,
+        request: OnchainSwapRequest,
+        min_confirmations: u8,
+        skip_sync: bool,
+    ) -> Result<OnchainSwapProposal, RgbLibError> {
+        self._get_wallet().accept_swap_request(
+            online,
+            request,
+            min_confirmations,
+            skip_sync,
+            vec![],
+        )
+    }
+
+    fn complete_swap_proposal(
+        &self,
+        online: Online,
+        proposal: OnchainSwapProposal,
+        min_confirmations: u8,
+        skip_sync: bool,
+    ) -> Result<OnchainSwapCompletion, RgbLibError> {
+        self._get_wallet()
+            .complete_swap_proposal(online, proposal, min_confirmations, skip_sync)
+    }
+
+    fn process_swap_completion(
+        &self,
+        online: Online,
+        completion: OnchainSwapCompletion,
+    ) -> Result<OnchainSwapCompletion, RgbLibError> {
+        self._get_wallet()
+            .process_swap_completion(online, completion)
+    }
+
+    fn broadcast_swap_completion(
+        &self,
+        online: Online,
+        completion: OnchainSwapCompletion,
+    ) -> Result<String, RgbLibError> {
+        self._get_wallet()
+            .broadcast_swap_completion(online, completion)
+    }
+
+    fn accept_swap_transfers(
+        &self,
+        online: Online,
+        completion: OnchainSwapCompletion,
+        role: OnchainSwapRole,
+        skip_sync: bool,
+    ) -> Result<OnchainSwapReceiveResult, RgbLibError> {
+        Ok(self
+            ._get_wallet()
+            .accept_swap_transfers(online, completion, role, skip_sync)?
+            .into())
+    }
+
     fn sync(&self, online: Online, options: SyncOptions) -> Result<(), RgbLibError> {
         self._get_wallet().sync(online, options.into())
     }
@@ -2534,5 +2637,36 @@ mod tests {
         let recipient_id = recipient_id_from_script_buf(script.clone(), BitcoinNetwork::Regtest);
         let script_hex = script_hex_from_recipient_id(recipient_id).unwrap().unwrap();
         assert_eq!(script_hex, script.to_hex_string());
+    }
+
+    const UDL: &str = include_str!("rgb-lib.udl");
+
+    #[test]
+    fn uniffi_exposes_swap_api_without_raw_rgb_primitives() {
+        for method in [
+            "create_swap_offer",
+            "accept_swap_offer",
+            "accept_swap_request",
+            "complete_swap_proposal",
+            "process_swap_completion",
+            "broadcast_swap_completion",
+            "accept_swap_transfers",
+        ] {
+            assert!(UDL.contains(method), "missing {method} from UDL");
+        }
+
+        for raw_name in [
+            "color_psbt",
+            "color_psbt_and_consume",
+            "consume_fascia",
+            "Fascia",
+            "RgbTransfer",
+            "BuilderSeal",
+        ] {
+            assert!(
+                !UDL.contains(raw_name),
+                "raw primitive {raw_name} must not be exposed in UDL"
+            );
+        }
     }
 }

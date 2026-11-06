@@ -2,6 +2,13 @@
 //!
 //! This module defines the online wallet methods.
 
+use super::offline::{
+    SwapOutgoingState, swap_build_input, swap_consignment_dir, swap_consignment_path,
+    swap_ensure_net_btc_outflow, swap_ensure_only_own_inputs_signed, swap_history_path,
+    swap_history_recipient_id, swap_input_to_outpoint, swap_input_txout, swap_invalid,
+    swap_mpc_entropy, swap_parse_script, swap_proxy_transport_endpoint, swap_rgb_leg_coloring_info,
+    swap_selected_inputs_total,
+};
 use super::*;
 use rgbstd::Operation as _;
 use rgbstd::contract::LinkableSchemaWrapper;
@@ -34,6 +41,30 @@ fn proxy_routing_id_for_transfer(transfer: &DbTransfer) -> String {
         _ => &[],
     };
     crate::utils::derive_proxy_recipient_id(&recipient_id, nonce)
+}
+
+/// GET the consignment posted under `recipient_id` from the proxy at `proxy_url`. A failed
+/// request or an empty result is [`Error::NoConsignment`].
+pub(crate) fn proxy_get_consignment(
+    proxy_url: &str,
+    recipient_id: &str,
+    logger: &Logger,
+) -> Result<GetConsignmentResponse, Error> {
+    let proxy_client = ProxyClient::new(proxy_url)?;
+    let consignment_res = proxy_client.get_consignment(recipient_id);
+    if consignment_res.is_err() || consignment_res.as_ref().unwrap().result.as_ref().is_none() {
+        debug!(
+            logger,
+            "Consignment GET response error: {:?}", &consignment_res
+        );
+        return Err(Error::NoConsignment);
+    }
+
+    let consignment_res = consignment_res.unwrap().result.unwrap();
+    #[cfg(test)]
+    debug!(logger, "Consignment GET response: {:?}", consignment_res);
+
+    Ok(consignment_res)
 }
 
 pub trait WalletOnline: WalletOffline {
@@ -486,7 +517,8 @@ pub trait WalletOnline: WalletOffline {
         // color-consume flow), so failing it would misreport state that already landed: once the
         // indexer knows the TX its inputs are spent for good, and once the fascia is in the stash
         // (marker left behind by a consume that crashed before its commit) the SQL side is the only
-        // thing still rollable back, which would diverge the two
+        // thing still rollable back, which would diverge the two; likewise, while it has not
+        // expired, the batch of an HTLC operation whose broadcast was attempted may still land
         if batch_transfer.status == TransferStatus::Initiated
             && let Some(txid) = batch_transfer.txid.as_deref()
             && (self
@@ -515,8 +547,10 @@ pub trait WalletOnline: WalletOffline {
         }
     }
 
-    /// Persist SQL Failed rows without triggering VSS backup. Caller heals HTLC
-    /// metadata (if any) and backs up only after SQL and files are coherent.
+    /// Fail the eligible transfers (see [`Self::fail_transfers_impl`]) and commit the SQL changes.
+    ///
+    /// Callers then run [`Self::fail_transfers_finish`] to align the file-backed HTLC operations
+    /// (if any) with the batches just marked as failed.
     fn fail_transfers_commit(
         &mut self,
         online: Online,
@@ -541,6 +575,7 @@ pub trait WalletOnline: WalletOffline {
     }
 
     /// Refuse failing a batch whose linked HTLC operation has a live broadcast state.
+    /// Default: no HTLC ops.
     fn psbt_op_live_broadcast_blocks_fail(
         &self,
         _batch_transfer: &DbBatchTransfer,
@@ -548,6 +583,8 @@ pub trait WalletOnline: WalletOffline {
         Ok(false)
     }
 
+    /// Complete a [`Self::fail_transfers_commit`] call: heal the HTLC operations linked to the
+    /// failed batches, then report the outcome.
     fn fail_transfers_finish(&self, outcome: FailTransfersOutcome) -> Result<bool, Error> {
         let healed = match self.heal_psbt_ops_after_failed_transfers() {
             Ok(healed) => healed,
@@ -905,24 +942,7 @@ pub trait WalletOnline: WalletOffline {
         proxy_url: &str,
         recipient_id: String,
     ) -> Result<GetConsignmentResponse, Error> {
-        let proxy_client = ProxyClient::new(proxy_url)?;
-        let consignment_res = proxy_client.get_consignment(&recipient_id);
-        if consignment_res.is_err() || consignment_res.as_ref().unwrap().result.as_ref().is_none() {
-            debug!(
-                self.logger(),
-                "Consignment GET response error: {:?}", &consignment_res
-            );
-            return Err(Error::NoConsignment);
-        }
-
-        let consignment_res = consignment_res.unwrap().result.unwrap();
-        #[cfg(test)]
-        debug!(
-            self.logger(),
-            "Consignment GET response: {:?}", consignment_res
-        );
-
-        Ok(consignment_res)
+        proxy_get_consignment(proxy_url, &recipient_id, self.logger())
     }
 
     fn extract_received_assignments(
@@ -956,30 +976,16 @@ pub trait WalletOnline: WalletOffline {
                     let opout = Opout::new(*opid, *ass_type, no as u16);
                     if let Assign::ConfidentialSeal { seal, state, .. } = fungible_assignment
                         && Some(*seal) == known_concealed
+                        && let Some(assignment) = Assignment::fungible(*ass_type, state.as_u64())
                     {
-                        match *ass_type {
-                            OS_ASSET => {
-                                received.insert(opout, Assignment::Fungible(state.as_u64()));
-                            }
-                            OS_INFLATION => {
-                                received.insert(opout, Assignment::InflationRight(state.as_u64()));
-                            }
-                            _ => {}
-                        }
+                        received.insert(opout, assignment);
                     };
                     if let Assign::Revealed { seal, state, .. } = fungible_assignment
                         && seal.txid == TxPtr::WitnessTx
                         && Some(seal.vout.into_u32()) == vout
+                        && let Some(assignment) = Assignment::fungible(*ass_type, state.as_u64())
                     {
-                        match *ass_type {
-                            OS_ASSET => {
-                                received.insert(opout, Assignment::Fungible(state.as_u64()));
-                            }
-                            OS_INFLATION => {
-                                received.insert(opout, Assignment::InflationRight(state.as_u64()));
-                            }
-                            _ => {}
-                        }
+                        received.insert(opout, assignment);
                     };
                 }
                 for (no, structured_assignment) in typed_assigns.as_structured().iter().enumerate()
@@ -2302,6 +2308,27 @@ pub trait WalletOnline: WalletOffline {
                     updated_asset.known_circulating_supply =
                         ActiveValue::Set(Some(known_circulating_supply.to_string()));
                     txn.update_asset(&mut updated_asset)?;
+                }
+            }
+        } else {
+            // on-chain swap receives are recorded on non-incoming batches
+            let asset_transfer_idxs = batch_transfer
+                .get_asset_transfers(&db_data.asset_transfers)
+                .iter()
+                .map(|t| t.idx)
+                .collect::<HashSet<_>>();
+            for coloring in db_data.colorings.iter().filter(|c| {
+                c.r#type == ColoringType::Receive
+                    && asset_transfer_idxs.contains(&c.asset_transfer_idx)
+            }) {
+                if let Some(txo) = db_data
+                    .txos
+                    .iter()
+                    .find(|t| t.idx == coloring.txo_idx && t.pending_witness)
+                {
+                    let mut txo: DbTxoActMod = txo.clone().into();
+                    txo.pending_witness = ActiveValue::Set(false);
+                    txn.update_txo(txo)?;
                 }
             }
         }
@@ -4842,6 +4869,1196 @@ pub trait WalletOnline: WalletOffline {
     }
 }
 
+// ─── On-chain swap: free helper functions (online) ───────────────────────────
+
+/// The RGB leg a wallet sends in a swap, with the inputs it spends.
+pub(crate) struct SwapRgbSend<'a> {
+    pub(crate) leg: &'a OnchainSwapLeg,
+    pub(crate) inputs: &'a [OnchainSwapInput],
+    pub(crate) change_script_hex: &'a str,
+    pub(crate) recipient_id: &'a str,
+    pub(crate) recipient_vout: u32,
+    pub(crate) blinding: u64,
+}
+
+impl SwapRgbSend<'_> {
+    fn input_outpoints(&self) -> HashSet<BdkOutPoint> {
+        self.inputs.iter().map(swap_input_to_outpoint).collect()
+    }
+
+    fn coloring_info(
+        &self,
+        wallet: &Wallet,
+        psbt: &Psbt,
+    ) -> Result<(ContractId, rust_only::ColoringInfo, bool), Error> {
+        let available = swap_input_rgb_amounts(wallet, &self.input_outpoints())?;
+        let change_script = swap_parse_script(self.change_script_hex)?;
+        // RGB change must land on the colored keychain, where the wallet tracks it. A side
+        // without RGB change gets a vanilla change (see swap_select_inputs), so no change vout
+        // here, and coloring fails closed if RGB change turns up anyway.
+        let colored_change = matches!(
+            wallet.bdk_wallet().derivation_of_spk(change_script.clone()),
+            Some((KeychainKind::External, _))
+        );
+        let change_vout = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .position(|o| colored_change && o.script_pubkey == change_script)
+            .map(|vout| vout as u32);
+        swap_rgb_leg_coloring_info(
+            self.leg,
+            psbt,
+            self.recipient_vout,
+            change_vout,
+            self.blinding,
+            &available,
+        )
+    }
+}
+
+/// Amounts per contract carried by the given wallet inputs (1 for a UDA token).
+pub(crate) fn swap_input_rgb_amounts(
+    wallet: &Wallet,
+    inputs: &HashSet<BdkOutPoint>,
+) -> Result<BTreeMap<ContractId, u64>, Error> {
+    let runtime = wallet.rgb_runtime()?;
+    let mut amounts = BTreeMap::new();
+    for contract_id in runtime.contracts_assigning(inputs.iter().copied())? {
+        let mut total = 0u64;
+        for (_, states) in runtime.contract_assignments_for(contract_id, inputs.iter().copied())? {
+            for (opout, state) in states {
+                match state {
+                    AllocatedState::Amount(amt) if opout.ty == OS_ASSET => {
+                        total = total
+                            .checked_add(amt.as_u64())
+                            .ok_or_else(|| swap_invalid("swap input amounts overflow"))?;
+                    }
+                    AllocatedState::Data(_) => total = 1,
+                    _ => {}
+                }
+            }
+        }
+        amounts.insert(contract_id, total);
+    }
+    Ok(amounts)
+}
+
+/// Stage the RGB leg on `psbt` without finalizing the commitment.
+pub(crate) fn swap_stage_rgb_leg(
+    wallet: &Wallet,
+    psbt: &mut Psbt,
+    send: &SwapRgbSend,
+) -> Result<(), Error> {
+    let (_, coloring_info, _) = send.coloring_info(wallet, psbt)?;
+    wallet.color_psbt_stage_for_inputs(psbt, coloring_info, send.input_outpoints())?;
+    Ok(())
+}
+
+/// Record the RGB leg of a finalized swap PSBT as an Initiated batch (the stash is untouched
+/// until the TX is seen) and emit the recipient's consignment.
+///
+/// The returned [`SwapOutgoingState`] points at the batch written in `txn`: the caller persists it
+/// (as `SWAP_OUTGOING_FILE`) only once `txn` is about to be committed, so a refusal in between
+/// never leaves a record of a batch that was rolled back.
+pub(crate) fn swap_prepare_rgb_leg(
+    txn: &DbTxn,
+    wallet: &Wallet,
+    psbt: &Psbt,
+    fascia: &Fascia,
+    send: &SwapRgbSend,
+    proxy_url: Option<&str>,
+    swap_id: &str,
+    expiration_timestamp: Option<u64>,
+) -> Result<(Vec<OnchainSwapConsignment>, SwapOutgoingState), Error> {
+    let (contract_id, coloring_info, shift) = send.coloring_info(wallet, psbt)?;
+    let batch_transfer_idx = wallet.prepare_consume_txn(
+        txn,
+        psbt,
+        fascia,
+        &coloring_info,
+        &send.input_outpoints(),
+        shift,
+        1,
+        expiration_timestamp,
+    )?;
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+    let seal = BuilderSeal::Revealed(GraphSeal::with_blinded_vout(
+        send.recipient_vout,
+        send.blinding,
+    ));
+    let transfer = wallet.generate_transfer(contract_id, vec![seal], psbt.get_txid(), fascia)?;
+    let consignments = swap_emit_consignments(
+        wallet,
+        vec![transfer],
+        proxy_url,
+        swap_id,
+        &txid,
+        send.recipient_id,
+        send.recipient_vout,
+        send.blinding,
+    )?;
+    Ok((
+        consignments,
+        SwapOutgoingState {
+            txid,
+            batch_transfer_idx,
+        },
+    ))
+}
+
+/// Color the RGB leg of a swap sent by a single party and prepare it for consumption.
+pub(crate) fn swap_color_rgb_leg(
+    txn: &DbTxn,
+    wallet: &Wallet,
+    psbt: &mut Psbt,
+    send: &SwapRgbSend,
+    proxy_url: Option<&str>,
+    swap_id: &str,
+    expiration_timestamp: Option<u64>,
+) -> Result<(Vec<OnchainSwapConsignment>, SwapOutgoingState), Error> {
+    swap_stage_rgb_leg(wallet, psbt, send)?;
+    let mpc_entropy = swap_mpc_entropy(wallet.wallet_dir(), swap_id)?;
+    let fascia = wallet.color_psbt_finalize(psbt, Some(mpc_entropy))?;
+    swap_prepare_rgb_leg(
+        txn,
+        wallet,
+        psbt,
+        &fascia,
+        send,
+        proxy_url,
+        swap_id,
+        expiration_timestamp,
+    )
+}
+
+pub(crate) fn swap_emit_consignments(
+    wallet: &Wallet,
+    transfers: Vec<RgbTransfer>,
+    proxy_url: Option<&str>,
+    swap_id: &str,
+    txid: &str,
+    recipient_id: &str,
+    recipient_vout: u32,
+    blinding: u64,
+) -> Result<Vec<OnchainSwapConsignment>, Error> {
+    let base_dir = swap_consignment_dir(wallet.wallet_dir(), swap_id);
+    fs::create_dir_all(&base_dir)?;
+    let endpoint = proxy_url.map(swap_proxy_transport_endpoint).transpose()?;
+
+    let mut consignments = vec![];
+    for transfer in transfers {
+        let transfer_asset_id = transfer.contract_id().to_string();
+        let path = swap_consignment_path(&base_dir, &transfer_asset_id);
+        transfer.save_file(&path)?;
+        if let Some(proxy_url) = proxy_url {
+            let proxy_client = ProxyClient::new(proxy_url)?;
+            wallet.post_consignment_to_proxy(
+                &proxy_client,
+                recipient_id.to_string(),
+                path.clone(),
+                txid.to_string(),
+                Some(recipient_vout),
+            )?;
+        }
+        consignments.push(OnchainSwapConsignment {
+            asset_id: transfer_asset_id,
+            path: if endpoint.is_some() {
+                String::new()
+            } else {
+                path.to_string_lossy().to_string()
+            },
+            endpoint: endpoint.clone(),
+            txid: txid.to_string(),
+            vout: recipient_vout,
+            blinding,
+            recipient_id: recipient_id.to_string(),
+        });
+    }
+    Ok(consignments)
+}
+
+/// Export from the stash the history of the allocations of the leg's asset on `inputs` (the
+/// giver's declared inputs) and post it to the proxy, for the receiver to validate before it signs.
+///
+/// The history is a transfer consignment without terminals: its bundles lead from genesis to the
+/// allocations on `inputs`, so it works for any holder of the asset, not only its issuer.
+pub(crate) fn swap_emit_asset_history(
+    wallet: &Wallet,
+    leg: &OnchainSwapLeg,
+    inputs: &[OnchainSwapInput],
+    proxy_url: Option<&str>,
+    swap_id: &str,
+) -> Result<Option<OnchainSwapAssetHistory>, Error> {
+    if !matches!(leg.kind, OnchainSwapLegKind::Rgb) {
+        return Ok(None);
+    }
+    let asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
+    let contract_id = ContractId::from_str(&asset_id)
+        .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
+    let history = {
+        let runtime = wallet.rgb_runtime()?;
+        let outputs = runtime
+            .contract_assignments_for(contract_id, inputs.iter().map(swap_input_to_outpoint))?
+            .into_keys()
+            .collect::<Vec<_>>();
+        if outputs.is_empty() {
+            return Err(swap_invalid(format!(
+                "swap inputs carry no allocation of {asset_id}"
+            )));
+        }
+        runtime.transfer(contract_id, outputs, [], None)?
+    };
+    let base_dir = swap_consignment_dir(wallet.wallet_dir(), swap_id);
+    fs::create_dir_all(&base_dir)?;
+    let path = swap_history_path(&base_dir, &asset_id);
+    history.save_file(&path)?;
+    let endpoint = proxy_url.map(swap_proxy_transport_endpoint).transpose()?;
+    let recipient_id = swap_history_recipient_id(swap_id, &asset_id);
+    if let Some(proxy_url) = proxy_url {
+        let proxy_client = ProxyClient::new(proxy_url)?;
+        wallet.post_consignment_to_proxy(
+            &proxy_client,
+            recipient_id.clone(),
+            path.clone(),
+            swap_id.to_string(),
+            None,
+        )?;
+    }
+    Ok(Some(OnchainSwapAssetHistory {
+        asset_id,
+        path: if endpoint.is_some() {
+            String::new()
+        } else {
+            path.to_string_lossy().to_string()
+        },
+        endpoint,
+        recipient_id,
+    }))
+}
+
+pub(crate) fn swap_record_incoming(
+    txn: &DbTxn,
+    asset_id: &str,
+    txid: &str,
+    vout: u32,
+    btc_amount_sat: u64,
+    assignments: &[Assignment],
+) -> Result<(), Error> {
+    let batch_transfer = DbBatchTransferActMod {
+        txid: ActiveValue::Set(Some(txid.to_string())),
+        status: ActiveValue::Set(TransferStatus::WaitingConfirmations),
+        expiration: ActiveValue::Set(None),
+        created_at: ActiveValue::Set(now().unix_timestamp()),
+        min_confirmations: ActiveValue::Set(1),
+        // this leg's consignment was already validated and accepted synchronously in
+        // `swap_accept_transfer_from_file`, so `incoming` is `false` purely to keep refresh()'s
+        // reconciliation on the plain confirmation-count path instead of the incoming-only
+        // branch, which expects a `DbTransfer` row and a consignment file at the ordinary
+        // (non-swap) receive path that this recording function never creates
+        incoming: ActiveValue::Set(false),
+        ..Default::default()
+    };
+    let batch_transfer_idx = txn.set_batch_transfer(batch_transfer)?;
+    let asset_transfer = DbAssetTransferActMod {
+        user_driven: ActiveValue::Set(true),
+        batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
+        asset_id: ActiveValue::Set(Some(asset_id.to_string())),
+        ..Default::default()
+    };
+    let asset_transfer_idx = txn.set_asset_transfer(asset_transfer)?;
+    let db_txo = DbTxoActMod {
+        txid: ActiveValue::Set(txid.to_string()),
+        vout: ActiveValue::Set(vout),
+        btc_amount: ActiveValue::Set(btc_amount_sat.to_string()),
+        spent: ActiveValue::Set(false),
+        exists: ActiveValue::Set(false),
+        pending_witness: ActiveValue::Set(true),
+        ..Default::default()
+    };
+    let _ = txn.set_txo(db_txo)?;
+    let txo_idx = txn
+        .get_txo(&Outpoint {
+            txid: txid.to_string(),
+            vout,
+        })?
+        .map(|t| t.idx)
+        .ok_or_else(|| swap_invalid("failed to locate swap output txo after insert"))?;
+
+    for assignment in assignments {
+        let db_coloring = DbColoringActMod {
+            txo_idx: ActiveValue::Set(txo_idx),
+            asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+            r#type: ActiveValue::Set(ColoringType::Receive),
+            assignment: ActiveValue::Set(assignment.clone()),
+            ..Default::default()
+        };
+        txn.set_coloring(db_coloring)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn swap_validate_assignments_for_leg(
+    assignments: &[Assignment],
+    leg: &OnchainSwapLeg,
+) -> Result<(), Error> {
+    if !matches!(leg.kind, OnchainSwapLegKind::Rgb) {
+        return Ok(());
+    }
+    let total = assignments.iter().try_fold(0u64, |acc, assignment| {
+        acc.checked_add(assignment.main_amount())
+            .ok_or_else(|| swap_invalid("swap assignment amounts overflow"))
+    })?;
+    if total != leg.amount {
+        return Err(swap_invalid(format!(
+            "RGB swap assignment amount mismatch: expected {}, got {total}",
+            leg.amount
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn swap_validate_fascia_received_leg(
+    fascia: &Fascia,
+    leg: &OnchainSwapLeg,
+    vout: u32,
+    blinding: u64,
+) -> Result<Vec<Assignment>, Error> {
+    if !matches!(leg.kind, OnchainSwapLegKind::Rgb) {
+        return Ok(vec![]);
+    }
+    let asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
+    let contract_id = ContractId::from_str(&asset_id)
+        .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
+    let mut assignments = vec![];
+    for (bundle_contract_id, bundle) in fascia.bundles() {
+        if *bundle_contract_id != contract_id {
+            continue;
+        }
+        for KnownTransition { transition, .. } in bundle.known_transitions.iter() {
+            for (ass_type, typed_assigns) in transition.assignments.iter() {
+                for fungible_assignment in typed_assigns.as_fungible().iter() {
+                    if let Assign::Revealed { seal, state, .. } = fungible_assignment
+                        && seal.txid == TxPtr::WitnessTx
+                        && seal.vout.into_u32() == vout
+                        && seal.blinding == blinding
+                    {
+                        assignments.extend(Assignment::fungible(*ass_type, state.as_u64()));
+                    }
+                }
+                for structured_assignment in typed_assigns.as_structured().iter() {
+                    if let Assign::Revealed { seal, .. } = structured_assignment
+                        && seal.txid == TxPtr::WitnessTx
+                        && seal.vout.into_u32() == vout
+                        && seal.blinding == blinding
+                    {
+                        assignments.push(Assignment::NonFungible);
+                    }
+                }
+            }
+        }
+    }
+    if assignments.is_empty() {
+        return Err(swap_invalid("RGB swap PSBT does not assign expected state"));
+    }
+    swap_validate_assignments_for_leg(&assignments, leg)?;
+    Ok(assignments)
+}
+
+fn swap_validate_witness_output(
+    consignment: &RgbTransfer,
+    witness_id: RgbTxid,
+    recipient_id: &str,
+    vout: u32,
+) -> Result<(), Error> {
+    let Some(anchored_bundle) = consignment
+        .bundles
+        .iter()
+        .find(|bundle| bundle.witness_id() == witness_id)
+    else {
+        return Err(swap_invalid(
+            "RGB swap consignment does not include the expected witness transaction",
+        ));
+    };
+    let PubWitness::Tx(tx) = &anchored_bundle.pub_witness else {
+        return Err(swap_invalid(
+            "RGB swap consignment is missing the witness transaction",
+        ));
+    };
+    let output = tx
+        .output
+        .get(vout as usize)
+        .ok_or_else(|| swap_invalid("RGB swap consignment missing expected output"))?;
+    let script_pubkey = script_buf_from_recipient_id(recipient_id.to_string())?
+        .ok_or_else(|| swap_invalid("RGB swap recipient ID is not witness-based"))?;
+    if output.script_pubkey != script_pubkey {
+        return Err(swap_invalid(
+            "RGB swap consignment output pays an unexpected script",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn swap_validate_received_transfer_from_file(
+    wallet: &mut Wallet,
+    consignment_path: &Path,
+    leg: &OnchainSwapLeg,
+    txid: String,
+    vout: u32,
+    blinding: u64,
+    recipient_id: &str,
+) -> Result<Vec<Assignment>, Error> {
+    if !matches!(leg.kind, OnchainSwapLegKind::Rgb) {
+        return Ok(vec![]);
+    }
+    let consignment = RgbTransfer::load_file(consignment_path).map_err(InternalError::from)?;
+    swap_validate_received_transfer(wallet, consignment, leg, txid, vout, blinding, recipient_id)
+}
+
+/// Validate the transfer consignment of a received swap leg, whose witness transaction may not be
+/// broadcast yet, and return the assignments it gives to `vout`.
+pub(crate) fn swap_validate_received_transfer(
+    wallet: &mut Wallet,
+    consignment: RgbTransfer,
+    leg: &OnchainSwapLeg,
+    txid: String,
+    vout: u32,
+    blinding: u64,
+    recipient_id: &str,
+) -> Result<Vec<Assignment>, Error> {
+    if !matches!(leg.kind, OnchainSwapLegKind::Rgb) {
+        return Ok(vec![]);
+    }
+    let expected_asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
+    let witness_id = RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;
+    let contract_id = consignment.contract_id();
+    let asset_id = contract_id.to_string();
+    if asset_id != expected_asset_id {
+        return Err(swap_invalid(format!(
+            "RGB swap consignment asset mismatch: expected {expected_asset_id}, got {asset_id}"
+        )));
+    }
+    let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+    wallet.check_schema_support(&asset_schema)?;
+
+    let mut runtime = wallet.rgb_runtime()?;
+    let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
+    runtime.store_secret_seal(graph_seal)?;
+
+    let resolver = OffchainResolver {
+        witness_id,
+        consignment: &consignment,
+        fallback: wallet.blockchain_resolver(),
+    };
+    let validation_config = ValidationConfig {
+        chain_net: wallet.chain_net(),
+        trusted_typesystem: asset_schema.types(),
+        ..Default::default()
+    };
+    match consignment.clone().validate(&resolver, &validation_config) {
+        Ok(_) => {}
+        Err(ValidationError::InvalidConsignment(e)) => {
+            error!(wallet.logger(), "Consignment is invalid: {}", e);
+            return Err(Error::InvalidConsignment);
+        }
+        Err(ValidationError::ResolverError(e)) => {
+            warn!(
+                wallet.logger(),
+                "Network error during consignment validation"
+            );
+            return Err(Error::Network {
+                details: e.to_string(),
+            });
+        }
+    };
+    swap_validate_witness_output(&consignment, witness_id, recipient_id, vout)?;
+
+    let assignments = wallet
+        .extract_received_assignments(&consignment, witness_id, Some(vout), None)
+        .into_values()
+        .collect::<Vec<_>>();
+    drop(runtime);
+    if assignments.is_empty() {
+        return Err(swap_invalid(
+            "RGB swap consignment did not assign expected state",
+        ));
+    }
+    swap_validate_assignments_for_leg(&assignments, leg)?;
+    Ok(assignments)
+}
+
+pub(crate) fn swap_validate_received_swap_leg(
+    wallet: &mut Wallet,
+    consignments: &[OnchainSwapConsignment],
+    leg: &OnchainSwapLeg,
+    txid: &str,
+    vout: u32,
+    blinding: u64,
+    recipient_id: &str,
+) -> Result<Vec<Assignment>, Error> {
+    if !matches!(leg.kind, OnchainSwapLegKind::Rgb) {
+        return Ok(vec![]);
+    }
+    let asset_id = leg.asset_id.as_deref().expect("RGB leg has asset ID");
+    let matching = consignments
+        .iter()
+        .filter(|consignment| consignment.asset_id == asset_id)
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(swap_invalid(format!(
+            "expected exactly one RGB swap consignment for {asset_id}, got {}",
+            matching.len()
+        )));
+    }
+    let consignment = matching[0];
+    if consignment.txid != txid {
+        return Err(swap_invalid("RGB swap consignment txid mismatch"));
+    }
+    if consignment.vout != vout {
+        return Err(swap_invalid("RGB swap consignment vout mismatch"));
+    }
+    if consignment.blinding != blinding {
+        return Err(swap_invalid("RGB swap consignment blinding mismatch"));
+    }
+    if consignment.recipient_id != recipient_id {
+        return Err(swap_invalid("RGB swap consignment recipient mismatch"));
+    }
+    let local_path = swap_fetch_consignment_to_file(wallet, consignment)?;
+    swap_validate_received_transfer_from_file(
+        wallet,
+        &local_path,
+        leg,
+        consignment.txid.clone(),
+        consignment.vout,
+        consignment.blinding,
+        recipient_id,
+    )
+}
+
+/// The counterparty's declared inputs must not be coins of this wallet: this wallet signs every
+/// input it can, so a smuggled coin would be spent for the counterparty's benefit.
+pub(crate) fn swap_ensure_inputs_foreign(
+    wallet: &Wallet,
+    counterparty_inputs: &[OnchainSwapInput],
+    own_inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    for input in counterparty_inputs {
+        let outpoint = swap_input_to_outpoint(input);
+        if own_inputs
+            .iter()
+            .any(|own| swap_input_to_outpoint(own) == outpoint)
+            || wallet.bdk_wallet().get_utxo(outpoint).is_some()
+            || wallet
+                .bdk_wallet()
+                .is_mine(swap_parse_script(&input.script_pubkey_hex)?)
+        {
+            return Err(swap_invalid(format!(
+                "swap input {} belongs to this wallet",
+                input.outpoint
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// What the swap takes from this wallet, net of what it pays back to it, from the wallet's own
+/// view of its coins rather than what the PSBT says they are worth.
+fn swap_ensure_own_net_outflow(
+    wallet: &Wallet,
+    psbt: &Psbt,
+    proposal: &OnchainSwapProposal,
+    role: OnchainSwapRole,
+    own_inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    let mut own_in = 0u64;
+    for input in own_inputs {
+        let utxo = wallet
+            .bdk_wallet()
+            .get_utxo(swap_input_to_outpoint(input))
+            .ok_or_else(|| {
+                swap_invalid(format!(
+                    "swap input {} is not an unspent coin of this wallet",
+                    input.outpoint
+                ))
+            })?;
+        if utxo.txout != swap_input_txout(input)? {
+            return Err(swap_invalid(format!(
+                "swap input {} does not match this wallet's coin",
+                input.outpoint
+            )));
+        }
+        own_in = own_in
+            .checked_add(utxo.txout.value.to_sat())
+            .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+    }
+    let own_out = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .filter(|o| wallet.bdk_wallet().is_mine(o.script_pubkey.clone()))
+        .try_fold(0u64, |total, o| total.checked_add(o.value.to_sat()))
+        .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+    swap_ensure_net_btc_outflow(proposal, role, own_in, own_out)
+}
+
+/// Sign the inputs this wallet declared as `role`, refusing a PSBT that would make it sign
+/// anything else or take more BTC from it than the swap terms allow.
+pub(crate) fn swap_sign_psbt(
+    wallet: &Wallet,
+    psbt: &mut Psbt,
+    proposal: &OnchainSwapProposal,
+    role: OnchainSwapRole,
+) -> Result<(), Error> {
+    let (own_inputs, counterparty_inputs) = match role {
+        OnchainSwapRole::Maker => (&proposal.maker_inputs, &proposal.request.taker_inputs),
+        OnchainSwapRole::Taker => (&proposal.request.taker_inputs, &proposal.maker_inputs),
+    };
+    swap_ensure_inputs_foreign(wallet, counterparty_inputs, own_inputs)?;
+    swap_ensure_own_net_outflow(wallet, psbt, proposal, role, own_inputs)?;
+    let sign_options = SignOptions {
+        trust_witness_utxo: true,
+        ..Default::default()
+    };
+    let before = psbt.clone();
+    wallet.sign_psbt_impl(psbt, Some(sign_options))?;
+    swap_ensure_only_own_inputs_signed(&before, psbt, own_inputs)
+}
+
+/// Finalize a swap PSBT that must be fully signed (the maker signs last).
+pub(crate) fn swap_finalize_psbt_required(wallet: &Wallet, psbt: &Psbt) -> Result<String, Error> {
+    swap_finalize_psbt(wallet, psbt)?.ok_or_else(|| swap_invalid("swap PSBT is not fully signed"))
+}
+
+pub(crate) fn swap_finalize_psbt(wallet: &Wallet, psbt: &Psbt) -> Result<Option<String>, Error> {
+    wallet
+        .finalize_psbt(psbt.to_string(), Some(SignOptions::default()))
+        .map(Some)
+        .or_else(|e| {
+            warn!(
+                wallet.logger(),
+                "PSBT finalization failed (not all inputs signed yet): {e}"
+            );
+            Ok(None)
+        })
+}
+
+// ─── On-chain swap: private helpers (concrete Wallet) ────────────────────────
+
+/// Fetch the counterparty's history of the asset of `leg`, validate it and accept it into the
+/// stash, so that this wallet knows the contract and the allocations the counterparty spends.
+pub(crate) fn swap_import_asset_history(
+    wallet: &Wallet,
+    txn: &DbTxn,
+    history: &OnchainSwapAssetHistory,
+    leg: &OnchainSwapLeg,
+) -> Result<(), Error> {
+    let expected_asset_id = leg.asset_id.as_deref().expect("RGB leg has asset ID");
+    if history.asset_id != expected_asset_id {
+        return Err(swap_invalid(format!(
+            "swap asset history asset mismatch: expected {expected_asset_id}, got {}",
+            history.asset_id
+        )));
+    }
+    let path = swap_fetch_asset_history_to_file(wallet, history)?;
+    let consignment = RgbTransfer::load_file(&path).map_err(InternalError::from)?;
+    let contract_id = consignment.contract_id();
+    let asset_id = contract_id.to_string();
+    if asset_id != expected_asset_id {
+        return Err(swap_invalid(format!(
+            "swap asset history contract mismatch: expected {expected_asset_id}, got {asset_id}"
+        )));
+    }
+    info!(
+        wallet.logger(),
+        "Importing swap asset history of {asset_id}"
+    );
+    let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+    wallet.check_schema_support(&asset_schema)?;
+    let validation_config = ValidationConfig {
+        chain_net: wallet.chain_net(),
+        trusted_typesystem: asset_schema.types(),
+        ..Default::default()
+    };
+    let valid_consignment =
+        match consignment.validate(wallet.blockchain_resolver(), &validation_config) {
+            Ok(consignment) => consignment,
+            Err(ValidationError::InvalidConsignment(e)) => {
+                error!(wallet.logger(), "Swap asset history is invalid: {}", e);
+                return Err(Error::InvalidConsignment);
+            }
+            Err(ValidationError::ResolverError(e)) => {
+                warn!(
+                    wallet.logger(),
+                    "Network error during swap asset history validation"
+                );
+                return Err(Error::Network {
+                    details: e.to_string(),
+                });
+            }
+        };
+    let valid_contract = valid_consignment.clone().into_valid_contract();
+    let mut runtime = wallet.rgb_runtime()?;
+    runtime.accept_transfer(valid_consignment.clone(), wallet.blockchain_resolver())?;
+    if txn.get_asset(asset_id)?.is_none() {
+        wallet.save_new_asset_internal(
+            txn,
+            &runtime,
+            contract_id,
+            asset_schema,
+            valid_contract,
+            Some(valid_consignment),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn swap_ensure_inputs_confirmed(
+    wallet: &Wallet,
+    inputs: &[OnchainSwapInput],
+    min_confirmations: u8,
+) -> Result<(), Error> {
+    if min_confirmations == 0 {
+        return Ok(());
+    }
+    for input in inputs {
+        let confirmations = wallet
+            .indexer()
+            .get_tx_confirmations(&input.outpoint.txid)?
+            .unwrap_or_default();
+        if confirmations < min_confirmations as u64 {
+            return Err(swap_invalid(format!(
+                "swap input {} has {confirmations} confirmations, required {min_confirmations}",
+                input.outpoint
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse swap inputs the indexer doesn't report as unspent (mempool included) or that don't hold
+/// the declared amount: signing over a spent input wastes the swap, as the transaction can never be
+/// mined, and so does signing over a wrong amount, as the PSBT's witness UTXOs are built from the
+/// declared ones and taproot signatures commit to every prevout amount.
+///
+/// `own_inputs` are this wallet's coins: when one of them is refused, the wallet's view of its
+/// UTXOs is stale (e.g. with `skip_sync`) rather than the counterparty at fault.
+pub(crate) fn swap_ensure_inputs_unspent(
+    wallet: &Wallet,
+    own_inputs: &[OnchainSwapInput],
+    counterparty_inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    let mut seen = HashSet::new();
+    let inputs = own_inputs
+        .iter()
+        .map(|i| (i, true))
+        .chain(counterparty_inputs.iter().map(|i| (i, false)));
+    for (input, own) in inputs {
+        let outpoint = swap_input_to_outpoint(input);
+        // each declared input costs indexer round trips: never check one twice, a transaction
+        // can't spend it twice anyway
+        if !seen.insert(outpoint) {
+            return Err(swap_invalid(format!(
+                "swap input {} is declared more than once",
+                input.outpoint
+            )));
+        }
+        let script = swap_parse_script(&input.script_pubkey_hex)?;
+        match wallet.indexer().unspent_txo_amount(&outpoint, &script)? {
+            None if own => {
+                return Err(swap_invalid(format!(
+                    "this wallet's swap input {} is already spent or unknown to the indexer: \
+                     the wallet needs a sync",
+                    input.outpoint
+                )));
+            }
+            None => {
+                return Err(swap_invalid(format!(
+                    "swap input {} is already spent or does not exist",
+                    input.outpoint
+                )));
+            }
+            Some(amount) if amount != input.amount_sat => {
+                return Err(swap_invalid(format!(
+                    "swap input {} amount mismatch: declared {} sat, found {amount} sat",
+                    input.outpoint, input.amount_sat
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn swap_accept_transfer_from_file(
+    wallet: &mut Wallet,
+    txn: &DbTxn,
+    consignment_path: &Path,
+    txid: String,
+    vout: u32,
+    blinding: u64,
+    recipient_id: &str,
+    btc_amount_sat: u64,
+) -> Result<Vec<Assignment>, Error> {
+    let witness_id = RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;
+    let consignment = RgbTransfer::load_file(consignment_path).map_err(InternalError::from)?;
+    let contract_id = consignment.contract_id();
+    let asset_id = contract_id.to_string();
+    let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+    wallet.check_schema_support(&asset_schema)?;
+
+    let mut runtime = wallet.rgb_runtime()?;
+    let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
+    runtime.store_secret_seal(graph_seal)?;
+
+    let resolver = OffchainResolver {
+        witness_id,
+        consignment: &consignment,
+        fallback: wallet.blockchain_resolver(),
+    };
+    let validation_config = ValidationConfig {
+        chain_net: wallet.chain_net(),
+        trusted_typesystem: asset_schema.types(),
+        ..Default::default()
+    };
+    let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
+        Ok(consignment) => consignment,
+        Err(ValidationError::InvalidConsignment(e)) => {
+            error!(wallet.logger(), "Consignment is invalid: {}", e);
+            return Err(Error::InvalidConsignment);
+        }
+        Err(ValidationError::ResolverError(e)) => {
+            warn!(
+                wallet.logger(),
+                "Network error during consignment validation"
+            );
+            return Err(Error::Network {
+                details: e.to_string(),
+            });
+        }
+    };
+    swap_validate_witness_output(&consignment, witness_id, recipient_id, vout)?;
+
+    let valid_contract = valid_consignment.clone().into_valid_contract();
+    runtime
+        .import_contract(valid_contract.clone(), wallet.blockchain_resolver())
+        .expect("failure importing validated contract");
+    if txn.get_asset(asset_id.clone())?.is_none() {
+        wallet.save_new_asset_internal(
+            txn,
+            &runtime,
+            contract_id,
+            asset_schema,
+            valid_contract.clone(),
+            Some(valid_consignment.clone()),
+        )?;
+    }
+    let received_rgb_assignments =
+        wallet.extract_received_assignments(&consignment, witness_id, Some(vout), None);
+    runtime.accept_transfer(valid_consignment, &resolver)?;
+    let assignments = received_rgb_assignments.into_values().collect::<Vec<_>>();
+    drop(runtime);
+    swap_record_incoming(txn, &asset_id, &txid, vout, btc_amount_sat, &assignments)?;
+    Ok(assignments)
+}
+
+pub(crate) fn swap_fetch_consignment_to_file(
+    wallet: &Wallet,
+    consignment: &OnchainSwapConsignment,
+) -> Result<PathBuf, Error> {
+    let endpoint_str =
+        consignment
+            .endpoint
+            .as_deref()
+            .ok_or_else(|| Error::InvalidTransportEndpoints {
+                details: s!("swap consignment missing proxy endpoint"),
+            })?;
+    let transport = RgbTransport::from_str(endpoint_str)?;
+    let proxy_url = TransportEndpoint::try_from(transport)?.endpoint;
+    let proxy_client = ProxyClient::new(&proxy_url)?;
+    let res = proxy_client.get_consignment(&consignment.recipient_id)?;
+    let consignment_res = res.result.ok_or(Error::NoConsignment)?;
+    let consignment_bytes = general_purpose::STANDARD
+        .decode(consignment_res.consignment)
+        .map_err(InternalError::from)?;
+    let target_dir = wallet
+        .wallet_dir()
+        .join("swap-receive")
+        .join(&consignment.recipient_id);
+    fs::create_dir_all(&target_dir)?;
+    let target_path = target_dir.join(format!("{}.rgb", consignment.asset_id));
+    fs::write(&target_path, &consignment_bytes)?;
+    Ok(target_path)
+}
+
+pub(crate) fn swap_fetch_asset_history_to_file(
+    wallet: &Wallet,
+    history: &OnchainSwapAssetHistory,
+) -> Result<PathBuf, Error> {
+    let endpoint_str =
+        history
+            .endpoint
+            .as_deref()
+            .ok_or_else(|| Error::InvalidTransportEndpoints {
+                details: s!("swap asset history missing proxy endpoint"),
+            })?;
+    let transport = RgbTransport::from_str(endpoint_str)?;
+    let proxy_url = TransportEndpoint::try_from(transport)?.endpoint;
+    let proxy_client = ProxyClient::new(&proxy_url)?;
+    let res = proxy_client.get_consignment(&history.recipient_id)?;
+    let history_res = res.result.ok_or(Error::NoConsignment)?;
+    let history_bytes = general_purpose::STANDARD
+        .decode(history_res.consignment)
+        .map_err(InternalError::from)?;
+    let target_dir = wallet
+        .wallet_dir()
+        .join("swap-history")
+        .join(&history.recipient_id);
+    fs::create_dir_all(&target_dir)?;
+    let target_path = swap_history_path(&target_dir, &history.asset_id);
+    fs::write(&target_path, &history_bytes)?;
+    Ok(target_path)
+}
+
+/// Pick coins out of `values` that together cover `needed`, keeping the overshoot small: the
+/// smallest coin that covers what is still missing, else the largest coin, and repeat. Returns
+/// the indices of the picked coins, or `None` when all of them together fall short.
+pub(crate) fn swap_pick_smallest_covering(values: &[u64], needed: u64) -> Option<Vec<usize>> {
+    let mut order = (0..values.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&i| (values[i], i));
+    let mut picked = vec![];
+    let mut missing = needed;
+    while missing > 0 {
+        if let Some(pos) = order.iter().position(|&i| values[i] >= missing) {
+            picked.push(order.remove(pos));
+            return Some(picked);
+        }
+        // no single coin covers the rest, so every remaining coin is below `missing`
+        let largest = order.pop()?;
+        missing -= values[largest];
+        picked.push(largest);
+    }
+    Some(picked)
+}
+
+/// Select plain BTC inputs from the vanilla wallet worth at least `needed_sat`.
+///
+/// Coins in `excluded`, coins already spent and coins the wallet holds back from vanilla sends
+/// (DB-tracked TXOs and those reserved by an unbroadcast `send_btc_begin` / `create_utxos_begin`)
+/// are never picked. With `prefer_smallest` the coins are chosen to leave the smallest leftover,
+/// otherwise they are taken in wallet order until the amount is covered.
+pub(crate) fn swap_select_btc_inputs(
+    wallet: &mut Wallet,
+    txn: &DbTxn,
+    needed_sat: u64,
+    min_confirmations: u8,
+    excluded: &HashSet<(&str, u32)>,
+    prefer_smallest: bool,
+) -> Result<Vec<OnchainSwapInput>, Error> {
+    // The caller (swap_select_inputs) already synced via sync_if_requested; we use
+    // internal_unspents() directly to avoid opening a second DB connection while the
+    // caller's transaction is still live (pool size = 1).
+    // a pending send_btc_begin / create_utxos_begin PSBT relies on its reserved coins: spending
+    // one here would make that PSBT invalid
+    let unspendable = wallet
+        .get_unspendable_bdk_outpoints(txn)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let candidates = wallet
+        .internal_unspents()
+        .filter(|o| {
+            let txid = o.outpoint.txid.to_string();
+            !o.is_spent
+                && !unspendable.contains(&o.outpoint)
+                && !excluded.contains(&(txid.as_str(), o.outpoint.vout))
+        })
+        .collect::<Vec<_>>();
+    let is_confirmed = |output: &LocalOutput| -> Result<bool, Error> {
+        if min_confirmations == 0 {
+            return Ok(true);
+        }
+        let confs = wallet
+            .indexer()
+            .get_tx_confirmations(&output.outpoint.txid.to_string())?
+            .unwrap_or_default();
+        Ok(confs >= min_confirmations as u64)
+    };
+    let insufficient = |available: u64| Error::InsufficientBitcoins {
+        needed: needed_sat,
+        available,
+    };
+    if prefer_smallest {
+        let mut eligible = vec![];
+        for output in candidates {
+            if is_confirmed(&output)? {
+                eligible.push(output);
+            }
+        }
+        let values = eligible
+            .iter()
+            .map(|o| o.txout.value.to_sat())
+            .collect::<Vec<_>>();
+        return match swap_pick_smallest_covering(&values, needed_sat) {
+            Some(picked) => Ok(picked
+                .into_iter()
+                .map(|i| swap_build_input(&eligible[i]))
+                .collect()),
+            None => Err(insufficient(
+                values.iter().fold(0u64, |acc, v| acc.saturating_add(*v)),
+            )),
+        };
+    }
+    let mut selected = vec![];
+    let mut total = 0u64;
+    for output in candidates {
+        if total >= needed_sat {
+            break;
+        }
+        if !is_confirmed(&output)? {
+            continue;
+        }
+        total = total
+            .checked_add(output.txout.value.to_sat())
+            .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+        selected.push(swap_build_input(&output));
+    }
+    if total < needed_sat {
+        return Err(insufficient(total));
+    }
+    Ok(selected)
+}
+
+/// Select this side's inputs for what it `gives` plus `extra_sat` of its own costs, and return
+/// them with the keychain its change output must use.
+///
+/// The change goes to the colored keychain only when the inputs carry RGB change (of the swapped
+/// asset or of others sharing the inputs), which coloring then assigns to it. Otherwise it goes
+/// to the vanilla keychain, so the sats of a plain BTC top-up stay spendable by `send_btc`.
+pub(crate) fn swap_select_inputs(
+    wallet: &mut Wallet,
+    txn: &DbTxn,
+    online: Online,
+    gives: &OnchainSwapLeg,
+    extra_sat: u64,
+    min_confirmations: u8,
+    skip_sync: bool,
+    exclude_outpoints: &[Outpoint],
+) -> Result<(Vec<OnchainSwapInput>, KeychainKind), Error> {
+    wallet.sync_if_requested(txn, Some(online), skip_sync, KeychainKind::Internal)?;
+    wallet.sync_if_requested(txn, Some(online), skip_sync, KeychainKind::External)?;
+    let excluded = exclude_outpoints
+        .iter()
+        .map(|o| (o.txid.as_str(), o.vout))
+        .collect::<HashSet<_>>();
+    match gives.kind {
+        OnchainSwapLegKind::Btc => {
+            let inputs = swap_select_btc_inputs(
+                wallet,
+                txn,
+                gives
+                    .amount
+                    .checked_add(extra_sat)
+                    .ok_or_else(|| swap_invalid("swap amounts overflow"))?,
+                min_confirmations,
+                &excluded,
+                false,
+            )?;
+            Ok((inputs, KeychainKind::Internal))
+        }
+        OnchainSwapLegKind::Rgb => {
+            let asset_id = gives.asset_id.clone().expect("RGB leg has asset ID");
+            let contract_id = ContractId::from_str(&asset_id)
+                .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
+            txn.check_asset_exists(asset_id.clone())?;
+            let assignments = AssignmentsCollection {
+                fungible: gives.amount,
+                non_fungible: false,
+                inflation: 0,
+            };
+            let (_, _, mut input_unspents, _) = wallet.get_transfer_begin_data(txn, 1)?;
+            input_unspents.retain(|u| !excluded.contains(&(u.utxo.txid.as_str(), u.utxo.vout)));
+            let selected = wallet.select_rgb_inputs(asset_id, &assignments, input_unspents)?;
+            let selected_outpoints = selected
+                .input_outpoints
+                .into_iter()
+                .map(BdkOutPoint::from)
+                .collect::<HashSet<_>>();
+            let bdk_outputs = wallet.bdk_wallet().list_unspent().collect::<Vec<_>>();
+            let mut colored_inputs = vec![];
+            for output in bdk_outputs {
+                if selected_outpoints.contains(&output.outpoint) {
+                    colored_inputs.push(swap_build_input(&output));
+                }
+            }
+            if colored_inputs.is_empty() {
+                return Err(swap_invalid("could not resolve selected RGB inputs"));
+            }
+            swap_ensure_inputs_confirmed(wallet, &colored_inputs, min_confirmations)?;
+            // coloring assigns everything the declared inputs carry, so the RGB change is
+            // computed on the same (final) input set
+            let carries_rgb_change = |wallet: &Wallet, inputs: &[OnchainSwapInput]| {
+                let outpoints = inputs.iter().map(swap_input_to_outpoint).collect();
+                Ok::<_, Error>(swap_input_rgb_amounts(wallet, &outpoints)?.into_iter().any(
+                    |(cid, amount)| amount > if cid == contract_id { gives.amount } else { 0 },
+                ))
+            };
+            let dust = wallet
+                .bdk_wallet()
+                .public_descriptor(KeychainKind::External)
+                .dust_value()
+                .to_sat();
+            let colored_total = swap_selected_inputs_total(&colored_inputs);
+            let mut reserve_change = carries_rgb_change(wallet, &colored_inputs)?;
+            loop {
+                // RGB change rides on this side's change output, which then has to be above dust
+                let needed = if reserve_change {
+                    extra_sat
+                        .checked_add(dust)
+                        .ok_or_else(|| swap_invalid("swap amounts overflow"))?
+                } else {
+                    extra_sat
+                };
+                let mut inputs = colored_inputs.clone();
+                if colored_total < needed {
+                    // colored UTXOs usually hold too few sats to pay for this side, so top them
+                    // up with plain BTC inputs. When the change is colored its sats can only be
+                    // spent with RGB, so pick the coins that leave the least behind.
+                    let btc_inputs = swap_select_btc_inputs(
+                        wallet,
+                        txn,
+                        needed - colored_total,
+                        min_confirmations,
+                        &excluded,
+                        reserve_change,
+                    )
+                    .map_err(|e| match e {
+                        Error::InsufficientBitcoins { available, .. } => {
+                            Error::InsufficientBitcoins {
+                                needed,
+                                available: colored_total.saturating_add(available),
+                            }
+                        }
+                        e => e,
+                    })?;
+                    inputs.extend(btc_inputs);
+                }
+                let rgb_change = carries_rgb_change(wallet, &inputs)?;
+                if rgb_change && !reserve_change {
+                    // a plain coin turned out to carry RGB, so make room for a colored change
+                    reserve_change = true;
+                    continue;
+                }
+                let change_keychain = if rgb_change {
+                    KeychainKind::External
+                } else {
+                    KeychainKind::Internal
+                };
+                return Ok((inputs, change_keychain));
+            }
+        }
+    }
+}
+
 /// Online operations for a wallet.
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
@@ -4940,5 +6157,60 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
         }
         info!(self.logger(), "Refresh completed");
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod swap_select_unit_tests {
+    use super::*;
+
+    #[test]
+    fn smallest_covering_coin_is_preferred() {
+        // a single coin covers the amount: the smallest such coin, whatever the order
+        assert_eq!(
+            swap_pick_smallest_covering(&[100_000_000, 5_000, 50_000, 1_500], 1_330),
+            Some(vec![3])
+        );
+        assert_eq!(
+            swap_pick_smallest_covering(&[100_000_000, 5_000, 50_000], 1_330),
+            Some(vec![1])
+        );
+        assert_eq!(
+            swap_pick_smallest_covering(&[100_000_000, 5_000, 50_000], 5_000),
+            Some(vec![1])
+        );
+        assert_eq!(
+            swap_pick_smallest_covering(&[100_000_000, 5_000, 50_000], 5_001),
+            Some(vec![2])
+        );
+    }
+
+    #[test]
+    fn smallest_covering_combines_coins_when_none_is_enough() {
+        // the largest coin first, then the smallest one covering the rest
+        assert_eq!(
+            swap_pick_smallest_covering(&[1_000, 3_000, 2_000, 600], 3_500),
+            Some(vec![1, 3])
+        );
+        assert_eq!(
+            swap_pick_smallest_covering(&[1_000, 3_000, 2_000], 6_000),
+            Some(vec![1, 2, 0])
+        );
+    }
+
+    #[test]
+    fn smallest_covering_edge_cases() {
+        assert_eq!(
+            swap_pick_smallest_covering(&[1_000, 2_000], 0),
+            Some(vec![])
+        );
+        assert_eq!(swap_pick_smallest_covering(&[1_000, 2_000], 3_001), None);
+        assert_eq!(swap_pick_smallest_covering(&[], 1), None);
+        assert_eq!(swap_pick_smallest_covering(&[0, 0], 1), None);
+        // ties go to the earlier coin
+        assert_eq!(
+            swap_pick_smallest_covering(&[2_000, 2_000], 1_500),
+            Some(vec![0])
+        );
     }
 }

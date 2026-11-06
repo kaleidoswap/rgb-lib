@@ -50,9 +50,9 @@ COMPOSE="$COMPOSE -f ${COMPOSE_FPATH}"
 EXPOSED_PORTS=(3000 50001) # see compose.yaml for the exposed ports
 TIMEOUT=100
 
-BCLI="$COMPOSE exec -T -u blits bitcoind bitcoin-cli -regtest"
-BCLI_SIGNET="$COMPOSE exec -T -u blits bitcoind_signet_custom bitcoin-cli -signet"
-BCLI_ESPLORA="$COMPOSE exec -T esplora cli"
+BCLI="$COMPOSE exec -T -u blits bitcoind bitcoin-cli -regtest -rpcwait -rpcwaittimeout=$TIMEOUT"
+BCLI_SIGNET="$COMPOSE exec -T -u blits bitcoind_signet_custom bitcoin-cli -signet -rpcwait -rpcwaittimeout=$TIMEOUT"
+BCLI_ESPLORA="$COMPOSE exec -T esplora cli -rpcwait -rpcwaittimeout=$TIMEOUT"
 
 _prepare_bitcoin_funds() {
     $BCLI createwallet miner
@@ -177,6 +177,9 @@ prepare_tests_environment() {
 
     _wait_for_bitcoind bitcoind_signet_custom
 
+    # esplora's bitcoind restarts during its boot: fund it only once it is up
+    _wait_for_esplora esplora
+
     _prepare_bitcoin_funds
 
     _wait_for_electrs electrs
@@ -186,8 +189,6 @@ prepare_tests_environment() {
     _wait_for_electrs electrs-blockstream
 
     _wait_for_electrs electrs_signet_custom
-
-    _wait_for_esplora esplora
 
     _wait_for_proxy proxy
 

@@ -38,9 +38,12 @@ pub use objects::{
 };
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub use objects::{
-    BurnBeginResult, BurnDetails, InflateBeginResult, InflateDetails, OnlineOptions,
-    OperationResult, RefreshFilter, RefreshResult, RefreshTransferStatus, RefreshedTransfer,
-    SendBeginResult, SendDetails,
+    BurnBeginResult, BurnDetails, InflateBeginResult, InflateDetails, OnchainSwapAssetHistory,
+    OnchainSwapCompletion, OnchainSwapConsignment, OnchainSwapExtraOutput, OnchainSwapInput,
+    OnchainSwapLeg, OnchainSwapLegKind, OnchainSwapOffer, OnchainSwapProposal,
+    OnchainSwapReceiveResult, OnchainSwapRequest, OnchainSwapRole, OnchainSwapStage,
+    OnchainSwapSummary, OnlineOptions, OperationResult, RefreshFilter, RefreshResult,
+    RefreshTransferStatus, RefreshedTransfer, SendBeginResult, SendDetails,
 };
 pub use offline::RgbWalletOpsOffline;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
