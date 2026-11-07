@@ -5053,10 +5053,23 @@ pub(crate) fn swap_emit_asset_history(
     let asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
     let path = wallet.wallet_dir().join(ASSETS_DIR).join(&asset_id);
     if !path.exists() {
-        return Err(swap_invalid(format!(
-            "swap asset history not found at {}",
-            path.display()
-        )));
+        // Only an issuer has the file from issuance. A wallet that received the asset holds the
+        // same contract in its stash: write it out, so that any holder can give the asset.
+        let contract_id = ContractId::from_str(&asset_id)
+            .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
+        let contract = wallet
+            .rgb_runtime()?
+            .export_contract(contract_id)
+            .map_err(|_| {
+                swap_invalid(format!(
+                    "swap asset history not found at {} and the asset is not in the wallet",
+                    path.display()
+                ))
+            })?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        contract.save_file(&path)?;
     }
     let endpoint = proxy_url.map(swap_proxy_transport_endpoint).transpose()?;
     let recipient_id = swap_history_recipient_id(swap_id, &asset_id);
