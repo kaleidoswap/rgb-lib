@@ -68,7 +68,7 @@ fn scenario_1_chunked_encrypted_backup_upload_and_restore() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
-            None,
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .expect("send");

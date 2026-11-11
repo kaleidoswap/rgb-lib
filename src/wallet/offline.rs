@@ -1495,7 +1495,7 @@ pub trait WalletOffline: WalletBackup {
         let (linked_from_asset_id, linked_to_asset_id, unspent_link_right_outpoint) =
             if asset.schema == AssetSchema::Ifa {
                 let (linked_from_asset_id, linked_to_asset_id) =
-                    self.asset_link_ifa_data(&asset_id)?;
+                    self.asset_link_ifa_data(txn, &asset_id)?;
                 let unspent_link_right_outpoint = txn.get_unspent_link_right_outpoint(&asset_id)?;
 
                 (
@@ -2072,7 +2072,7 @@ pub trait WalletOffline: WalletBackup {
                                     medias.clone(),
                                 )?;
                                 let (linked_from_asset_id, linked_to_asset_id) =
-                                    self.asset_link_ifa_data(&asset.asset_id)?;
+                                    self.asset_link_ifa_data(txn, &asset.asset_id)?;
                                 asset.linked_from_asset_id = linked_from_asset_id;
                                 asset.linked_to_asset_id = linked_to_asset_id;
                                 Ok(asset)
@@ -2799,14 +2799,14 @@ pub trait WalletOffline: WalletBackup {
 
     fn asset_link_ifa_data(
         &self,
+        txn: &DbTxn,
         asset_id: &str,
     ) -> Result<(Option<String>, Option<String>), Error> {
         let contract_id = ContractId::from_str(asset_id).map_err(|e| Error::Internal {
             details: e.to_string(),
         })?;
-        let txn = self.database().begin_transaction()?;
         let contract = self
-            .rgb_stock(&txn)?
+            .rgb_stock(txn)?
             .contract_wrapper::<InflatableFungibleAsset>(contract_id)?;
         let linked_from_asset_id = contract
             .link_from()

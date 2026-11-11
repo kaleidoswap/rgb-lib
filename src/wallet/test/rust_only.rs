@@ -1598,6 +1598,8 @@ fn color_psbt_and_prepare_consume_rejects_second_live_batch_for_same_txid() {
 #[parallel]
 fn color_psbt_and_prepare_consume_bulk_fail_transfers_reclaims_expired_batch() {
     initialize();
+    // no sender proxy is involved: let the expiration take effect without the skew margin
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(0));
 
     let amt_sat = 500;
     let blinding = 777;
@@ -1635,6 +1637,8 @@ fn color_psbt_and_prepare_consume_bulk_fail_transfers_reclaims_expired_batch() {
 #[parallel]
 fn color_psbt_and_prepare_consume_bulk_fail_transfers_spares_broadcast_expired_batch() {
     initialize();
+    // no sender proxy is involved: let the expiration take effect without the skew margin
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(0));
 
     let amt_sat = 500;
     let blinding = 777;
@@ -1716,13 +1720,15 @@ fn consume_transfer_fascia_recovers_after_crash_between_stash_consume_and_db_com
         .get_transfers_dir()
         .join(&txid)
         .join("stash_consumed");
+    // the stash consume and the SQL side share one transaction: the failure rolls both back,
+    // and the marker (written only on commit) is never left behind
     assert!(
-        marker.exists(),
-        "durable marker must exist after stash consume"
+        !marker.exists(),
+        "no marker may survive a rolled back consume"
     );
     assert!(party_send.check_test_transfer_status_sender(&txid, TransferStatus::Initiated));
 
-    // Retry finishes the SQL side without a second consume_fascia.
+    // Retry consumes the fascia again and finishes the SQL side.
     party_send
         .wallet
         .consume_transfer_fascia(party_send.party_online(), batch_transfer_idx)
@@ -3348,6 +3354,8 @@ fn psbt_op_prepare_foreign_escrow_input_persists_claim_change() {
         )
         .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
     let mut claim_psbt = claim_builder.finish().unwrap();
+    // BDK 3.2 no longer fills in the previous TXs of the wallet inputs
+    party.wallet.add_non_witness_utxos(&mut claim_psbt);
     prepend_psbt_input(
         &mut claim_psbt,
         escrow_outpoint,
@@ -3722,6 +3730,8 @@ fn psbt_op_foreign_escrow_witness_receive_apply_refresh_balance() {
         .add_recipient(claim_script.clone(), BdkAmount::from_sat(amt_sat))
         .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
     let mut claim_psbt = claim_builder.finish().unwrap();
+    // BDK 3.2 no longer fills in the previous TXs of the wallet inputs
+    party.wallet.add_non_witness_utxos(&mut claim_psbt);
     prepend_psbt_input(
         &mut claim_psbt,
         escrow_outpoint,
@@ -4726,6 +4736,8 @@ fn psbt_op_abort_recovers_after_crash_between_sql_fail_and_journal() {
 #[parallel]
 fn psbt_op_fail_transfers_expiration_heals_meta() {
     initialize();
+    // no sender proxy is involved: let the expiration take effect without the skew margin
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(0));
 
     let amt_sat = 500;
     let blinding = 777;
@@ -4889,6 +4901,8 @@ fn psbt_op_abort_refused_after_broadcast_attempt() {
 #[parallel]
 fn psbt_op_fail_transfers_bulk_releases_expired_attempted_batch() {
     initialize();
+    // no sender proxy is involved: let the expiration take effect without the skew margin
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(0));
 
     let amt_sat = 500;
     let blinding = 777;

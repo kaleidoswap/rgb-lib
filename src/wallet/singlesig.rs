@@ -1924,6 +1924,7 @@ impl Wallet {
         if matches!(offer.maker_gives.kind, OnchainSwapLegKind::Rgb) {
             maker_history = swap_emit_asset_history(
                 self,
+                &txn,
                 &offer.maker_gives,
                 &proposal.maker_inputs,
                 &offer.swap_id,
@@ -1958,7 +1959,7 @@ impl Wallet {
                     outgoing = Some(leg_outgoing);
                 }
                 SwapDirection::RgbForRgb => {
-                    swap_stage_rgb_leg(self, &mut psbt, &send)?;
+                    swap_stage_rgb_leg(&txn, self, &mut psbt, &send)?;
                 }
                 SwapDirection::BtcForRgb => {
                     unreachable!("BTC-for-RGB cannot reach maker_gives==Rgb branch")
@@ -2090,6 +2091,7 @@ impl Wallet {
                     .ok_or_else(|| swap_invalid("missing taker RGB recipient ID"))?;
                 swap_validate_received_swap_leg(
                     self,
+                    &txn,
                     &proposal.consignments,
                     &offer.maker_gives,
                     &proposal.txid,
@@ -2106,11 +2108,12 @@ impl Wallet {
                 swap_import_asset_history(self, &txn, maker_history, &offer.maker_gives)?;
                 taker_history = swap_emit_asset_history(
                     self,
+                    &txn,
                     &offer.maker_receives,
                     &proposal.request.taker_inputs,
                     &offer.swap_id,
                 )?;
-                swap_stage_rgb_leg(self, &mut psbt, &taker_send)?;
+                swap_stage_rgb_leg(&txn, self, &mut psbt, &taker_send)?;
                 let mpc_entropy = swap_mpc_entropy(self.wallet_dir(), &offer.swap_id)?;
                 let fascia = self.color_psbt_finalize(&mut psbt, Some(mpc_entropy))?;
                 let taker_recv_vout =
@@ -2141,6 +2144,7 @@ impl Wallet {
                 )
                 .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
                 let received = self.generate_transfer(
+                    &txn,
                     maker_contract_id,
                     vec![BuilderSeal::Revealed(GraphSeal::with_blinded_vout(
                         taker_recv_vout,
@@ -2151,6 +2155,7 @@ impl Wallet {
                 )?;
                 swap_validate_received_transfer(
                     self,
+                    &txn,
                     received,
                     &offer.maker_gives,
                     psbt.unsigned_tx.compute_txid().to_string(),
@@ -2288,8 +2293,10 @@ impl Wallet {
                     .maker_rgb_recipient_id
                     .as_deref()
                     .ok_or_else(|| swap_invalid("missing maker RGB recipient ID"))?;
+                let txn = self.database().begin_transaction()?;
                 swap_validate_received_swap_leg(
                     self,
+                    &txn,
                     &completion.consignments,
                     &offer.maker_receives,
                     &txid,
@@ -2298,7 +2305,6 @@ impl Wallet {
                     recv_recipient_id,
                 )?;
 
-                let txn = self.database().begin_transaction()?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::Internal)?;
                 self.sync_if_requested(&txn, Some(online), false, KeychainKind::External)?;
                 swap_ensure_inputs_unspent(
@@ -2342,8 +2348,10 @@ impl Wallet {
                     .maker_rgb_recipient_id
                     .as_deref()
                     .ok_or_else(|| swap_invalid("missing maker RGB recipient ID"))?;
+                let txn = self.database().begin_transaction()?;
                 swap_validate_received_swap_leg(
                     self,
+                    &txn,
                     &completion.consignments,
                     &offer.maker_receives,
                     &txid,
@@ -2352,7 +2360,6 @@ impl Wallet {
                     recv_recipient_id,
                 )?;
 
-                let txn = self.database().begin_transaction()?;
                 let taker_history = completion
                     .taker_history
                     .as_ref()
@@ -2677,7 +2684,7 @@ impl Wallet {
             any_unspent = true;
             if utxo.keychain == KeychainKind::Internal
                 && !colored_txos.contains(&outpoint)
-                && swap_input_rgb_amounts(self, &HashSet::from([outpoint]))?.is_empty()
+                && swap_input_rgb_amounts(self, &txn, &HashSet::from([outpoint]))?.is_empty()
             {
                 inputs.push(outpoint);
             }

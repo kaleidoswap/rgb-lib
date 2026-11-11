@@ -12582,7 +12582,7 @@ fn offline_receiver_witness_restart_donation_true() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
-            None,
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap();
@@ -12699,7 +12699,7 @@ fn offline_receiver_blind_restart_donation_true() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
-            None,
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap();
@@ -12987,7 +12987,7 @@ fn offline_receiver_nack_donation_true_receiver_fails_after_broadcast() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
-            None,
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap();

@@ -1037,13 +1037,13 @@ impl Wallet {
     /// it only if you know what you're doing</div>
     pub fn generate_transfer(
         &self,
+        txn: &DbTxn,
         contract_id: ContractId,
         beneficiaries: Vec<BuilderSeal<GraphSeal>>,
         witness_txid: RgbTxid,
         fascia: &Fascia,
     ) -> Result<RgbTransfer, Error> {
-        let txn = self.database().begin_transaction()?;
-        let runtime = self.rgb_stock(&txn)?;
+        let runtime = self.rgb_stock(txn)?;
         let mut beneficiaries_witness = vec![];
         let mut beneficiaries_blinded = vec![];
         for builder_seal in beneficiaries {
@@ -1455,7 +1455,12 @@ impl Wallet {
 
         let txn = self.database().begin_transaction()?;
         let runtime = self.rgb_stock(&txn)?;
-        runtime.genesis(contract_id)?;
+        // an unknown contract is an asset this wallet doesn't hold
+        if runtime.genesis(contract_id).is_err() {
+            return Err(Error::AssetNotFound {
+                asset_id: contract_id.to_string(),
+            });
+        }
         let state = runtime
             .contract_assignments_for(contract_id, parsed.iter().map(|(_, outpoint)| *outpoint))?;
 
@@ -1817,6 +1822,7 @@ impl Wallet {
             shift_output_map_for_opreturn_first,
         )?;
         let result = self.prepare_color_and_transfer_runtime(
+            &txn,
             &mut runtime,
             psbt,
             fascia,
@@ -1840,12 +1846,12 @@ impl Wallet {
     /// amount of each contract.
     pub(crate) fn color_psbt_stage_for_inputs(
         &self,
+        txn: &DbTxn,
         psbt: &mut Psbt,
         coloring_info: ColoringInfo,
         prev_outputs: HashSet<OutPoint>,
     ) -> Result<AssetBeneficiariesMap, Error> {
-        let txn = self.database().begin_transaction()?;
-        let runtime = self.rgb_stock(&txn)?;
+        let runtime = self.rgb_stock(txn)?;
         // checked before `prepare_psbt_for_coloring`, which would otherwise insert an OP_RETURN
         // into the caller's PSBT on the way to failing
         self.reject_uncolored_input_contracts(&runtime, &prev_outputs, &coloring_info)?;
@@ -1981,7 +1987,7 @@ impl Wallet {
                     ),
                 });
             }
-            self.consume_fascia_persist_then_mark(fascia, &[&stash_marker])?;
+            self.consume_fascia_persist_then_mark(&txn, fascia, &[&stash_marker])?;
             #[cfg(test)]
             if MOCK_FAIL_AFTER_STASH_CONSUME.with(|f| f.replace(false)) {
                 return Err(Error::Internal {
@@ -2008,6 +2014,7 @@ impl Wallet {
     /// of the same tx is not a sign that this fascia's bundles are in the stash.
     pub(crate) fn consume_fascia_persist_then_mark(
         &self,
+        txn: &DbTxn,
         fascia: Fascia,
         markers: &[&Path],
     ) -> Result<(), Error> {
@@ -2025,20 +2032,22 @@ impl Wallet {
                 });
             }
         };
-        let txn = self.database().begin_transaction()?;
-        let mut runtime = self.rgb_stock(&txn)?;
-        runtime.consume_fascia(fascia, Some(witness_ord))?;
-        drop(runtime);
-        txn.commit()?;
+        self.rgb_stock(txn)?
+            .consume_fascia(fascia, Some(witness_ord))?;
         #[cfg(test)]
         if MOCK_FAIL_AFTER_STOCK_PERSIST.with(|f| f.replace(false)) {
             return Err(Error::Internal {
                 details: s!("mock failure after stock persist before marker"),
             });
         }
-        for marker in markers {
-            persist_stash_consumed_marker(marker)?;
-        }
+        // the markers record a consume that is durable only once the caller's transaction
+        // commits: write them after the commit, never before
+        let markers: Vec<PathBuf> = markers.iter().map(|m| m.to_path_buf()).collect();
+        txn.on_commit(move || {
+            for marker in &markers {
+                let _ = persist_stash_consumed_marker(marker);
+            }
+        });
         Ok(())
     }
 
@@ -2091,6 +2100,7 @@ impl Wallet {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_color_and_transfer_runtime(
         &self,
+        txn: &DbTxn,
         runtime: &mut RgbStock<'_>,
         psbt: &Psbt,
         fascia: Fascia,
@@ -2146,6 +2156,7 @@ impl Wallet {
 
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         let batch_transfer_idx = self.persist_color_prepare_batch(
+            txn,
             psbt,
             &txid,
             &spent,
@@ -2191,6 +2202,7 @@ impl Wallet {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn persist_color_prepare_batch(
         &self,
+        txn: &DbTxn,
         psbt: &Psbt,
         txid: &str,
         spent: &HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>>,
@@ -2203,9 +2215,8 @@ impl Wallet {
         runtime: &RgbStock<'_>,
     ) -> Result<i32, Error> {
         self.write_color_prepare_files(psbt, txid, fascia, allow_consume_transfer_fascia)?;
-        let txn = self.database().begin_transaction()?;
         let batch_transfer_idx = self.persist_color_prepare_batch_txn(
-            &txn,
+            txn,
             psbt,
             txid,
             spent,
@@ -2215,7 +2226,6 @@ impl Wallet {
             expiration_timestamp,
             runtime,
         )?;
-        txn.commit()?;
         Ok(batch_transfer_idx)
     }
 
@@ -2620,6 +2630,7 @@ impl Wallet {
             false,
         )?;
         let result = self.prepare_color_and_transfer_runtime(
+            &txn,
             &mut runtime,
             psbt,
             fascia,
@@ -3014,7 +3025,7 @@ impl Wallet {
 
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         let allocations = fascia_allocations(&fascia)?;
-        let foreign_inputs = self.collect_foreign_input_entries(&spent)?;
+        let foreign_inputs = self.collect_foreign_input_entries(&txn, &spent)?;
 
         let operation_id = Self::new_psbt_op_id();
         let op_dir = self.psbt_op_dir(&operation_id)?;
@@ -3068,6 +3079,7 @@ impl Wallet {
         self.psbt_op_write_meta(&operation_id, &meta)?;
 
         let batch_transfer_idx = match self.persist_color_prepare_batch(
+            &txn,
             psbt,
             &txid,
             &spent,
@@ -3086,6 +3098,7 @@ impl Wallet {
             }
         };
         drop(runtime);
+        txn.commit()?;
 
         self.psbt_op_bind_batch_identity(&operation_id, &mut meta, batch_transfer_idx)?;
         self.trigger_auto_backup();
@@ -3108,9 +3121,9 @@ impl Wallet {
 
     fn collect_foreign_input_entries(
         &self,
+        txn: &DbTxn,
         spent: &SpentByContract,
     ) -> Result<Vec<ForeignInputEntry>, Error> {
-        let txn = self.database().begin_transaction()?;
         let mut foreign_inputs = Vec::new();
         for (contract_id, by_outpoint) in spent {
             for (outpoint, assignments) in by_outpoint {
@@ -3211,7 +3224,13 @@ impl Wallet {
                 self.psbt_op_write_meta(operation_id, &meta)?;
             }
             let transfer_marker = self.get_transfer_dir(&meta.txid).join(STASH_CONSUMED_FILE);
-            self.consume_fascia_persist_then_mark(fascia, &[&stash_marker, &transfer_marker])?;
+            let txn = self.database().begin_transaction()?;
+            self.consume_fascia_persist_then_mark(
+                &txn,
+                fascia,
+                &[&stash_marker, &transfer_marker],
+            )?;
+            txn.commit()?;
             #[cfg(test)]
             if MOCK_FAIL_AFTER_STASH_CONSUME.with(|f| f.replace(false)) {
                 return Err(Error::Internal {

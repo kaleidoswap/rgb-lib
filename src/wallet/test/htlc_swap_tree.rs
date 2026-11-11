@@ -437,6 +437,7 @@ fn build_htlc_spend(
         builder.nlocktime(BtcLockTime::from_height(locked.htlc.timeout_height).unwrap());
     }
     let mut psbt = builder.finish().unwrap();
+    party.wallet.add_non_witness_utxos(&mut psbt);
     if colored {
         insert_op_return_first(&mut psbt);
     }

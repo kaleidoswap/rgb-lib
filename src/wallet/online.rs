@@ -7424,9 +7424,10 @@ impl SwapRgbSend<'_> {
     fn coloring_info(
         &self,
         wallet: &Wallet,
+        txn: &DbTxn,
         psbt: &Psbt,
     ) -> Result<(ContractId, rust_only::ColoringInfo, bool), Error> {
-        let available = swap_input_rgb_amounts(wallet, &self.input_outpoints())?;
+        let available = swap_input_rgb_amounts(wallet, txn, &self.input_outpoints())?;
         let change_script = swap_parse_script(self.change_script_hex)?;
         // RGB change must land on the colored keychain, where the wallet tracks it. A side
         // without RGB change gets a vanilla change (see swap_select_inputs), so no change vout
@@ -7455,10 +7456,10 @@ impl SwapRgbSend<'_> {
 /// Amounts per contract carried by the given wallet inputs (1 for a UDA token).
 pub(crate) fn swap_input_rgb_amounts(
     wallet: &Wallet,
+    txn: &DbTxn,
     inputs: &HashSet<BdkOutPoint>,
 ) -> Result<BTreeMap<ContractId, u64>, Error> {
-    let txn = wallet.database().begin_transaction()?;
-    let runtime = wallet.rgb_stock(&txn)?;
+    let runtime = wallet.rgb_stock(txn)?;
     let mut amounts = BTreeMap::new();
     for contract_id in runtime.contracts_assigning(inputs.iter().copied())? {
         let mut total = 0u64;
@@ -7482,12 +7483,13 @@ pub(crate) fn swap_input_rgb_amounts(
 
 /// Stage the RGB leg on `psbt` without finalizing the commitment.
 pub(crate) fn swap_stage_rgb_leg(
+    txn: &DbTxn,
     wallet: &Wallet,
     psbt: &mut Psbt,
     send: &SwapRgbSend,
 ) -> Result<(), Error> {
-    let (_, coloring_info, _) = send.coloring_info(wallet, psbt)?;
-    wallet.color_psbt_stage_for_inputs(psbt, coloring_info, send.input_outpoints())?;
+    let (_, coloring_info, _) = send.coloring_info(wallet, txn, psbt)?;
+    wallet.color_psbt_stage_for_inputs(txn, psbt, coloring_info, send.input_outpoints())?;
     Ok(())
 }
 
@@ -7506,7 +7508,7 @@ pub(crate) fn swap_prepare_rgb_leg(
     swap_id: &str,
     expiration_timestamp: Option<u64>,
 ) -> Result<(Vec<OnchainSwapConsignment>, SwapOutgoingState), Error> {
-    let (contract_id, coloring_info, shift) = send.coloring_info(wallet, psbt)?;
+    let (contract_id, coloring_info, shift) = send.coloring_info(wallet, txn, psbt)?;
     let batch_transfer_idx = wallet.prepare_consume_txn(
         txn,
         psbt,
@@ -7522,7 +7524,8 @@ pub(crate) fn swap_prepare_rgb_leg(
         send.recipient_vout,
         send.blinding,
     ));
-    let transfer = wallet.generate_transfer(contract_id, vec![seal], psbt.get_txid(), fascia)?;
+    let transfer =
+        wallet.generate_transfer(txn, contract_id, vec![seal], psbt.get_txid(), fascia)?;
     let consignments = swap_emit_consignments(
         wallet,
         vec![transfer],
@@ -7550,7 +7553,7 @@ pub(crate) fn swap_color_rgb_leg(
     swap_id: &str,
     expiration_timestamp: Option<u64>,
 ) -> Result<(Vec<OnchainSwapConsignment>, SwapOutgoingState), Error> {
-    swap_stage_rgb_leg(wallet, psbt, send)?;
+    swap_stage_rgb_leg(txn, wallet, psbt, send)?;
     let mpc_entropy = swap_mpc_entropy(wallet.wallet_dir(), swap_id)?;
     let fascia = wallet.color_psbt_finalize(psbt, Some(mpc_entropy))?;
     swap_prepare_rgb_leg(
@@ -7600,6 +7603,7 @@ pub(crate) fn swap_emit_consignments(
 /// allocations on `inputs`, so it works for any holder of the asset, not only its issuer.
 pub(crate) fn swap_emit_asset_history(
     wallet: &Wallet,
+    txn: &DbTxn,
     leg: &OnchainSwapLeg,
     inputs: &[OnchainSwapInput],
     swap_id: &str,
@@ -7611,8 +7615,7 @@ pub(crate) fn swap_emit_asset_history(
     let contract_id = ContractId::from_str(&asset_id)
         .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
     let history = {
-        let txn = wallet.database().begin_transaction()?;
-        let runtime = wallet.rgb_stock(&txn)?;
+        let runtime = wallet.rgb_stock(txn)?;
         let outputs = runtime
             .contract_assignments_for(contract_id, inputs.iter().map(swap_input_to_outpoint))?
             .into_keys()
@@ -7800,6 +7803,7 @@ fn swap_validate_witness_output(
 
 pub(crate) fn swap_validate_received_transfer_from_file(
     wallet: &mut Wallet,
+    txn: &DbTxn,
     consignment_path: &Path,
     leg: &OnchainSwapLeg,
     txid: String,
@@ -7811,13 +7815,23 @@ pub(crate) fn swap_validate_received_transfer_from_file(
         return Ok(vec![]);
     }
     let consignment = RgbTransfer::load_file(consignment_path).map_err(InternalError::from)?;
-    swap_validate_received_transfer(wallet, consignment, leg, txid, vout, blinding, recipient_id)
+    swap_validate_received_transfer(
+        wallet,
+        txn,
+        consignment,
+        leg,
+        txid,
+        vout,
+        blinding,
+        recipient_id,
+    )
 }
 
 /// Validate the transfer consignment of a received swap leg, whose witness transaction may not be
 /// broadcast yet, and return the assignments it gives to `vout`.
 pub(crate) fn swap_validate_received_transfer(
     wallet: &mut Wallet,
+    txn: &DbTxn,
     consignment: RgbTransfer,
     leg: &OnchainSwapLeg,
     txid: String,
@@ -7840,8 +7854,7 @@ pub(crate) fn swap_validate_received_transfer(
     let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
     wallet.check_schema_support(&asset_schema)?;
 
-    let txn = wallet.database().begin_transaction()?;
-    let mut runtime = wallet.rgb_stock(&txn)?;
+    let mut runtime = wallet.rgb_stock(txn)?;
     let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
     runtime.store_secret_seal(graph_seal)?;
 
@@ -7882,7 +7895,6 @@ pub(crate) fn swap_validate_received_transfer(
         .into_values()
         .collect::<Vec<_>>();
     drop(runtime);
-    txn.commit()?;
     if assignments.is_empty() {
         return Err(swap_invalid(
             "RGB swap consignment did not assign expected state",
@@ -7894,6 +7906,7 @@ pub(crate) fn swap_validate_received_transfer(
 
 pub(crate) fn swap_validate_received_swap_leg(
     wallet: &mut Wallet,
+    txn: &DbTxn,
     consignments: &[OnchainSwapConsignment],
     leg: &OnchainSwapLeg,
     txid: &str,
@@ -7931,6 +7944,7 @@ pub(crate) fn swap_validate_received_swap_leg(
     let local_path = swap_write_consignment_to_file(wallet, consignment)?;
     swap_validate_received_transfer_from_file(
         wallet,
+        txn,
         &local_path,
         leg,
         consignment.txid.clone(),
@@ -8511,7 +8525,7 @@ pub(crate) fn swap_select_inputs(
             // computed on the same (final) input set
             let carries_rgb_change = |wallet: &Wallet, inputs: &[OnchainSwapInput]| {
                 let outpoints = inputs.iter().map(swap_input_to_outpoint).collect();
-                Ok::<_, Error>(swap_input_rgb_amounts(wallet, &outpoints)?.into_iter().any(
+                Ok::<_, Error>(swap_input_rgb_amounts(wallet, txn, &outpoints)?.into_iter().any(
                     |(cid, amount)| amount > if cid == contract_id { gives.amount } else { 0 },
                 ))
             };

@@ -68,7 +68,7 @@ fn scenario_1_encrypted_backup_restore_matches_state_and_wallet_operational() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
-            None,
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .expect("send");

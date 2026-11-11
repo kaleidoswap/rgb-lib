@@ -167,7 +167,7 @@ fn scenario_4_1_wrong_signing_key_restore_fails_and_writes_no_wallet_data() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
-            None,
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .expect("send");

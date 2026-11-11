@@ -100,9 +100,16 @@ fn inconsistent_restored_backup_returns_dedicated_error() {
     let _ = wallet_a
         .create_utxos(online_a, true, Some(3), Some(20_000), FEE_RATE, false)
         .expect("create_utxos");
+    // an asset with media, whose file the broken restore below loses
     let _ = wallet_a
-        .issue_asset_nia("QA".into(), "QA asset".into(), 0, vec![100])
-        .expect("issue_asset_nia");
+        .issue_asset_cfa(
+            "QA asset".into(),
+            None,
+            0,
+            vec![100],
+            Some(FILE_STR.to_string()),
+        )
+        .expect("issue_asset_cfa");
 
     let (signing_key, store_id) = generate_signing_key_and_store_id("qa_stale_restore");
     let config = VssBackupConfig::new(vss_server_url(), store_id, signing_key);
@@ -111,7 +118,7 @@ fn inconsistent_restored_backup_returns_dedicated_error() {
     rt.block_on(wallet_a.vss_backup(&client)).expect("backup");
 
     // Restore, then break internal consistency (as a stale or torn backup
-    // would): drop the RGB runtime data while the DB still lists the asset.
+    // would): drop the media files while the DB still lists them.
     let restore_tmp_broken = tempfile::tempdir().expect("tempdir");
     let restored_dir = rt
         .block_on(restore_from_vss(
@@ -119,8 +126,10 @@ fn inconsistent_restored_backup_returns_dedicated_error() {
             restore_tmp_broken.path().to_str().unwrap(),
         ))
         .expect("restore_from_vss");
-    std::fs::remove_dir_all(restored_dir.join(crate::utils::RGB_RUNTIME_DIR))
-        .expect("drop rgb runtime dir");
+    let media_dir = restored_dir.join(crate::wallet::MEDIA_DIR);
+    for entry in std::fs::read_dir(&media_dir).expect("media dir") {
+        std::fs::remove_file(entry.expect("media entry").path()).expect("drop media file");
+    }
 
     let mut restored_data = wallet_a.get_wallet_data();
     restored_data.data_dir = restore_tmp_broken.path().to_string_lossy().to_string();
