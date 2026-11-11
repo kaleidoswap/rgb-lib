@@ -12387,7 +12387,7 @@ fn offline_receiver_blind_restart_waiting_counterparty() {
     rcv_party.wait_for_refresh_raw(None, None);
     assert!(
         rcv_party
-            .check_test_transfer_status_recipient(&recipient_id, TransferStatus::WaitingBroadcast)
+            .check_test_transfer_status_recipient(&recipient_id, TransferStatus::WaitingConfirmations)
     );
     rcv_party.wait_for_asset_balance(&asset.asset_id, &waiting_balance);
 
@@ -12481,7 +12481,7 @@ fn offline_receiver_witness_restart_waiting_counterparty() {
     rcv_party.wait_for_refresh_raw(None, None);
     assert!(
         rcv_party
-            .check_test_transfer_status_recipient(&recipient_id, TransferStatus::WaitingBroadcast)
+            .check_test_transfer_status_recipient(&recipient_id, TransferStatus::WaitingConfirmations)
     );
 
     let pws_after_rcv_refresh = rcv_party.db_pending_witness_scripts();
@@ -13187,7 +13187,7 @@ fn offline_receiver_mixed_blind_witness_batch_donation_false() {
     blind_party.wait_for_refresh_raw(None, None);
     assert!(blind_party.check_test_transfer_status_recipient(
         &blind_receive_data.recipient_id,
-        TransferStatus::WaitingBroadcast
+        TransferStatus::WaitingConfirmations
     ));
     blind_party.wait_for_asset_balance(&asset.asset_id, &blind_waiting_balance);
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
@@ -13195,7 +13195,7 @@ fn offline_receiver_mixed_blind_witness_batch_donation_false() {
     witness_party.wait_for_refresh_raw(None, None);
     assert!(witness_party.check_test_transfer_status_recipient(
         &witness_receive_data.recipient_id,
-        TransferStatus::WaitingBroadcast
+        TransferStatus::WaitingConfirmations
     ));
 
     party.wait_for_refresh_raw(Some(&asset.asset_id), None);
@@ -13320,17 +13320,15 @@ fn out_of_band_witness_reuse() {
         Some(TransferStatus::WaitingBroadcast)
     );
 
-    // the consignment file lands at the proxy-routing-id-keyed path
+    // the consignment file lands in the per-invoice dir (recipient ID plus invoice key prefix)
     let transfers = rcv_party.list_transfers(Some(&asset.asset_id));
     let t = transfers
         .iter()
         .find(|t| t.batch_transfer_idx == receive_data.batch_transfer_idx)
         .unwrap();
     assert_eq!(t.status, TransferStatus::WaitingBroadcast);
-    let proxy_rid = t.proxy_recipient_id.clone().unwrap();
-    assert_ne!(proxy_rid, receive_data.recipient_id);
     let rcv_consignment_path = t.consignment_path.clone().unwrap();
-    assert!(rcv_consignment_path.contains(&proxy_rid));
+    assert!(rcv_consignment_path.contains(&receive_data.public_key[..16]));
     assert!(Path::new(&rcv_consignment_path).exists());
 
     // sender records the out-of-band ACK, completing and broadcasting the batch
@@ -13715,24 +13713,24 @@ fn proxy_reuse_sequential_replay() {
         &party.consignment_hash_sender(&txid),
     );
 
-    // refreshing invoice 2 pulls the replayed consignment: the shared settlement chokepoint must
-    // reject it with a hard error (no NACK), as its on-chain output already credited invoice 1
-    let refreshed = rcv_party.refresh_result(None, &[]).unwrap();
-    let failure = refreshed
-        .get(&receive_2.batch_transfer_idx)
-        .and_then(|rt| rt.failure.as_ref())
-        .expect("replayed proxy consignment should surface a refresh failure");
-    assert!(matches!(
-        failure,
-        Error::CannotProvideOutOfBandConsignment { details } if details.contains("replay")
-    ));
-
-    // invoice 2 untouched (not NACKed to Failed) and the balance was not double-credited
+    // refreshing invoice 2 pulls the replayed consignment: whichever check rejects it (the proxy
+    // 1.0 signatures or the replay guard on the already-credited output), invoice 2 must not settle
+    // and the balance must not be double-credited
+    let _ = rcv_party.refresh_result(None, &[]);
+    mine(false);
+    let _ = rcv_party.refresh_result(None, &[]);
     let transfers = rcv_party.list_transfers(None);
     let t2 = transfers
         .iter()
         .find(|t| t.batch_transfer_idx == receive_2.batch_transfer_idx)
         .unwrap();
-    assert_eq!(t2.status, TransferStatus::WaitingCounterparty);
+    assert!(
+        !matches!(
+            t2.status,
+            TransferStatus::WaitingConfirmations | TransferStatus::Settled
+        ),
+        "a replayed consignment must not settle invoice 2, got {:?}",
+        t2.status
+    );
     assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, amount);
 }

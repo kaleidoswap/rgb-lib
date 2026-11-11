@@ -3146,6 +3146,21 @@ pub trait WalletOnline: WalletOffline {
 
             // copy the provided consignment to the canonical receive path, so later refresh stages
             // (safe height, confirmations) find it where they expect it
+            // never overwrite the files of another transfer: the cache dir is unique per invoice
+            // unless the transfer predates invoice public keys and falls back to the recipient ID
+            let cache_id = self.receive_cache_id(&transfer);
+            if let Some(other) = txn
+                .iter_transfers()?
+                .into_iter()
+                .find(|t| t.idx != transfer.idx && self.receive_cache_id(t) == cache_id)
+            {
+                return Err(Error::CannotProvideOutOfBandConsignment {
+                    details: format!(
+                        "receive files of recipient {recipient_id} are shared with transfer {}",
+                        other.idx
+                    ),
+                });
+            }
             let consignment_path = self.get_receive_consignment_path(&transfer);
             atomic_write_with(&consignment_path, |tmp| {
                 fs::copy(consignment_path_in, tmp)?;

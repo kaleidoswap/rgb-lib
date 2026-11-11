@@ -1761,8 +1761,9 @@ impl Wallet {
             return Err(Error::CannotEndTransfer { txid });
         }
         let (txid, _, info_contents, _) = self.get_transfer_end_data(&psbt)?;
-        // the data must be of a send: another operation would be completed skipping its checks
-        if !info_contents.is_operation(&TypeOfTransition::Transfer) {
+        // the data must be of a donation send: another operation (or a send waiting for the
+        // recipients' ACK) would be completed skipping its checks
+        if !info_contents.is_operation(&TypeOfTransition::Transfer) || !info_contents.donation {
             return Err(Error::WrongOperation { txid });
         }
 
