@@ -42,30 +42,6 @@ fn proxy_routing_id_for_transfer(transfer: &DbTransfer) -> String {
     crate::utils::derive_proxy_recipient_id(&recipient_id, nonce)
 }
 
-/// GET the consignment posted under `recipient_id` from the proxy at `proxy_url`. A failed
-/// request or an empty result is [`Error::NoConsignment`].
-pub(crate) fn proxy_get_consignment(
-    proxy_url: &str,
-    recipient_id: &str,
-    logger: &Logger,
-) -> Result<GetConsignmentResponse, Error> {
-    let proxy_client = ProxyClient::new(proxy_url)?;
-    let consignment_res = proxy_client.get_consignment(recipient_id);
-    if consignment_res.is_err() || consignment_res.as_ref().unwrap().result.as_ref().is_none() {
-        debug!(
-            logger,
-            "Consignment GET response error: {:?}", &consignment_res
-        );
-        return Err(Error::NoConsignment);
-    }
-
-    let consignment_res = consignment_res.unwrap().result.unwrap();
-    #[cfg(test)]
-    debug!(logger, "Consignment GET response: {:?}", consignment_res);
-
-    Ok(consignment_res)
-}
-
 /// Return the indexer protocol for the provided URL.
 /// An error is raised if the provided indexer URL is invalid or if the service is for the wrong
 /// network or doesn't have the required functionality.
@@ -896,7 +872,7 @@ pub trait WalletOnline: WalletOffline {
         let mut scripts = HashSet::new();
         for transfer in txn.get_batch_transfer_transfers(batch_transfer.idx)? {
             let vout = match transfer.recipient_type {
-                Some(RecipientTypeFull::Witness { vout }) => vout,
+                Some(RecipientTypeFull::Witness { vout, .. }) => vout,
                 _ => continue,
             };
             if let (Some(txid), Some(vout)) = (&batch_transfer.txid, vout) {
@@ -1301,7 +1277,7 @@ pub trait WalletOnline: WalletOffline {
     fn check_consistency(&mut self, txn: &DbTxn) -> Result<(), Error> {
         info!(self.logger(), "Doing a consistency check...");
 
-        let result = self.check_consistency_inner(txn, runtime);
+        let result = self.check_consistency_inner(txn);
         #[cfg(feature = "vss")]
         {
             let marker = self
@@ -1323,7 +1299,7 @@ pub trait WalletOnline: WalletOffline {
         result
     }
 
-    fn check_consistency_inner(&mut self, txn: &DbTxn, runtime: &RgbRuntime) -> Result<(), Error> {
+    fn check_consistency_inner(&mut self, txn: &DbTxn) -> Result<(), Error> {
         self.wallet_specific_consistency_checks(txn)?;
 
         let medias = txn.iter_media()?;
@@ -1952,7 +1928,8 @@ pub trait WalletOnline: WalletOffline {
                     if let BuilderSeal::Revealed(seal) = fungible_assignment.seal
                         && seal.txid == TxPtr::WitnessTx
                         && Some(seal.vout.into_u32()) == vout
-                        && let Some(assignment) = Assignment::fungible(*ass_type, state.as_u64())
+                        && let Some(assignment) =
+                            Assignment::fungible(*ass_type, fungible_assignment.state.as_u64())
                     {
                         received.insert(opout, assignment);
                     };
@@ -2698,7 +2675,7 @@ pub trait WalletOnline: WalletOffline {
         batch_transfer: &DbBatchTransfer,
         asset_transfer: &DbAssetTransfer,
         transfer: &DbTransfer,
-        _recipient_id: String,
+        recipient_id: String,
         consignment_path: &Path,
         mode: ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
@@ -3136,7 +3113,7 @@ pub trait WalletOnline: WalletOffline {
         // consignment carries no per-invoice recipient nonce, so it cannot be bound to a specific
         // reused invoice here.
         let mut seen_recipient_ids = HashSet::new();
-        for (_, _, transfer, _, _) in &matches {
+        for (_, _, transfer) in &matches {
             let recipient_id = transfer
                 .recipient_id
                 .clone()
@@ -3158,7 +3135,7 @@ pub trait WalletOnline: WalletOffline {
         // invoices (e.g. a sender batched a send to two of them), so process every matched receive.
         // Only out-of-band invoices settle here; proxy ones are settled by refresh.
         let mut results: RefreshResult = HashMap::new();
-        for (batch_transfer, asset_transfer, transfer, txid, vout) in matches {
+        for (batch_transfer, asset_transfer, transfer) in matches {
             if !transfer.uses_out_of_band_exchange() {
                 continue;
             }
@@ -3173,8 +3150,7 @@ pub trait WalletOnline: WalletOffline {
 
             // copy the provided consignment to the canonical receive path, so later refresh stages
             // (safe height, confirmations) find it where they expect it
-            let consignment_path =
-                self.get_receive_consignment_path(&proxy_routing_id_for_transfer(&transfer));
+            let consignment_path = self.get_receive_consignment_path(&recipient_id);
             atomic_write_with(&consignment_path, |tmp| {
                 fs::copy(consignment_path_in, tmp)?;
                 Ok(())
@@ -6012,6 +5988,7 @@ pub trait WalletOnline: WalletOffline {
                 &mut rejected,
                 &mut reject_lists,
                 dry_run,
+                None,
             )? {
                 PrepareTransferPsbtResult::Retry => {
                     // start over from the original transfer info, with the assignments needed
@@ -7221,6 +7198,7 @@ pub trait WalletOnline: WalletOffline {
                 linked_to_contract_id: Some(child_contract_id),
                 beneficiaries_blinded: vec![],
                 beneficiaries_witness: vec![],
+                burn_reason: None,
             };
         let mut transfer_info_map: BTreeMap<String, InfoAssetTransfer> =
             BTreeMap::from([(parent_contract_id_str.clone(), transfer_info)]);
@@ -7246,8 +7224,11 @@ pub trait WalletOnline: WalletOffline {
                 fee_rate_checked,
                 min_confirmations,
                 None,
+                None,
+                None,
                 &mut runtime,
                 &mut rejected,
+                &mut HashMap::new(),
                 dry_run,
                 None,
             )? {
@@ -7267,7 +7248,7 @@ pub trait WalletOnline: WalletOffline {
         let (txid, _transfer_dir, info_contents, fascia) =
             self.get_transfer_end_data(signed_psbt)?;
 
-        let mut runtime = self.rgb_runtime()?;
+        let mut runtime = self.rgb_stock(txn)?;
 
         {
             for (parent_asset_id, asset_transfer_info) in &info_contents.transfers {
@@ -7391,7 +7372,9 @@ pub trait WalletOnline: WalletOffline {
             txid.clone(),
             &info_contents,
             TransferStatus::WaitingConfirmations,
+            &HashMap::new(),
             false,
+            signed_psbt,
         )?;
 
         Ok(OperationResult {
@@ -7455,7 +7438,8 @@ pub(crate) fn swap_input_rgb_amounts(
     wallet: &Wallet,
     inputs: &HashSet<BdkOutPoint>,
 ) -> Result<BTreeMap<ContractId, u64>, Error> {
-    let runtime = wallet.rgb_runtime()?;
+    let txn = wallet.database().begin_transaction()?;
+    let runtime = wallet.rgb_stock(&txn)?;
     let mut amounts = BTreeMap::new();
     for contract_id in runtime.contracts_assigning(inputs.iter().copied())? {
         let mut total = 0u64;
@@ -7565,6 +7549,17 @@ pub(crate) fn swap_color_rgb_leg(
     )
 }
 
+/// Swap consignments travel out of band: proxy protocol 1.0 only carries consignments for invoices
+/// reserved through per-operation keys, which the swap messages do not exchange.
+fn swap_refuse_proxy_transport(proxy_url: Option<&str>) -> Result<(), Error> {
+    if proxy_url.is_some() {
+        return Err(Error::Proxy {
+            details: s!("swap consignments over a proxy are not supported by proxy protocol 1.0"),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn swap_emit_consignments(
     wallet: &Wallet,
     transfers: Vec<RgbTransfer>,
@@ -7575,6 +7570,7 @@ pub(crate) fn swap_emit_consignments(
     recipient_vout: u32,
     blinding: u64,
 ) -> Result<Vec<OnchainSwapConsignment>, Error> {
+    swap_refuse_proxy_transport(proxy_url)?;
     let base_dir = swap_consignment_dir(wallet.wallet_dir(), swap_id);
     fs::create_dir_all(&base_dir)?;
     let endpoint = proxy_url.map(swap_proxy_transport_endpoint).transpose()?;
@@ -7584,16 +7580,6 @@ pub(crate) fn swap_emit_consignments(
         let transfer_asset_id = transfer.contract_id().to_string();
         let path = swap_consignment_path(&base_dir, &transfer_asset_id);
         transfer.save_file(&path)?;
-        if let Some(proxy_url) = proxy_url {
-            let proxy_client = ProxyClient::new(proxy_url)?;
-            wallet.post_consignment_to_proxy(
-                &proxy_client,
-                recipient_id.to_string(),
-                path.clone(),
-                txid.to_string(),
-                Some(recipient_vout),
-            )?;
-        }
         consignments.push(OnchainSwapConsignment {
             asset_id: transfer_asset_id,
             path: if endpoint.is_some() {
@@ -7626,11 +7612,13 @@ pub(crate) fn swap_emit_asset_history(
     if !matches!(leg.kind, OnchainSwapLegKind::Rgb) {
         return Ok(None);
     }
+    swap_refuse_proxy_transport(proxy_url)?;
     let asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
     let contract_id = ContractId::from_str(&asset_id)
         .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
     let history = {
-        let runtime = wallet.rgb_runtime()?;
+        let txn = wallet.database().begin_transaction()?;
+        let runtime = wallet.rgb_stock(&txn)?;
         let outputs = runtime
             .contract_assignments_for(contract_id, inputs.iter().map(swap_input_to_outpoint))?
             .into_keys()
@@ -7640,7 +7628,7 @@ pub(crate) fn swap_emit_asset_history(
                 "swap inputs carry no allocation of {asset_id}"
             )));
         }
-        runtime.transfer(contract_id, outputs, [], None)?
+        runtime.transfer(contract_id, outputs, [], None, None)?.0
     };
     let base_dir = swap_consignment_dir(wallet.wallet_dir(), swap_id);
     fs::create_dir_all(&base_dir)?;
@@ -7648,16 +7636,6 @@ pub(crate) fn swap_emit_asset_history(
     history.save_file(&path)?;
     let endpoint = proxy_url.map(swap_proxy_transport_endpoint).transpose()?;
     let recipient_id = swap_history_recipient_id(swap_id, &asset_id);
-    if let Some(proxy_url) = proxy_url {
-        let proxy_client = ProxyClient::new(proxy_url)?;
-        wallet.post_consignment_to_proxy(
-            &proxy_client,
-            recipient_id.clone(),
-            path.clone(),
-            swap_id.to_string(),
-            None,
-        )?;
-    }
     Ok(Some(OnchainSwapAssetHistory {
         asset_id,
         path: if endpoint.is_some() {
@@ -7772,16 +7750,19 @@ pub(crate) fn swap_validate_fascia_received_leg(
         for KnownTransition { transition, .. } in bundle.known_transitions.iter() {
             for (ass_type, typed_assigns) in transition.assignments.iter() {
                 for fungible_assignment in typed_assigns.as_fungible().iter() {
-                    if let Assign::Revealed { seal, state, .. } = fungible_assignment
+                    if let BuilderSeal::Revealed(seal) = fungible_assignment.seal
                         && seal.txid == TxPtr::WitnessTx
                         && seal.vout.into_u32() == vout
                         && seal.blinding == blinding
                     {
-                        assignments.extend(Assignment::fungible(*ass_type, state.as_u64()));
+                        assignments.extend(Assignment::fungible(
+                            *ass_type,
+                            fungible_assignment.state.as_u64(),
+                        ));
                     }
                 }
                 for structured_assignment in typed_assigns.as_structured().iter() {
-                    if let Assign::Revealed { seal, .. } = structured_assignment
+                    if let BuilderSeal::Revealed(seal) = structured_assignment.seal
                         && seal.txid == TxPtr::WitnessTx
                         && seal.vout.into_u32() == vout
                         && seal.blinding == blinding
@@ -7814,12 +7795,8 @@ fn swap_validate_witness_output(
             "RGB swap consignment does not include the expected witness transaction",
         ));
     };
-    let PubWitness::Tx(tx) = &anchored_bundle.pub_witness else {
-        return Err(swap_invalid(
-            "RGB swap consignment is missing the witness transaction",
-        ));
-    };
-    let output = tx
+    let output = anchored_bundle
+        .tx
         .output
         .get(vout as usize)
         .ok_or_else(|| swap_invalid("RGB swap consignment missing expected output"))?;
@@ -7875,7 +7852,8 @@ pub(crate) fn swap_validate_received_transfer(
     let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
     wallet.check_schema_support(&asset_schema)?;
 
-    let mut runtime = wallet.rgb_runtime()?;
+    let txn = wallet.database().begin_transaction()?;
+    let mut runtime = wallet.rgb_stock(&txn)?;
     let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
     runtime.store_secret_seal(graph_seal)?;
 
@@ -7886,10 +7864,9 @@ pub(crate) fn swap_validate_received_transfer(
     };
     let validation_config = ValidationConfig {
         chain_net: wallet.chain_net(),
-        trusted_typesystem: asset_schema.types(),
         ..Default::default()
     };
-    match consignment.clone().validate(&resolver, &validation_config) {
+    match consignment.clone().validate(&asset_schema.schema_rules(), &resolver, &validation_config) {
         Ok(_) => {}
         Err(ValidationError::InvalidConsignment(e)) => {
             error!(wallet.logger(), "Consignment is invalid: {}", e);
@@ -7904,6 +7881,11 @@ pub(crate) fn swap_validate_received_transfer(
                 details: e.to_string(),
             });
         }
+        Err(e) => {
+            return Err(Error::Internal {
+                details: format!("unexpected consignment validation error: {e}"),
+            });
+        }
     };
     swap_validate_witness_output(&consignment, witness_id, recipient_id, vout)?;
 
@@ -7912,6 +7894,7 @@ pub(crate) fn swap_validate_received_transfer(
         .into_values()
         .collect::<Vec<_>>();
     drop(runtime);
+    txn.commit()?;
     if assignments.is_empty() {
         return Err(swap_invalid(
             "RGB swap consignment did not assign expected state",
@@ -8110,11 +8093,14 @@ pub(crate) fn swap_import_asset_history(
     wallet.check_schema_support(&asset_schema)?;
     let validation_config = ValidationConfig {
         chain_net: wallet.chain_net(),
-        trusted_typesystem: asset_schema.types(),
         ..Default::default()
     };
     let valid_consignment =
-        match consignment.validate(wallet.blockchain_resolver(), &validation_config) {
+        match consignment.validate(
+            &asset_schema.schema_rules(),
+            &wallet.blockchain_resolver(),
+            &validation_config,
+        ) {
             Ok(consignment) => consignment,
             Err(ValidationError::InvalidConsignment(e)) => {
                 error!(wallet.logger(), "Swap asset history is invalid: {}", e);
@@ -8129,10 +8115,15 @@ pub(crate) fn swap_import_asset_history(
                     details: e.to_string(),
                 });
             }
+            Err(e) => {
+                return Err(Error::Internal {
+                    details: format!("unexpected consignment validation error: {e}"),
+                });
+            }
         };
     let valid_contract = valid_consignment.clone().into_valid_contract();
-    let mut runtime = wallet.rgb_runtime()?;
-    runtime.accept_transfer(valid_consignment.clone(), wallet.blockchain_resolver())?;
+    let mut runtime = wallet.rgb_stock(txn)?;
+    runtime.accept_transfer(valid_consignment.clone(), &wallet.blockchain_resolver())?;
     if txn.get_asset(asset_id)?.is_none() {
         wallet.save_new_asset_internal(
             txn,
@@ -8240,7 +8231,7 @@ pub(crate) fn swap_accept_transfer_from_file(
     let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
     wallet.check_schema_support(&asset_schema)?;
 
-    let mut runtime = wallet.rgb_runtime()?;
+    let mut runtime = wallet.rgb_stock(txn)?;
     let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
     runtime.store_secret_seal(graph_seal)?;
 
@@ -8251,10 +8242,9 @@ pub(crate) fn swap_accept_transfer_from_file(
     };
     let validation_config = ValidationConfig {
         chain_net: wallet.chain_net(),
-        trusted_typesystem: asset_schema.types(),
         ..Default::default()
     };
-    let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
+    let valid_consignment = match consignment.clone().validate(&asset_schema.schema_rules(), &resolver, &validation_config) {
         Ok(consignment) => consignment,
         Err(ValidationError::InvalidConsignment(e)) => {
             error!(wallet.logger(), "Consignment is invalid: {}", e);
@@ -8269,12 +8259,17 @@ pub(crate) fn swap_accept_transfer_from_file(
                 details: e.to_string(),
             });
         }
+        Err(e) => {
+            return Err(Error::Internal {
+                details: format!("unexpected consignment validation error: {e}"),
+            });
+        }
     };
     swap_validate_witness_output(&consignment, witness_id, recipient_id, vout)?;
 
     let valid_contract = valid_consignment.clone().into_valid_contract();
     runtime
-        .import_contract(valid_contract.clone(), wallet.blockchain_resolver())
+        .import_contract(valid_contract.clone(), &wallet.blockchain_resolver())
         .expect("failure importing validated contract");
     if txn.get_asset(asset_id.clone())?.is_none() {
         wallet.save_new_asset_internal(
@@ -8299,58 +8294,20 @@ pub(crate) fn swap_fetch_consignment_to_file(
     wallet: &Wallet,
     consignment: &OnchainSwapConsignment,
 ) -> Result<PathBuf, Error> {
-    let endpoint_str =
-        consignment
-            .endpoint
-            .as_deref()
-            .ok_or_else(|| Error::InvalidTransportEndpoints {
-                details: s!("swap consignment missing proxy endpoint"),
-            })?;
-    let transport = RgbTransport::from_str(endpoint_str)?;
-    let proxy_url = TransportEndpoint::try_from(transport)?.endpoint;
-    let proxy_client = ProxyClient::new(&proxy_url)?;
-    let res = proxy_client.get_consignment(&consignment.recipient_id)?;
-    let consignment_res = res.result.ok_or(Error::NoConsignment)?;
-    let consignment_bytes = general_purpose::STANDARD
-        .decode(consignment_res.consignment)
-        .map_err(InternalError::from)?;
-    let target_dir = wallet
-        .wallet_dir()
-        .join("swap-receive")
-        .join(&consignment.recipient_id);
-    fs::create_dir_all(&target_dir)?;
-    let target_path = target_dir.join(format!("{}.rgb", consignment.asset_id));
-    fs::write(&target_path, &consignment_bytes)?;
-    Ok(target_path)
+    let _ = (wallet, consignment);
+    Err(Error::Proxy {
+        details: s!("swap consignments over a proxy are not supported by proxy protocol 1.0"),
+    })
 }
 
 pub(crate) fn swap_fetch_asset_history_to_file(
     wallet: &Wallet,
     history: &OnchainSwapAssetHistory,
 ) -> Result<PathBuf, Error> {
-    let endpoint_str =
-        history
-            .endpoint
-            .as_deref()
-            .ok_or_else(|| Error::InvalidTransportEndpoints {
-                details: s!("swap asset history missing proxy endpoint"),
-            })?;
-    let transport = RgbTransport::from_str(endpoint_str)?;
-    let proxy_url = TransportEndpoint::try_from(transport)?.endpoint;
-    let proxy_client = ProxyClient::new(&proxy_url)?;
-    let res = proxy_client.get_consignment(&history.recipient_id)?;
-    let history_res = res.result.ok_or(Error::NoConsignment)?;
-    let history_bytes = general_purpose::STANDARD
-        .decode(history_res.consignment)
-        .map_err(InternalError::from)?;
-    let target_dir = wallet
-        .wallet_dir()
-        .join("swap-history")
-        .join(&history.recipient_id);
-    fs::create_dir_all(&target_dir)?;
-    let target_path = swap_history_path(&target_dir, &history.asset_id);
-    fs::write(&target_path, &history_bytes)?;
-    Ok(target_path)
+    let _ = (wallet, history);
+    Err(Error::Proxy {
+        details: s!("swap consignments over a proxy are not supported by proxy protocol 1.0"),
+    })
 }
 
 /// Pick coins out of `values` that together cover `needed`, keeping the overshoot small: the

@@ -961,7 +961,8 @@ impl IssuedAssetDetails for AssetIFA {
     ) -> Result<Self, Error> {
         let mut asset_details =
             Self::get_asset_details(txn, wallet, asset, None, None, None, None, None, None)?;
-        let contract = IfaWrapper::with(issue_data.valid_contract.contract_data());
+        let contract =
+            IfaWrapper::with(RgbStock::new(txn).consignment_data(&issue_data.valid_contract)?);
         asset_details.issuance_link_right_outpoint = issue_data.link_right_outpoint.clone();
         asset_details.linked_from_asset_id = contract
             .link_from()

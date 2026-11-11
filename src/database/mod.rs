@@ -377,7 +377,7 @@ impl RgbLibDatabase {
             txn: Some(block_on(self.connection.begin())?),
             on_commit: Mutex::new(Vec::new()),
             #[cfg(feature = "vss")]
-            _state_guard: state_guard,
+            _state_guard: Some(state_guard),
         })
     }
 }
@@ -388,7 +388,7 @@ pub struct DbTxn {
     /// data the commit has just made durable.
     on_commit: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     #[cfg(feature = "vss")]
-    _state_guard: crate::utils::WalletStateGuard,
+    _state_guard: Option<crate::utils::WalletStateGuard>,
 }
 
 // required by the rgb-ops `RgbStore` trait (implemented on `&DbTxn`); the inner
@@ -437,6 +437,9 @@ impl DbTxn {
         let mut savepoint = DbTxn {
             txn: Some(block_on(self.inner().begin())?),
             on_commit: Mutex::new(Vec::new()),
+            // the outer transaction already holds the (reentrant) wallet state guard
+            #[cfg(feature = "vss")]
+            _state_guard: None,
         };
         // on error the savepoint is dropped, which rolls it back
         let res = f(&savepoint)?;

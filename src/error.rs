@@ -1105,6 +1105,10 @@ impl<E: std::error::Error> From<StockError<&DbTxn, E>> for Error {
             StockError::WitnessUnresolved(txid, e) => Error::Indexer {
                 details: format!("cannot resolve witness {txid}: {e}"),
             },
+            // an unknown contract is an asset the wallet doesn't hold
+            StockError::Inconsistency(rgbstd::persistence::Inconsistency::ContractAbsent(
+                contract_id,
+            )) => InternalError::UnknownContract(contract_id).into(),
             // anything else is invalid input or inconsistent RGB data, which
             // can only happen in case of a bug
             e => Error::Internal {

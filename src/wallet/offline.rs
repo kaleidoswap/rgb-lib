@@ -1178,7 +1178,7 @@ pub trait WalletOffline: WalletBackup {
             Assignment::Fungible(amt) | Assignment::InflationRight(amt) => {
                 invoice_builder = invoice_builder.set_amount_raw(*amt);
             }
-            Assignment::NonFungible | Assignment::Any => {}
+            Assignment::NonFungible | Assignment::LinkRight | Assignment::Any => {}
         }
         if let Some(state_name) = detected_assignment.state_name() {
             invoice_builder = invoice_builder.set_assignment_name(state_name);
@@ -2804,8 +2804,10 @@ pub trait WalletOffline: WalletBackup {
         let contract_id = ContractId::from_str(asset_id).map_err(|e| Error::Internal {
             details: e.to_string(),
         })?;
-        let runtime = self.rgb_runtime()?;
-        let contract = runtime.contract_wrapper::<InflatableFungibleAsset>(contract_id)?;
+        let txn = self.database().begin_transaction()?;
+        let contract = self
+            .rgb_stock(&txn)?
+            .contract_wrapper::<InflatableFungibleAsset>(contract_id)?;
         let linked_from_asset_id = contract
             .link_from()
             .map_err(|e| Error::Internal {

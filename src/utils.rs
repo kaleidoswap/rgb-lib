@@ -55,6 +55,9 @@ pub(crate) fn wallet_state_lock(
     Ok(lock)
 }
 
+/// Lockfile of the legacy filesystem RGB runtime, skipped when backing up old wallet dirs.
+pub(crate) const RGB_RUNTIME_LOCK_FILE: &str = "rgb_runtime.lock";
+
 #[cfg(feature = "rgb_fs_store_migration")]
 pub(crate) const RGB_RUNTIME_DIR: &str = "rgb";
 
@@ -1131,6 +1134,13 @@ impl<'txn> RgbStock<'txn> {
             .ok_or_else(|| Error::Internal {
                 details: format!("schema for contract {contract_id} not found"),
             })
+    }
+
+    pub(crate) fn contracts_assigning(
+        &self,
+        outputs: impl IntoIterator<Item = impl Into<OutPoint>>,
+    ) -> Result<BTreeSet<ContractId>, Error> {
+        Ok(FromIterator::from_iter(self.stock.contracts_assigning(outputs)?))
     }
 
     pub(crate) fn schemata(&self) -> Result<Vec<SchemaInfo>, Error> {

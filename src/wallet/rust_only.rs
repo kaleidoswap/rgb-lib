@@ -12,7 +12,6 @@
 
 use super::*;
 #[cfg(feature = "_online")]
-use crate::wallet::online::proxy_get_consignment;
 use amplify::num::u5;
 use bdk_wallet::bitcoin::psbt::Output as PsbtOutput;
 #[cfg(feature = "_online")]
@@ -311,23 +310,11 @@ pub fn fetch_consignment_by_recipient_id_unchecked(
     recipient_id: String,
     consignment_endpoint: &str,
 ) -> Result<FetchedConsignment, Error> {
-    let proxy_url = TransportEndpoint::new(consignment_endpoint.to_string())?.endpoint;
-    let consignment_res = proxy_get_consignment(
-        &proxy_url,
-        &recipient_id,
-        &Logger::root(slog::Discard, o!()),
-    )?;
-    let vout = consignment_res.vout.ok_or_else(|| Error::Internal {
-        details: s!("missing vout in consignment response"),
-    })?;
-    let consignment_bytes = general_purpose::STANDARD
-        .decode(consignment_res.consignment)
-        .map_err(InternalError::from)?;
-    let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
-    Ok(FetchedConsignment {
-        consignment,
-        txid: consignment_res.txid,
-        vout,
+    // proxy protocol 1.0 delivers consignments only for reserved invoices, through per-operation
+    // keys: a lookup by recipient ID (proxy 0.2) is gone, exchange HTLC consignments out of band
+    let _ = (recipient_id, consignment_endpoint);
+    Err(Error::Proxy {
+        details: s!("fetching a consignment by recipient ID is not supported by proxy protocol 1.0"),
     })
 }
 
@@ -349,7 +336,7 @@ fn fascia_allocations(fascia: &Fascia) -> Result<Vec<PsbtOpAllocation>, Error> {
             for (ass_type, typed_assigns) in transition.assignments.iter() {
                 let mut found = vec![];
                 for assign in typed_assigns.as_fungible() {
-                    let amount = assign.as_revealed_state().as_u64();
+                    let amount = assign.state.as_u64();
                     let assignment =
                         Assignment::fungible(*ass_type, amount).ok_or_else(|| unknown(ass_type))?;
                     found.push((witness_vout(assign.revealed_seal()), assignment));
@@ -621,45 +608,6 @@ fn rebuild_psbt_preserving_maps(
     Ok(rebuilt)
 }
 
-/// Indexer protocol
-#[derive(Debug, Clone)]
-#[cfg(feature = "_online")]
-pub enum IndexerProtocol {
-    /// An indexer implementing the electrum protocol
-    Electrum,
-    /// An indexer implementing the esplora protocol
-    Esplora,
-}
-
-#[cfg(feature = "_online")]
-impl fmt::Display for IndexerProtocol {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-/// Return the indexer protocol for the provided URL.
-/// An error is raised if the provided indexer URL is invalid or if the service is for the wrong
-/// network or doesn't have the required functionality.
-///
-/// <div class="warning">This method is meant for special usage and is normally not needed, use
-/// it only if you know what you're doing</div>
-#[cfg(feature = "_online")]
-pub fn check_indexer_url(
-    indexer_url: &str,
-    bitcoin_network: BitcoinNetwork,
-) -> Result<IndexerProtocol, Error> {
-    let (indexer, _) = get_indexer_and_resolver(indexer_url, bitcoin_network)?;
-    let indexer_protocol = match indexer {
-        #[cfg(feature = "electrum")]
-        Indexer::Electrum(_) => IndexerProtocol::Electrum,
-        #[cfg(feature = "esplora")]
-        Indexer::Esplora(_) => IndexerProtocol::Esplora,
-    };
-
-    Ok(indexer_protocol)
-}
-
 /// Check whether the provided URL points to a valid proxy.
 /// An error is raised if the provided proxy URL is invalid or if the service is running an
 /// unsupported protocol version.
@@ -668,7 +616,15 @@ pub fn check_indexer_url(
 /// it only if you know what you're doing</div>
 #[cfg(feature = "_online")]
 pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
-    check_proxy(proxy_url)
+    check_proxy(proxy_url).map(|_| ())
+}
+
+/// Load an RGB fascia from the file at the provided path.
+///
+/// <div class="warning">This method is meant for special usage and is normally not needed, use
+/// it only if you know what you're doing</div>
+pub fn load_fascia(path: &Path) -> Result<Fascia, Error> {
+    read_fascia(path)
 }
 
 /// Resolve an `output_map` key to the vout of the (already OP_RETURN-prepared) PSBT it seals,
@@ -827,7 +783,8 @@ impl Wallet {
     ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
         info!(self.logger(), "Coloring PSBT...");
         let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
-        let runtime = self.rgb_runtime()?;
+        let txn = self.database().begin_transaction()?;
+        let runtime = self.rgb_stock(&txn)?;
         self.color_psbt_with_prevouts_runtime(
             &runtime,
             psbt,
@@ -850,7 +807,7 @@ impl Wallet {
     /// the `coloring_info` static blinding as MPC entropy.
     pub(crate) fn color_psbt_with_prevouts_runtime(
         &self,
-        runtime: &RgbRuntime,
+        runtime: &RgbStock<'_>,
         psbt: &mut Psbt,
         coloring_info: ColoringInfo,
         prev_outputs: HashSet<OutPoint>,
@@ -879,7 +836,7 @@ impl Wallet {
     /// [`Self::color_psbt_finalize`] commits all of them at once.
     pub(crate) fn color_psbt_stage_runtime(
         &self,
-        runtime: &RgbRuntime,
+        runtime: &RgbStock<'_>,
         psbt: &mut Psbt,
         coloring_info: ColoringInfo,
         prev_outputs: HashSet<OutPoint>,
@@ -1045,7 +1002,8 @@ impl Wallet {
             .map(|txin| txin.previous_output)
             .collect::<HashSet<OutPoint>>();
         let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
-        let runtime = self.rgb_runtime()?;
+        let txn = self.database().begin_transaction()?;
+        let runtime = self.rgb_stock(&txn)?;
         self.color_psbt_stage_runtime(
             &runtime,
             psbt,
@@ -1088,7 +1046,8 @@ impl Wallet {
         witness_txid: RgbTxid,
         fascia: &Fascia,
     ) -> Result<RgbTransfer, Error> {
-        let runtime = self.rgb_runtime()?;
+        let txn = self.database().begin_transaction()?;
+        let runtime = self.rgb_stock(&txn)?;
         let mut beneficiaries_witness = vec![];
         let mut beneficiaries_blinded = vec![];
         for builder_seal in beneficiaries {
@@ -1101,12 +1060,16 @@ impl Wallet {
                 }
             };
         }
-        Ok(runtime.transfer_from_fascia(
-            contract_id,
-            beneficiaries_witness,
-            beneficiaries_blinded,
-            fascia,
-        )?)
+        Ok(runtime
+            .transfer_from_fascia(
+                contract_id,
+                beneficiaries_witness,
+                beneficiaries_blinded,
+                [],
+                fascia,
+                None,
+            )?
+            .0)
     }
 
     /// Validate a counterparty's colored HTLC spend without reserving inputs or
@@ -1162,7 +1125,8 @@ impl Wallet {
                 "HTLC spend does not preserve the exact allocation at the payment output",
             ));
         }
-        let runtime = self.rgb_runtime()?;
+        let txn = self.database().begin_transaction()?;
+        let runtime = self.rgb_stock(&txn)?;
         let other_inputs: Vec<_> = psbt
             .unsigned_tx
             .input
@@ -1199,28 +1163,33 @@ impl Wallet {
             contract_id,
             vec![ExplicitSeal::with(witness_id, payment_vout)],
             Vec::new(),
+            [],
             &fascia,
-        )?;
-        let (_, fallback) = get_indexer_and_resolver(indexer_url, self.bitcoin_network())?;
+            None,
+        )?
+        .0;
+        let (_, fallback) = get_indexer_and_resolver(&indexer_config_from_url(indexer_url)?, self.bitcoin_network())?;
         let resolver = crate::utils::OffchainResolver {
             witness_id,
             consignment: &consignment,
-            fallback: &fallback,
+            fallback: ChainResolver { inner: &fallback },
         };
         let schema: AssetSchema = consignment.schema_id().try_into()?;
         let config = ValidationConfig {
             chain_net: self.bitcoin_network().into(),
-            trusted_typesystem: schema.types(),
             ..Default::default()
         };
         consignment
             .clone()
-            .validate(&resolver, &config)
+            .validate(&schema.schema_rules(), &resolver, &config)
             .map_err(|e| match e {
                 ValidationError::ResolverError(e) => Error::Network {
                     details: e.to_string(),
                 },
                 ValidationError::InvalidConsignment(e) => Error::InvalidColoringInfo {
+                    details: format!("invalid HTLC spend proof: {e}"),
+                },
+                e => Error::InvalidColoringInfo {
                     details: format!("invalid HTLC spend proof: {e}"),
                 },
             })?;
@@ -1246,7 +1215,8 @@ impl Wallet {
 
         let witness_txid = psbt.get_txid();
 
-        let mut runtime = self.rgb_runtime()?;
+        let txn = self.database().begin_transaction()?;
+        let mut runtime = self.rgb_stock(&txn)?;
         runtime.consume_fascia(fascia, None)?;
 
         let mut transfers = vec![];
@@ -1264,14 +1234,19 @@ impl Wallet {
                     }
                 };
             }
-            transfers.push(runtime.transfer(
+            let (consignment, spv_proofs) = runtime.transfer(
                 contract_id,
                 beneficiaries_witness,
                 beneficiaries_blinded,
                 Some(witness_txid),
-            )?);
+                self.spv_resolver(),
+            )?;
+            runtime.store_spv_proofs(spv_proofs)?;
+            transfers.push(consignment);
         }
 
+        drop(runtime);
+        txn.commit()?;
         info!(self.logger(), "Color PSBT and consume completed");
         Ok(transfers)
     }
@@ -1315,7 +1290,9 @@ impl Wallet {
 
         let psbt = Psbt::from_str(&psbt)?;
         let (txid, transfer_dir, info_contents, fascia) = self.get_transfer_end_data(&psbt)?;
-        self.gen_consignments(&fascia, &info_contents.transfers, &transfer_dir)?;
+        let txn = self.database().begin_transaction()?;
+        self.gen_consignments(&txn, &fascia, &info_contents.transfers, &transfer_dir)?;
+        txn.commit()?;
 
         let consignment_paths = info_contents
             .transfers
@@ -1367,9 +1344,8 @@ impl Wallet {
         let contract_id = ContractId::from_str(&asset_id).map_err(|error| Error::Internal {
             details: format!("invalid asset ID: {error}"),
         })?;
-        self.rgb_runtime()?
-            .export_contract(contract_id)
-            .map_err(Error::from)
+        let txn = self.database().begin_transaction()?;
+        self.rgb_stock(&txn)?.export_contract(contract_id)
     }
 
     /// Validate and import an RGB contract without importing any asset allocations.
@@ -1396,24 +1372,22 @@ impl Wallet {
         self.check_schema_support(&asset_schema)?;
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
-            trusted_typesystem: asset_schema.types(),
             ..Default::default()
         };
         let valid_contract = contract
-            .validate(&DumbResolver, &validation_config)
+            .validate(&asset_schema.schema_rules(), &DumbResolver, &validation_config)
             .map_err(|_| Error::InvalidConsignment)?;
 
-        // The RGB runtime lock serializes the stock and database state transition. Persisting the
-        // stock before committing the database makes every interrupted state repairable on retry.
-        let mut runtime = self.rgb_runtime()?;
-        let contract_in_stock = runtime.export_contract(contract_id).is_ok();
+        // the stock and the wallet tables share one transaction: they commit together
         let txn = self.database().begin_transaction()?;
+        let mut runtime = self.rgb_stock(&txn)?;
+        let contract_in_stock = runtime.export_contract(contract_id).is_ok();
         let asset_in_database = txn.get_asset(asset_id.clone())?.is_some();
         let already_imported = contract_in_stock && asset_in_database;
 
         if already_imported {
-            drop(txn);
             drop(runtime);
+            drop(txn);
             return Ok(ImportAssetContractResult {
                 asset_id: asset_id.clone(),
                 already_imported: true,
@@ -1423,7 +1397,7 @@ impl Wallet {
 
         if !asset_in_database
             && !self
-                .extract_attachments(&valid_contract, asset_schema)
+                .extract_attachments(&runtime, &valid_contract, asset_schema)?
                 .is_empty()
         {
             return Err(Error::InvalidAttachments {
@@ -1432,7 +1406,6 @@ impl Wallet {
         }
 
         if !contract_in_stock {
-            runtime.require_explicit_persistence();
             runtime.import_contract(valid_contract.clone(), &DumbResolver)?;
         }
 
@@ -1447,11 +1420,8 @@ impl Wallet {
             )?;
         }
         self.update_backup_info(&txn, false)?;
-        if !contract_in_stock {
-            runtime.persist()?;
-        }
-        txn.commit()?;
         drop(runtime);
+        txn.commit()?;
         self.trigger_auto_backup();
 
         Ok(ImportAssetContractResult {
@@ -1512,7 +1482,8 @@ impl Wallet {
             })
             .collect::<Result<_, Error>>()?;
 
-        let runtime = self.rgb_runtime()?;
+        let txn = self.database().begin_transaction()?;
+        let runtime = self.rgb_stock(&txn)?;
         runtime.genesis(contract_id)?;
         let state = runtime
             .contract_assignments_for(contract_id, parsed.iter().map(|(_, outpoint)| *outpoint))?;
@@ -1552,8 +1523,10 @@ impl Wallet {
         witness_ord: Option<WitnessOrd>,
     ) -> Result<(), Error> {
         info!(self.logger(), "Consuming fascia...");
-        self.rgb_runtime()?
+        let txn = self.database().begin_transaction()?;
+        self.rgb_stock(&txn)?
             .consume_fascia(fascia.clone(), witness_ord)?;
+        txn.commit()?;
         info!(self.logger(), "Consume fascia completed");
         Ok(())
     }
@@ -1584,11 +1557,13 @@ impl Wallet {
     ) -> Result<UpdateRes, Error> {
         info!(self.logger(), "Updating witnesses...");
         self.check_online(online)?;
-        let update_res = self.rgb_runtime()?.update_witnesses(
-            self.blockchain_resolver(),
+        let txn = self.database().begin_transaction()?;
+        let update_res = self.rgb_stock(&txn)?.update_witnesses(
+            &self.blockchain_resolver(),
             after_height,
             force_witnesses,
         )?;
+        txn.commit()?;
         info!(self.logger(), "Update witnesses completed");
         Ok(update_res)
     }
@@ -1602,8 +1577,11 @@ impl Wallet {
         witness_id: RgbTxid,
         witness_ord: WitnessOrd,
     ) -> Result<(), Error> {
-        let mut runtime = self.rgb_runtime()?;
+        let txn = self.database().begin_transaction()?;
+        let mut runtime = self.rgb_stock(&txn)?;
         runtime.upsert_witness(witness_id, witness_ord)?;
+        drop(runtime);
+        txn.commit()?;
         Ok(())
     }
 
@@ -1628,13 +1606,15 @@ impl Wallet {
             fallback: self.blockchain_resolver(),
         };
         let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-        let trusted_typesystem = asset_schema.types();
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
-            trusted_typesystem,
             ..Default::default()
         };
-        let valid_transfer = match consignment.clone().validate(&resolver, &validation_config) {
+        let valid_transfer = match consignment.clone().validate(
+            &asset_schema.schema_rules(),
+            &resolver,
+            &validation_config,
+        ) {
             Ok(consignment) => consignment,
             Err(ValidationError::InvalidConsignment(error)) => {
                 error!(self.logger(), "Consignment is invalid: {}", error);
@@ -1645,15 +1625,21 @@ impl Wallet {
                     details: error.to_string(),
                 });
             }
+            Err(e) => {
+                return Err(Error::Internal {
+                    details: format!("unexpected consignment validation error: {e}"),
+                });
+            }
         };
         let valid_contract = valid_transfer.clone().into_valid_contract();
 
-        let runtime = self.rgb_runtime()?;
         let txn = self.database().begin_transaction()?;
+        let runtime = self.rgb_stock(&txn)?;
         if txn.get_asset(contract_id.to_string())?.is_some() {
             // Metadata registration is idempotent only when the RGB stock agrees with the database.
             // A missing stock entry means the caller has not completed transfer acceptance.
             runtime.export_contract(contract_id)?;
+            drop(runtime);
             drop(txn);
             info!(self.logger(), "Save new asset completed");
             return Ok(());
@@ -1667,8 +1653,8 @@ impl Wallet {
             Some(valid_transfer),
         )?;
         self.update_backup_info(&txn, false)?;
-        txn.commit()?;
         drop(runtime);
+        txn.commit()?;
         self.trigger_auto_backup();
 
         info!(self.logger(), "Save new asset completed");
@@ -1795,7 +1781,9 @@ impl Wallet {
             txid.clone(),
             &info_contents,
             TransferStatus::WaitingConfirmations,
+            &HashMap::new(),
             true,
+            &psbt,
         )?;
 
         self.update_backup_info(&txn, false)?;
@@ -1843,7 +1831,8 @@ impl Wallet {
             .iter()
             .map(|txin| txin.previous_output)
             .collect::<HashSet<OutPoint>>();
-        let mut runtime = self.rgb_runtime()?;
+        let txn = self.database().begin_transaction()?;
+        let mut runtime = self.rgb_stock(&txn)?;
         // checked before `prepare_psbt_for_coloring`, which would otherwise insert an OP_RETURN
         // into the caller's PSBT on the way to failing
         self.reject_uncolored_input_contracts(&runtime, &prev_outputs, &coloring_info)?;
@@ -1868,8 +1857,8 @@ impl Wallet {
             expiration_timestamp,
         )?;
         info!(self.logger(), "Color PSBT prepare-consume completed");
-        runtime.persist()?;
         drop(runtime);
+        txn.commit()?;
         self.trigger_auto_backup();
         Ok(result)
     }
@@ -1884,7 +1873,8 @@ impl Wallet {
         coloring_info: ColoringInfo,
         prev_outputs: HashSet<OutPoint>,
     ) -> Result<AssetBeneficiariesMap, Error> {
-        let runtime = self.rgb_runtime()?;
+        let txn = self.database().begin_transaction()?;
+        let runtime = self.rgb_stock(&txn)?;
         // checked before `prepare_psbt_for_coloring`, which would otherwise insert an OP_RETURN
         // into the caller's PSBT on the way to failing
         self.reject_uncolored_input_contracts(&runtime, &prev_outputs, &coloring_info)?;
@@ -1920,7 +1910,7 @@ impl Wallet {
         min_confirmations: u8,
         expiration_timestamp: Option<u64>,
     ) -> Result<i32, Error> {
-        let runtime = self.rgb_runtime()?;
+        let runtime = self.rgb_stock(txn)?;
         let mut spent: HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>> = HashMap::new();
         for contract_id in coloring_info.asset_info_map.keys() {
             let by_outpoint = spent.entry(*contract_id).or_default();
@@ -2028,7 +2018,8 @@ impl Wallet {
                 });
             }
         }
-        self.update_db_colored_txos_from_bdk(&txn, false)?;
+        let pending_witness_scripts = self.reconcile_pending_witness(&txn)?;
+        self.update_db_colored_txos_from_bdk(&txn, false, &pending_witness_scripts)?;
         self.mark_psbt_inputs_spent(&txn, &psbt)?;
         let mut updated: DbBatchTransferActMod = batch_transfer.into();
         updated.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
@@ -2063,10 +2054,11 @@ impl Wallet {
                 });
             }
         };
-        let mut runtime = self.rgb_runtime()?;
-        runtime.require_explicit_persistence();
+        let txn = self.database().begin_transaction()?;
+        let mut runtime = self.rgb_stock(&txn)?;
         runtime.consume_fascia(fascia, Some(witness_ord))?;
-        runtime.persist()?;
+        drop(runtime);
+        txn.commit()?;
         #[cfg(test)]
         if MOCK_FAIL_AFTER_STOCK_PERSIST.with(|f| f.replace(false)) {
             return Err(Error::Internal {
@@ -2083,7 +2075,7 @@ impl Wallet {
     /// `coloring_info`: no transition would re-assign them, so they would be destroyed.
     pub(crate) fn reject_uncolored_input_contracts(
         &self,
-        runtime: &RgbRuntime,
+        runtime: &RgbStock<'_>,
         inputs: &HashSet<OutPoint>,
         coloring_info: &ColoringInfo,
     ) -> Result<(), Error> {
@@ -2128,7 +2120,7 @@ impl Wallet {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_color_and_transfer_runtime(
         &self,
-        runtime: &mut RgbRuntime,
+        runtime: &mut RgbStock<'_>,
         psbt: &Psbt,
         fascia: Fascia,
         asset_beneficiaries: AssetBeneficiariesMap,
@@ -2174,8 +2166,11 @@ impl Wallet {
                 *contract_id,
                 beneficiaries_witness,
                 beneficiaries_blinded,
+                [],
                 &fascia,
-            )?);
+                None,
+            )?
+            .0);
         }
 
         let txid = psbt.unsigned_tx.compute_txid().to_string();
@@ -2234,7 +2229,7 @@ impl Wallet {
         min_confirmations: u8,
         expiration_timestamp: Option<u64>,
         allow_consume_transfer_fascia: bool,
-        runtime: &RgbRuntime,
+        runtime: &RgbStock<'_>,
     ) -> Result<i32, Error> {
         self.write_color_prepare_files(psbt, txid, fascia, allow_consume_transfer_fascia)?;
         let txn = self.database().begin_transaction()?;
@@ -2275,7 +2270,7 @@ impl Wallet {
         shift_output_map_for_opreturn_first: bool,
         min_confirmations: u8,
         expiration_timestamp: Option<u64>,
-        runtime: &RgbRuntime,
+        runtime: &RgbStock<'_>,
     ) -> Result<i32, Error> {
         let created_at = now().unix_timestamp();
         let bitcoin_network = self.bitcoin_network();
@@ -2496,12 +2491,13 @@ impl Wallet {
     /// Shared setup for [`Self::color_psbt_for_outpoints`] and
     /// [`Self::color_psbt_for_outpoints_and_prepare_consume`]: empty/subset checks, validate allocations,
     /// prepare PSBT. Returns `(runtime, override_set)`.
-    fn prepare_color_psbt_for_outpoints(
+    fn prepare_color_psbt_for_outpoints<'t>(
         &self,
+        txn: &'t DbTxn,
         psbt: &mut Psbt,
         coloring_info: &ColoringInfo,
         input_outpoints: Vec<OutPoint>,
-    ) -> Result<(RgbRuntime, HashSet<OutPoint>), Error> {
+    ) -> Result<(RgbStock<'t>, HashSet<OutPoint>), Error> {
         let override_set: HashSet<OutPoint> = input_outpoints.into_iter().collect();
         if override_set.is_empty() {
             return Err(Error::InvalidColoringInfo {
@@ -2519,7 +2515,7 @@ impl Wallet {
                 details: s!("input_outpoints must be a subset of PSBT inputs"),
             });
         }
-        let runtime = self.rgb_runtime()?;
+        let runtime = self.rgb_stock(txn)?;
         self.validate_color_psbt_for_outpoints_inputs(
             &runtime,
             psbt,
@@ -2564,8 +2560,9 @@ impl Wallet {
         input_outpoints: Vec<OutPoint>,
     ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
         info!(self.logger(), "Coloring PSBT...");
+        let txn = self.database().begin_transaction()?;
         let (runtime, override_set) =
-            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
+            self.prepare_color_psbt_for_outpoints(&txn, psbt, &coloring_info, input_outpoints)?;
         let result = self.color_psbt_with_prevouts_runtime(
             &runtime,
             psbt,
@@ -2580,7 +2577,7 @@ impl Wallet {
 
     fn validate_color_psbt_for_outpoints_inputs(
         &self,
-        runtime: &RgbRuntime,
+        runtime: &RgbStock<'_>,
         psbt: &Psbt,
         override_set: &HashSet<OutPoint>,
         psbt_inputs: &HashSet<OutPoint>,
@@ -2640,8 +2637,9 @@ impl Wallet {
         expiration_timestamp: Option<u64>,
     ) -> Result<ColorPrepareResult, Error> {
         info!(self.logger(), "Coloring PSBT and preparing consume...");
+        let txn = self.database().begin_transaction()?;
         let (mut runtime, override_set) =
-            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
+            self.prepare_color_psbt_for_outpoints(&txn, psbt, &coloring_info, input_outpoints)?;
         let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(
             &runtime,
             psbt,
@@ -2662,8 +2660,8 @@ impl Wallet {
             expiration_timestamp,
         )?;
         info!(self.logger(), "Color PSBT prepare-consume completed");
-        runtime.persist()?;
         drop(runtime);
+        txn.commit()?;
         self.trigger_auto_backup();
         Ok(result)
     }
@@ -2988,8 +2986,9 @@ impl Wallet {
             PsbtOpExpiry::At(timestamp) => Some(timestamp),
             PsbtOpExpiry::Never => None,
         };
+        let txn = self.database().begin_transaction()?;
         let (runtime, override_set) =
-            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints)?;
+            self.prepare_color_psbt_for_outpoints(&txn, psbt, &coloring_info, input_outpoints)?;
         let (fascia, asset_beneficiaries) = self.color_psbt_with_prevouts_runtime(
             &runtime,
             psbt,
@@ -3035,8 +3034,11 @@ impl Wallet {
                 *contract_id,
                 beneficiaries_witness,
                 beneficiaries_blinded,
+                [],
                 &fascia,
-            )?);
+                None,
+            )?
+            .0);
         }
 
         let txid = psbt.unsigned_tx.compute_txid().to_string();
@@ -3266,7 +3268,8 @@ impl Wallet {
                 });
             }
         }
-        self.update_db_colored_txos_from_bdk(&txn, false)?;
+        let pending_witness_scripts = self.reconcile_pending_witness(&txn)?;
+        self.update_db_colored_txos_from_bdk(&txn, false, &pending_witness_scripts)?;
         self.mark_psbt_inputs_spent(&txn, &psbt)?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
@@ -3778,7 +3781,7 @@ impl Wallet {
         info!(self.logger(), "Accepting pinned transfer...");
         self.check_online(online)?;
         pin_witness_output_to_recipient_id(
-            self.blockchain_resolver(),
+            self.blockchain_resolver().inner,
             self.indexer(),
             self.chain_net(),
             &witness_recipient_id,
@@ -3860,7 +3863,8 @@ impl Wallet {
             Self::validate_expected_transfer_intent(&consignment, &asset_schema, expected)?;
         }
 
-        let mut runtime = self.rgb_runtime()?;
+        let txn = self.database().begin_transaction()?;
+        let mut runtime = self.rgb_stock(&txn)?;
 
         let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
         runtime.store_secret_seal(graph_seal)?;
@@ -3872,13 +3876,11 @@ impl Wallet {
         };
 
         debug!(self.logger(), "Validating consignment...");
-        let trusted_typesystem = asset_schema.types();
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
-            trusted_typesystem,
             ..Default::default()
         };
-        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
+        let valid_consignment = match consignment.clone().validate(&asset_schema.schema_rules(), &resolver, &validation_config) {
             Ok(consignment) => consignment,
             Err(ValidationError::InvalidConsignment(e)) => {
                 error!(self.logger(), "Consignment is invalid: {}", e);
@@ -3888,6 +3890,11 @@ impl Wallet {
                 warn!(self.logger(), "Network error during consignment validation");
                 return Err(Error::Network {
                     details: e.to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(Error::Internal {
+                    details: format!("unexpected consignment validation error: {e}"),
                 });
             }
         };
@@ -3929,13 +3936,15 @@ impl Wallet {
 
         let valid_contract = valid_consignment.clone().into_valid_contract();
         let media_digests = self
-            .extract_attachments(&valid_contract, asset_schema)
+            .extract_attachments(&runtime, &valid_contract, asset_schema)?
             .iter()
             .map(|a| hex::encode(a.digest))
             .collect::<HashSet<_>>();
-        runtime.import_contract(valid_contract, self.blockchain_resolver())?;
+        runtime.import_contract(valid_contract, &self.blockchain_resolver())?;
 
         runtime.accept_transfer(valid_consignment, &resolver)?;
+        drop(runtime);
+        txn.commit()?;
 
         info!(self.logger(), "Accept transfer completed");
         Ok((consignment, received, media_digests))
@@ -4172,11 +4181,20 @@ fn fascia_from_committed_psbt(psbt: &Psbt) -> Result<Fascia, Error> {
         details: s!("PSBT has no RGB bundles"),
     })?;
     let seal_witness = SealWitness::new(
-        PubWitness::with(psbt.unsigned_tx.clone()),
+        psbt.unsigned_tx.clone(),
         merkle_block,
         OpretProof::default().into(),
+        None,
     );
     Ok(Fascia::new(seal_witness, bundles))
+}
+
+/// The indexer configuration of an electrum or esplora `indexer_url`, as detected by probing it.
+#[cfg(feature = "_online")]
+fn indexer_config_from_url(indexer_url: &str) -> Result<IndexerConfig, Error> {
+    detect_indexer(indexer_url, None).ok_or_else(|| Error::InvalidIndexer {
+        details: format!("no electrum or esplora indexer found at {indexer_url}"),
+    })
 }
 
 /// Return an [`AnyResolver`] for the provided indexer URL, auto-detecting the protocol
@@ -4189,7 +4207,7 @@ pub fn get_resolver(
     indexer_url: &str,
     bitcoin_network: BitcoinNetwork,
 ) -> Result<AnyResolver, Error> {
-    let (_, resolver) = get_indexer_and_resolver(indexer_url, bitcoin_network)?;
+    let (_, resolver) = get_indexer_and_resolver(&indexer_config_from_url(indexer_url)?, bitcoin_network)?;
     Ok(resolver)
 }
 
@@ -4227,17 +4245,15 @@ pub fn validate_consignment(
 
     let chain_net: ChainNet = bitcoin_network.into();
     let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-    let trusted_typesystem = asset_schema.types();
 
     let resolver = get_resolver(indexer_url, bitcoin_network)?;
 
     let validation_config = ValidationConfig {
         chain_net,
-        trusted_typesystem,
         ..Default::default()
     };
 
-    match consignment.clone().validate(&resolver, &validation_config) {
+    match consignment.clone().validate(&asset_schema.schema_rules(), &resolver, &validation_config) {
         Ok(valid_consignment) => {
             let status = valid_consignment.validation_status();
             Ok(ValidateConsignmentResult {
@@ -4263,6 +4279,12 @@ pub fn validate_consignment(
             valid: false,
             warnings: None,
             error: Some("resolver".to_string()),
+            details: Some(e.to_string()),
+        }),
+        Err(e) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("invalid".to_string()),
             details: Some(e.to_string()),
         }),
     }
@@ -4293,23 +4315,23 @@ pub fn validate_consignment_offchain(
     let witness_id = RgbTxid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
     let chain_net: ChainNet = bitcoin_network.into();
     let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-    let trusted_typesystem = asset_schema.types();
 
     let fallback_resolver = get_resolver(indexer_url, bitcoin_network)?;
 
     let resolver = crate::utils::OffchainResolver {
         witness_id,
         consignment: &consignment,
-        fallback: &fallback_resolver,
+        fallback: ChainResolver {
+            inner: &fallback_resolver,
+        },
     };
 
     let validation_config = ValidationConfig {
         chain_net,
-        trusted_typesystem,
         ..Default::default()
     };
 
-    match consignment.clone().validate(&resolver, &validation_config) {
+    match consignment.clone().validate(&asset_schema.schema_rules(), &resolver, &validation_config) {
         Ok(valid_consignment) => {
             let status = valid_consignment.validation_status();
             Ok(ValidateConsignmentResult {
@@ -4337,6 +4359,12 @@ pub fn validate_consignment_offchain(
             error: Some("resolver".to_string()),
             details: Some(e.to_string()),
         }),
+        Err(e) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("invalid".to_string()),
+            details: Some(e.to_string()),
+        }),
     }
 }
 
@@ -4345,13 +4373,6 @@ pub fn validate_consignment_offchain(
 mod tests {
     use super::*;
     use psrgbt::RgbPropKeyExt;
-
-    #[cfg(feature = "_online")]
-    #[test]
-    fn display_indexer_protocol() {
-        assert_eq!(IndexerProtocol::Electrum.to_string(), "Electrum");
-        assert_eq!(IndexerProtocol::Esplora.to_string(), "Esplora");
-    }
 
     use bdk_wallet::bitcoin::{
         Sequence, TxIn, Witness, absolute::LockTime, psbt::raw::ProprietaryKey,

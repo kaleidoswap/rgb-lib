@@ -949,7 +949,13 @@ fn get_fingerprint_from_zip_bytes(data: &[u8]) -> Result<String, Error> {
         details: format!("Failed to read zip archive: {e}"),
     })?;
 
-    let first_entry = archive.name_for_index(0).unwrap_or_default();
+    let first_entry = archive
+        .name_for_index(0)
+        .transpose()
+        .map_err(|e| Error::Internal {
+            details: format!("Failed to read zip archive: {e}"),
+        })?
+        .unwrap_or_default();
     let fingerprint = first_entry.trim_end_matches('/').to_string();
 
     // Validate: wallet fingerprints are 8 hex characters (4 bytes)
@@ -1064,7 +1070,7 @@ fn unzip_wallet_from_bytes(data: &[u8], target_dir: &Path, logger: &Logger) -> R
             None => continue,
         };
 
-        if file.name().ends_with('/') {
+        if file.is_dir() {
             debug!(logger, "VSS restore: creating directory {:?}", outpath);
             fs::create_dir_all(&outpath)?;
         } else {

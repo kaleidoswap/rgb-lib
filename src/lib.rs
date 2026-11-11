@@ -152,7 +152,7 @@ pub use bdk_wallet::bitcoin;
 #[cfg(not(feature = "wallet"))]
 pub use rgbstd::bitcoin;
 pub use rgbstd::{
-    ChainNet, ContractId, Txid as RgbTxid,
+    ContractId, Txid as RgbTxid,
     containers::{
         ConsignmentExt, Contract as RgbContract, Fascia, FileContent, Transfer as RgbTransfer,
         WitnessBundle,
@@ -178,8 +178,6 @@ pub use crate::{
         backup::restore_backup,
     },
 };
-#[cfg(feature = "_online")]
-use std::collections::BTreeSet;
 
 #[cfg(all(test, feature = "electrum"))]
 use std::io::{BufRead, BufReader};
@@ -263,7 +261,7 @@ use bdk_wallet::{
         bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource, Xpriv, Xpub},
         consensus::{Decodable, Encodable},
         hashes::Hash as Sha256Hash,
-        psbt::{ExtractTxError, Psbt},
+        psbt::Psbt,
         secp256k1::Secp256k1,
     },
     chain::{
@@ -381,7 +379,7 @@ use rgbstd::{
     daggy::Walker,
     indexers::AnyResolver,
     validation::{
-        OpoutsDagData, SchemaRules, ValidationConfig, ValidationError, Validity, Warning,
+        OpoutsDagData, SchemaRules, Validity, Warning,
     },
 };
 #[cfg(feature = "wallet")]

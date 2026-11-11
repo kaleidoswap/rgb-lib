@@ -128,7 +128,7 @@ impl AssetSchema {
                 Self::Uda => true,
                 Self::Nia | Self::Cfa | Self::Ifa => false,
             },
-            Assignment::InflationRight(_) => match self {
+            Assignment::InflationRight(_) | Assignment::LinkRight => match self {
                 Self::Ifa => true,
                 Self::Nia | Self::Uda | Self::Cfa => false,
             },
@@ -525,7 +525,8 @@ impl Assignment {
         match self {
             Self::Fungible(_) | Self::NonFungible => Some(RGB_STATE_ASSET_OWNER),
             Self::InflationRight(_) => Some(RGB_STATE_INFLATION_ALLOWANCE),
-            Self::Any => None,
+            // link rights are not requested through invoices
+            Self::LinkRight | Self::Any => None,
         }
     }
 

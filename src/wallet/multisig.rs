@@ -2390,7 +2390,9 @@ impl MultisigWallet {
                 if matches!(operation_type, OperationType::SendRgb) {
                     let (_, transfer_dir, info_contents, fascia) =
                         self.get_transfer_end_data(&begin_operation_data.psbt)?;
-                    self.gen_consignments(&fascia, &info_contents.transfers, &transfer_dir)?;
+                    let txn = self.database().begin_transaction()?;
+                    self.gen_consignments(&txn, &fascia, &info_contents.transfers, &transfer_dir)?;
+                    txn.commit()?;
                     for asset_id in info_contents.transfers.keys() {
                         let consignment_path = self
                             .get_asset_transfer_dir(&transfer_dir, asset_id)

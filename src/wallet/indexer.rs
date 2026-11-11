@@ -400,6 +400,16 @@ impl Indexer {
     pub(crate) fn get_tx(&self, txid: &str) -> Result<Option<BdkTransaction>, Error> {
         let txid = Txid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
         Ok(match self {
+            #[cfg(feature = "bitcoind")]
+            Indexer::Bitcoind(client) => match client.get_raw_transaction(&txid, None) {
+                Ok(tx) => Some(tx),
+                Err(BitcoindRpcError::JsonRpc(BitcoindJsonRpcError::Rpc(e)))
+                    if e.code == BITCOIND_RPC_INVALID_ADDRESS_OR_KEY =>
+                {
+                    None
+                }
+                Err(e) => return Err(IndexerError::from(e).into()),
+            },
             #[cfg(feature = "electrum")]
             Indexer::Electrum(client) => match client.inner.transaction_get(&txid) {
                 Ok(tx) => Some(tx),
@@ -424,6 +434,13 @@ impl Indexer {
         script: &ScriptBuf,
     ) -> Result<Option<u64>, Error> {
         Ok(match self {
+            // gettxout already reports only unspent outputs, mempool spends included
+            #[cfg(feature = "bitcoind")]
+            Indexer::Bitcoind(client) => client
+                .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
+                .map_err(IndexerError::from)?
+                .filter(|out| out.script_pub_key.hex == script.as_bytes())
+                .map(|out| out.value.to_sat()),
             #[cfg(feature = "electrum")]
             Indexer::Electrum(client) => client
                 .inner
