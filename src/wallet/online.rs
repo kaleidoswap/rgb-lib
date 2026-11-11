@@ -1557,8 +1557,8 @@ pub trait WalletOnline: WalletOffline {
         })
     }
 
-    fn get_received_signed_tx_path(&self, recipient_id: &str) -> PathBuf {
-        self.get_receive_consignment_path(recipient_id)
+    fn get_received_signed_tx_path(&self, transfer: &DbTransfer) -> PathBuf {
+        self.get_receive_consignment_path(transfer)
             .with_file_name(RECEIVED_SIGNED_TX_FILE)
     }
 
@@ -1566,7 +1566,7 @@ pub trait WalletOnline: WalletOffline {
     /// broadcast deadline (v1.0-changes-spec.md 6.4) and broadcast it.
     fn broadcast_received_tx(
         &self,
-        recipient_id: &str,
+        transfer: &DbTransfer,
         signed_tx_b64: &str,
         signed_tx_hash: &str,
         sender_pubkey_hex: &str,
@@ -1586,15 +1586,15 @@ pub trait WalletOnline: WalletOffline {
             .map_err(|e| Error::Internal {
                 details: e.to_string(),
             })?;
-        atomic_write(&self.get_received_signed_tx_path(recipient_id), &tx_bytes)?;
+        atomic_write(&self.get_received_signed_tx_path(transfer), &tx_bytes)?;
         self.broadcast_tx(tx)?;
         Ok(())
     }
 
     /// Broadcast again the signed TX released to a recipient, if saved, e.g. after it was evicted
     /// from the mempool. Failures are only logged, as the TX may e.g. have been replaced.
-    fn rebroadcast_received_tx(&self, recipient_id: &str) {
-        let path = self.get_received_signed_tx_path(recipient_id);
+    fn rebroadcast_received_tx(&self, transfer: &DbTransfer) {
+        let path = self.get_received_signed_tx_path(transfer);
         let Ok(tx_bytes) = fs::read(&path) else {
             return;
         };
@@ -1619,10 +1619,11 @@ pub trait WalletOnline: WalletOffline {
         &self,
         txn: &DbTxn,
         mode: &ReceiveMode,
-        recipient_id: &str,
+        transfer: &DbTransfer,
         recipient_seed: &[u8],
         updated_batch_transfer: &mut DbBatchTransferActMod,
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        let recipient_id = transfer.recipient_id.as_deref().unwrap_or_default();
         debug!(
             self.logger(),
             "Refusing invalid consignment for {recipient_id}"
@@ -1656,7 +1657,7 @@ pub trait WalletOnline: WalletOffline {
             .into_iter()
             .collect();
         self.unflag_pending_witness_txos(txn, &HashSet::new(), &scripts)?;
-        self.delete_valid_consignment(recipient_id)?;
+        self.delete_valid_consignment(transfer)?;
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
         Ok(Some(txn.update_batch_transfer(updated_batch_transfer)?))
     }
@@ -2043,15 +2044,16 @@ pub trait WalletOnline: WalletOffline {
     fn load_received_valid_transfer(
         &self,
         batch_transfer: &DbBatchTransfer,
-        recipient_id: &str,
+        transfer: &DbTransfer,
     ) -> Result<ValidTransfer, Error> {
-        let consignment_path = self.get_receive_consignment_path(recipient_id);
+        let consignment_path = self.get_receive_consignment_path(transfer);
         let valid_consignment_path = self.get_receive_valid_consignment_path(&consignment_path);
         if valid_consignment_path.exists() {
             return ValidTransfer::load_file(&valid_consignment_path)
                 .map_err(|e| InternalError::from(e).into());
         }
 
+        let recipient_id = transfer.recipient_id.as_deref().unwrap_or_default();
         debug!(
             self.logger(),
             "No validated consignment for {recipient_id}, validating consignment"
@@ -2094,8 +2096,8 @@ pub trait WalletOnline: WalletOffline {
     }
 
     /// Delete the validated copy of a received consignment
-    fn delete_valid_consignment(&self, recipient_id: &str) -> Result<(), Error> {
-        let consignment_path = self.get_receive_consignment_path(recipient_id);
+    fn delete_valid_consignment(&self, transfer: &DbTransfer) -> Result<(), Error> {
+        let consignment_path = self.get_receive_consignment_path(transfer);
         match fs::remove_file(self.get_receive_valid_consignment_path(&consignment_path)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -2156,10 +2158,6 @@ pub trait WalletOnline: WalletOffline {
     ) -> Result<Option<DbBatchTransfer>, Error> {
         debug!(self.logger(), "ACKing consignment...");
 
-        let recipient_id = transfer
-            .recipient_id
-            .clone()
-            .expect("transfer should have a recipient ID");
 
         // the sender proxy retention grace is how long after the operation expiration a released
         // signed TX can still be retrieved: a non-donation transfer whose sender proxy grants
@@ -2177,7 +2175,7 @@ pub trait WalletOnline: WalletOffline {
                 return self.refuse_consignment(
                     txn,
                     mode,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                 );
@@ -2248,7 +2246,7 @@ pub trait WalletOnline: WalletOffline {
                     (Some(signed_tx), Some(signed_tx_hash), Some(sender_pubkey)) => {
                         // the TX has been released: decrypt and broadcast it
                         self.broadcast_received_tx(
-                            &recipient_id,
+                            &transfer,
                             &signed_tx,
                             &signed_tx_hash,
                             &sender_pubkey,
@@ -2352,8 +2350,8 @@ pub trait WalletOnline: WalletOffline {
         // failed for a transient reason (e.g. network error), reuse them instead of hitting the
         // proxy again; the endpoint we used is recorded in the metadata, since a failed refresh
         // rolls back the `used` flag on the transfer transport endpoint
-        let consignment_path = self.get_receive_consignment_path(&recipient_id);
-        let consignment_meta_path = self.get_receive_consignment_meta_path(&recipient_id);
+        let consignment_path = self.get_receive_consignment_path(&transfer);
+        let consignment_meta_path = self.get_receive_consignment_meta_path(&transfer);
         let data = if consignment_path.exists()
             && consignment_meta_path.exists()
             && let Ok(meta_str) = fs::read_to_string(&consignment_meta_path)
@@ -2465,7 +2463,7 @@ pub trait WalletOnline: WalletOffline {
                     return self.refuse_consignment(
                         txn,
                         &ReceiveMode::Proxy(data),
-                        &recipient_id,
+                        &transfer,
                         &recipient_seed,
                         &mut updated_batch_transfer,
                     );
@@ -2501,7 +2499,6 @@ pub trait WalletOnline: WalletOffline {
             batch_transfer,
             &asset_transfer,
             &transfer,
-            recipient_id,
             &consignment_path,
             mode,
             &mut updated_batch_transfer,
@@ -2675,7 +2672,6 @@ pub trait WalletOnline: WalletOffline {
         batch_transfer: &DbBatchTransfer,
         asset_transfer: &DbAssetTransfer,
         transfer: &DbTransfer,
-        recipient_id: String,
         consignment_path: &Path,
         mode: ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
@@ -2693,7 +2689,7 @@ pub trait WalletOnline: WalletOffline {
                 return self.refuse_consignment(
                     txn,
                     &mode,
-                    &recipient_id,
+                    transfer,
                     &recipient_seed,
                     updated_batch_transfer,
                 );
@@ -2712,7 +2708,7 @@ pub trait WalletOnline: WalletOffline {
             return self.refuse_consignment(
                 txn,
                 &mode,
-                &recipient_id,
+                transfer,
                 &recipient_seed,
                 updated_batch_transfer,
             );
@@ -2729,7 +2725,7 @@ pub trait WalletOnline: WalletOffline {
                 return self.refuse_consignment(
                     txn,
                     &mode,
-                    &recipient_id,
+                    transfer,
                     &recipient_seed,
                     updated_batch_transfer,
                 );
@@ -2742,7 +2738,7 @@ pub trait WalletOnline: WalletOffline {
             return self.refuse_consignment(
                 txn,
                 &mode,
-                &recipient_id,
+                transfer,
                 &recipient_seed,
                 updated_batch_transfer,
             );
@@ -2766,7 +2762,7 @@ pub trait WalletOnline: WalletOffline {
                     return self.refuse_consignment(
                         txn,
                         &mode,
-                        &recipient_id,
+                        transfer,
                         &recipient_seed,
                         updated_batch_transfer,
                     );
@@ -2785,7 +2781,7 @@ pub trait WalletOnline: WalletOffline {
             return self.refuse_consignment(
                 txn,
                 &mode,
-                &recipient_id,
+                transfer,
                 &recipient_seed,
                 updated_batch_transfer,
             );
@@ -2821,7 +2817,7 @@ pub trait WalletOnline: WalletOffline {
                 return self.refuse_consignment(
                     txn,
                     &mode,
-                    &recipient_id,
+                    transfer,
                     &recipient_seed,
                     updated_batch_transfer,
                 );
@@ -2848,7 +2844,7 @@ pub trait WalletOnline: WalletOffline {
             return self.refuse_consignment(
                 txn,
                 &mode,
-                &recipient_id,
+                transfer,
                 &recipient_seed,
                 updated_batch_transfer,
             );
@@ -2919,7 +2915,7 @@ pub trait WalletOnline: WalletOffline {
                     return self.refuse_consignment(
                         txn,
                         &mode,
-                        &recipient_id,
+                        transfer,
                         &recipient_seed,
                         updated_batch_transfer,
                     );
@@ -2944,7 +2940,7 @@ pub trait WalletOnline: WalletOffline {
                     return self.refuse_consignment(
                         txn,
                         &mode,
-                        &recipient_id,
+                        transfer,
                         &recipient_seed,
                         updated_batch_transfer,
                     );
@@ -3128,25 +3124,6 @@ pub trait WalletOnline: WalletOffline {
             }
         }
 
-        // the receive consignment is cached under the recipient ID, which address reuse lets
-        // other transfers share: refuse rather than overwrite the cached consignment of any other
-        // transfer (in any status) with the same recipient ID
-        let matched_idxs: HashSet<i32> = matches.iter().map(|(_, _, t)| t.idx).collect();
-        if let Some(other) = txn.iter_transfers()?.into_iter().find(|t| {
-            !matched_idxs.contains(&t.idx)
-                && t.recipient_id.is_some()
-                && seen_recipient_ids.contains(t.recipient_id.as_ref().unwrap())
-        }) {
-            return Err(Error::CannotProvideOutOfBandConsignment {
-                details: format!(
-                    "recipient {} is shared with transfer {} (address reuse), refusing to \
-                     overwrite its consignment",
-                    other.recipient_id.unwrap_or_default(),
-                    other.idx
-                ),
-            });
-        }
-
         // the replayed-output guard lives in validate_received_consignment (the shared settlement
         // chokepoint), so it covers this OOB path and the proxy path alike.
 
@@ -3169,7 +3146,7 @@ pub trait WalletOnline: WalletOffline {
 
             // copy the provided consignment to the canonical receive path, so later refresh stages
             // (safe height, confirmations) find it where they expect it
-            let consignment_path = self.get_receive_consignment_path(&recipient_id);
+            let consignment_path = self.get_receive_consignment_path(&transfer);
             atomic_write_with(&consignment_path, |tmp| {
                 fs::copy(consignment_path_in, tmp)?;
                 Ok(())
@@ -3184,7 +3161,6 @@ pub trait WalletOnline: WalletOffline {
                 &batch_transfer,
                 &asset_transfer,
                 &transfer,
-                recipient_id,
                 &consignment_path,
                 mode,
                 &mut updated_batch_transfer,
@@ -3220,10 +3196,6 @@ pub trait WalletOnline: WalletOffline {
 
         let (_, transfer) =
             batch_transfer.get_incoming_transfer(&db_data.asset_transfers, &db_data.transfers)?;
-        let recipient_id = transfer
-            .recipient_id
-            .clone()
-            .expect("transfer should have a recipient ID");
         let txid = batch_transfer
             .txid
             .as_deref()
@@ -3254,7 +3226,7 @@ pub trait WalletOnline: WalletOffline {
             return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?));
         }
 
-        let valid_consignment = self.load_received_valid_transfer(batch_transfer, &recipient_id)?;
+        let valid_consignment = self.load_received_valid_transfer(batch_transfer, &transfer)?;
         let validation_status = valid_consignment.validation_status();
         let unsafe_txids = Self::collect_unsafe_history_txids(&validation_status.warnings, txid);
 
@@ -3285,7 +3257,7 @@ pub trait WalletOnline: WalletOffline {
         } else {
             let proxy_url =
                 Self::used_recipient_proxy_endpoint(&tte_data).expect("there should be 1 used TTE");
-            let consignment_meta_path = self.get_receive_consignment_meta_path(&recipient_id);
+            let consignment_meta_path = self.get_receive_consignment_meta_path(&transfer);
             let meta: ReceivedConsignmentMeta =
                 serde_json::from_str(&fs::read_to_string(&consignment_meta_path)?)
                     .map_err(InternalError::from)?;
@@ -3834,8 +3806,8 @@ pub trait WalletOnline: WalletOffline {
             {
                 let (_, transfer) = batch_transfer
                     .get_incoming_transfer(&db_data.asset_transfers, &db_data.transfers)?;
-                if let Some(recipient_id) = &transfer.recipient_id {
-                    self.rebroadcast_received_tx(recipient_id);
+                if transfer.recipient_id.is_some() {
+                    self.rebroadcast_received_tx(&transfer);
                 }
             }
         }
@@ -3893,10 +3865,10 @@ pub trait WalletOnline: WalletOffline {
 
             // accept consignment
             let valid_consignment =
-                self.load_received_valid_transfer(batch_transfer, &recipient_id)?;
+                self.load_received_valid_transfer(batch_transfer, &transfer)?;
             let mut stock = self.rgb_stock(txn)?;
             stock.accept_transfer(valid_consignment.clone(), &self.blockchain_resolver())?;
-            self.delete_valid_consignment(&recipient_id)?;
+            self.delete_valid_consignment(&transfer)?;
             let asset_schema: AssetSchema = valid_consignment.schema_id().try_into()?;
             if asset_schema == AssetSchema::Ifa {
                 let contract_id = valid_consignment.contract_id();
@@ -4145,12 +4117,8 @@ pub trait WalletOnline: WalletOffline {
 
         match (res.signed_tx, res.signed_tx_hash, res.sender_pk) {
             (Some(signed_tx), Some(signed_tx_hash), Some(sender_pubkey)) => {
-                let recipient_id = transfer
-                    .recipient_id
-                    .clone()
-                    .expect("transfer should have a recipient ID");
                 self.broadcast_received_tx(
-                    &recipient_id,
+                    &transfer,
                     &signed_tx,
                     &signed_tx_hash,
                     &sender_pubkey,

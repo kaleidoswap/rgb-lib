@@ -2189,15 +2189,28 @@ pub trait WalletOffline: WalletBackup {
         recipient_id.replace(":", "_")
     }
 
-    fn get_receive_consignment_path(&self, recipient_id: &str) -> PathBuf {
+    /// Name of the dir holding a receive transfer's files: its recipient ID, plus a prefix of the
+    /// invoice public key when it has one, since address reuse lets several invoices share a
+    /// recipient ID.
+    fn receive_cache_id(&self, transfer: &DbTransfer) -> String {
+        let recipient_id = transfer.recipient_id.as_deref().unwrap_or_default();
+        match transfer.recipient_pubkey.as_deref() {
+            Some(pubkey) if !pubkey.is_empty() => {
+                format!("{recipient_id}-{}", hex::encode(&pubkey[..pubkey.len().min(8)]))
+            }
+            _ => recipient_id.to_string(),
+        }
+    }
+
+    fn get_receive_consignment_path(&self, transfer: &DbTransfer) -> PathBuf {
         self.get_transfers_dir()
-            .join(self.normalize_recipient_id(recipient_id))
+            .join(self.normalize_recipient_id(&self.receive_cache_id(transfer)))
             .join(CONSIGNMENT_RCV_FILE)
     }
 
-    fn get_receive_consignment_meta_path(&self, recipient_id: &str) -> PathBuf {
+    fn get_receive_consignment_meta_path(&self, transfer: &DbTransfer) -> PathBuf {
         self.get_transfers_dir()
-            .join(self.normalize_recipient_id(recipient_id))
+            .join(self.normalize_recipient_id(&self.receive_cache_id(transfer)))
             .join(CONSIGNMENT_RCV_META_FILE)
     }
 
@@ -2276,15 +2289,7 @@ pub trait WalletOffline: WalletBackup {
                 TransferStatus::WaitingCounterparty,
             ) => None,
             (TransferKind::ReceiveBlind | TransferKind::ReceiveWitness, _) => {
-                let recipient_id = transfer.recipient_id.clone().unwrap();
-                let nonce: &[u8] = match transfer.recipient_type.as_ref() {
-                    Some(RecipientTypeFull::Witness {
-                        recipient_nonce, ..
-                    }) => recipient_nonce.as_slice(),
-                    _ => &[],
-                };
-                let proxy_rid = crate::utils::derive_proxy_recipient_id(&recipient_id, nonce);
-                Some(self.get_receive_consignment_path(&proxy_rid))
+                Some(self.get_receive_consignment_path(transfer))
             }
             (TransferKind::Issuance, _) => {
                 Some(self.get_issue_consignment_path(&asset_transfer.asset_id.clone().unwrap()))

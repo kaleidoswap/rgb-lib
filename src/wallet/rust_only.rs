@@ -1747,10 +1747,27 @@ impl Wallet {
         let psbt = Psbt::from_str(&signed_psbt)?;
         let txn = self.database().begin_transaction()?;
 
+        // as in send_end: refuse ending an operation that failed or was already ended
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        if let Some(existing) = txn
+            .get_batch_transfers_by_txid(&txid)?
+            .into_iter()
+            .find(|batch_transfer| !batch_transfer.incoming)
+            && !matches!(
+                existing.status,
+                TransferStatus::Initiated | TransferStatus::WaitingCounterparty
+            )
+        {
+            return Err(Error::CannotEndTransfer { txid });
+        }
+        let (txid, _, info_contents, _) = self.get_transfer_end_data(&psbt)?;
+        // the data must be of a send: another operation would be completed skipping its checks
+        if !info_contents.is_operation(&TypeOfTransition::Transfer) {
+            return Err(Error::WrongOperation { txid });
+        }
+
         // this will also update the DB with the new UTXOs and BDK
         self.broadcast_psbt(&txn, &psbt)?;
-
-        let (txid, _, info_contents, _) = self.get_transfer_end_data(&psbt)?;
 
         let batch_transfer_idx = self.update_or_save_transfers(
             &txn,

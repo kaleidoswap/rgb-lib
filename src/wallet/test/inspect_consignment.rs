@@ -163,7 +163,9 @@ fn success() {
     // the same way, skipping the checks
     let rcv_consignment_path = rcv_party
         .wallet
-        .get_receive_consignment_path(&receive_data_blind.recipient_id);
+        .get_receive_consignment_path(
+            &rcv_party.get_test_transfer_recipient(&receive_data_blind.recipient_id),
+        );
     let valid_consignment_path = rcv_party
         .wallet
         .get_receive_valid_consignment_path(&rcv_consignment_path);

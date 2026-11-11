@@ -160,7 +160,7 @@ fn auto_backup_queue_retains_the_latest_snapshot_and_ignores_stale_workers() {
 #[test]
 fn snapshots_wait_for_rgb_writers_and_capture_matching_files_and_database() {
     let (_dir, wallet, _keys) = local_wallet(false);
-    let marker = wallet.get_wallet_dir().join("rgb/state-marker");
+    let marker = wallet.get_wallet_dir().join("state-marker");
     std::fs::write(&marker, b"before").unwrap();
     let runtime = wallet.database().state_guard();
     std::thread::scope(|scope| {
@@ -203,7 +203,7 @@ fn snapshots_wait_for_rgb_writers_and_capture_matching_files_and_database() {
         assert_eq!(timestamp.to_string(), expected);
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let file = format!(
-            "{}/rgb/state-marker",
+            "{}/state-marker",
             wallet
                 .get_wallet_dir()
                 .file_name()

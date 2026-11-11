@@ -11793,7 +11793,7 @@ fn recipient_fails_unconfirmed_past_deadline() {
     assert_eq!(batch_transfer.broadcast_deadline, Some(deadline));
     let saved_tx = rcv_party
         .wallet
-        .get_receive_consignment_path(&receive_data.recipient_id)
+        .get_receive_consignment_path(&rcv_party.get_test_transfer_recipient(&receive_data.recipient_id))
         .with_file_name("rcv_signed.tx");
     assert!(saved_tx.exists());
 

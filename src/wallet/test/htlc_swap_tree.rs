@@ -468,7 +468,15 @@ fn sign_htlc_spend(
         .sign(&psbt.unsigned_tx, &psbt_prevouts(&psbt), path);
     psbt.inputs[htlc_index].final_script_witness = Some(witness.clone());
 
-    let signed = party.wallet.sign_psbt(psbt.to_string(), None).unwrap();
+    // the lock TX is not in this wallet's graph: trust the witness UTXO of the inputs (BDK 3.2)
+    let sign_options = bdk_wallet::SignOptions {
+        trust_witness_utxo: true,
+        ..Default::default()
+    };
+    let signed = party
+        .wallet
+        .sign_psbt(psbt.to_string(), Some(sign_options))
+        .unwrap();
     let finalized = party.wallet.finalize_psbt(signed, None).unwrap();
     let finalized = Psbt::from_str(&finalized).unwrap();
     assert_eq!(
