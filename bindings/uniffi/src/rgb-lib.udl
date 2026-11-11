@@ -33,6 +33,8 @@ namespace rgb_lib {
 
   [Throws=RgbLibError]
   string restore_from_vss(VssBackupConfig config, string target_dir);
+
+  [Throws=RgbLibError]
   ConsignmentInspection inspect_consignment(string consignment_path, BundleFilter bundle_filter);
 };
 
@@ -327,7 +329,7 @@ dictionary AcceptTransferResult {
   sequence<Assignment> assignments;
 };
 
-// Caller intent for fetch_and_accept: reject unintended but structurally valid consignments.
+// Caller intent for accept_htlc_consignment: reject unintended but structurally valid consignments.
 dictionary ExpectedTransfer {
   string asset_id;
   AssetSchema asset_schema;
@@ -1046,8 +1048,7 @@ dictionary OnchainSwapInput {
 [Remote]
 dictionary OnchainSwapConsignment {
   string asset_id;
-  string path;
-  string? endpoint;
+  string consignment;
   string txid;
   u32 vout;
   u64 blinding;
@@ -1057,8 +1058,7 @@ dictionary OnchainSwapConsignment {
 [Remote]
 dictionary OnchainSwapAssetHistory {
   string asset_id;
-  string path;
-  string? endpoint;
+  string consignment;
   string recipient_id;
 };
 
@@ -1075,7 +1075,6 @@ dictionary OnchainSwapOffer {
   string? maker_rgb_recipient_id;
   string? maker_rgb_script_pubkey_hex;
   u64? maker_rgb_blinding;
-  string? proxy_url;
   sequence<OnchainSwapExtraOutput> extra_outputs;
 };
 
@@ -1273,11 +1272,12 @@ interface Wallet {
   // min_confirmations: 0 allows mempool/Tentative (reorg-exposed HTLC race); >=1 requires mined.
   // Raw fetch/accept halves are Rust-only (`*_unchecked`) — do not re-export them here.
   [Throws=RgbLibError]
-  AcceptTransferResult fetch_and_accept_transfer_by_recipient_id(
+  AcceptTransferResult accept_htlc_consignment(
     Online online,
-    string proxy_recipient_id,
+    string consignment,
+    string txid,
+    u32 vout,
     string witness_recipient_id,
-    string consignment_endpoint,
     u64 blinding,
     u8 min_confirmations,
     ExpectedTransfer expected);
@@ -1445,7 +1445,7 @@ interface Wallet {
   [Throws=RgbLibError]
   OnchainSwapOffer create_swap_offer(
     OnchainSwapLeg maker_gives, OnchainSwapLeg maker_receives,
-    u64 network_fee_sat, u64? expiration_timestamp, string? proxy_url,
+    u64 network_fee_sat, u64? expiration_timestamp,
     sequence<OnchainSwapExtraOutput> extra_outputs);
 
   [Throws=RgbLibError]

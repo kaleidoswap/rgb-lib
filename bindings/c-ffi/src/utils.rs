@@ -187,54 +187,20 @@ pub(crate) fn validate_consignment(
     indexer_url: *const c_char,
     bitcoin_network: *const c_char,
 ) -> Result<String, Error> {
-    use rgb_lib::{
-        ChainNet, FileContent, RgbTransfer, ValidationConfig, ValidationError,
-        wallet::rust_only::get_resolver,
-    };
+    use rgb_lib::wallet::rust_only::{ValidateConsignmentResult, validate_consignment as validate};
 
     let file_path = ptr_to_string(file_path);
     let indexer_url = ptr_to_string(indexer_url);
     let bitcoin_network = BitcoinNetwork::from_str(&ptr_to_string(bitcoin_network))?;
-    let chain_net: ChainNet = bitcoin_network.into();
 
-    let consignment = RgbTransfer::load_file(&file_path).map_err(|e| {
-        Error::RgbLib(RgbLibError::Internal {
-            details: format!("Failed to load consignment: {e}"),
-        })
-    })?;
+    let result: ValidateConsignmentResult = validate(&file_path, &indexer_url, bitcoin_network)?;
 
-    let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-    let trusted_typesystem = asset_schema.types();
-
-    let resolver = get_resolver(&indexer_url, bitcoin_network)?;
-
-    let validation_config = ValidationConfig {
-        chain_net,
-        trusted_typesystem,
-        ..Default::default()
-    };
-
-    match consignment.validate(&resolver, &validation_config) {
-        Ok(valid_consignment) => {
-            let status = valid_consignment.validation_status();
-            Ok(serde_json::to_string(&serde_json::json!({
-                "valid": true,
-                "warnings": status.warnings.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-            }))?)
-        }
-        Err(ValidationError::InvalidConsignment(failure)) => {
-            Ok(serde_json::to_string(&serde_json::json!({
-                "valid": false,
-                "error": "invalid",
-                "details": failure.to_string(),
-            }))?)
-        }
-        Err(ValidationError::ResolverError(e)) => Ok(serde_json::to_string(&serde_json::json!({
-            "valid": false,
-            "error": "resolver",
-            "details": e.to_string(),
-        }))?),
-    }
+    Ok(serde_json::to_string(&serde_json::json!({
+        "valid": result.valid,
+        "warnings": result.warnings,
+        "error": result.error,
+        "details": result.details,
+    }))?)
 }
 
 pub(crate) fn validate_consignment_offchain(

@@ -2833,11 +2833,9 @@ pub trait WalletOffline: WalletBackup {
         maker_receives: OnchainSwapLeg,
         network_fee_sat: u64,
         expiration_timestamp: Option<u64>,
-        proxy_url: Option<String>,
         extra_outputs: Vec<OnchainSwapExtraOutput>,
     ) -> Result<OnchainSwapOffer, Error> {
         swap_validate_legs(&maker_gives, &maker_receives)?;
-        swap_validate_proxy_url(&proxy_url)?;
         swap_validate_extra_outputs(&extra_outputs, self.bitcoin_network())?;
         let (
             maker_btc_address,
@@ -2874,7 +2872,6 @@ pub trait WalletOffline: WalletBackup {
             maker_rgb_recipient_id,
             maker_rgb_script_pubkey_hex,
             maker_rgb_blinding,
-            proxy_url,
             extra_outputs,
         })
     }
@@ -3258,31 +3255,6 @@ fn swap_asset_file_path(base_dir: &Path, prefix: &str, asset_id: &str) -> PathBu
 pub(crate) fn swap_history_recipient_id(swap_id: &str, asset_id: &str) -> String {
     let asset_id_hash = hash_bytes_hex(asset_id.as_bytes());
     format!("swap-history-{swap_id}-{}", &asset_id_hash[..16])
-}
-
-#[cfg(feature = "_online")]
-pub(crate) fn swap_proxy_transport_endpoint(proxy_url: &str) -> Result<String, Error> {
-    let endpoint = if let Some(rest) = proxy_url.strip_prefix("http://") {
-        format!("rpc://{rest}")
-    } else if let Some(rest) = proxy_url.strip_prefix("https://") {
-        format!("rpcs://{rest}")
-    } else {
-        proxy_url.to_string()
-    };
-    let transport = RgbTransport::from_str(&endpoint)?;
-    TransportEndpoint::try_from(transport)?;
-    Ok(endpoint)
-}
-
-#[cfg(feature = "_online")]
-pub(crate) fn swap_validate_proxy_url(proxy_url: &Option<String>) -> Result<(), Error> {
-    let proxy_url = proxy_url
-        .as_deref()
-        .ok_or_else(|| Error::InvalidTransportEndpoints {
-            details: s!("on-chain RGB swaps require a proxy URL"),
-        })?;
-    swap_proxy_transport_endpoint(proxy_url)?;
-    Ok(())
 }
 
 /// Build the coloring for a swap RGB leg: `leg.amount` goes to `recipient_vout` and everything
@@ -3976,7 +3948,6 @@ mod swap_unit_tests {
             maker_rgb_recipient_id: Some("maker-rgb-recipient".to_string()),
             maker_rgb_script_pubkey_hex: Some("51".to_string()),
             maker_rgb_blinding: Some(1),
-            proxy_url: Some("rpc://127.0.0.1:3000".to_string()),
             extra_outputs: vec![],
         };
         OnchainSwapProposal {
@@ -4233,21 +4204,6 @@ mod swap_unit_tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn validates_swap_proxy_transport() {
-        assert_eq!(
-            swap_proxy_transport_endpoint("http://127.0.0.1:3000").unwrap(),
-            "rpc://127.0.0.1:3000"
-        );
-        assert_eq!(
-            swap_proxy_transport_endpoint("https://example.com/json-rpc").unwrap(),
-            "rpcs://example.com/json-rpc"
-        );
-        assert!(swap_validate_proxy_url(&Some("rpc://127.0.0.1:3000".to_string())).is_ok());
-        assert!(swap_validate_proxy_url(&None).is_err());
-        assert!(swap_validate_proxy_url(&Some("ws://127.0.0.1:3000".to_string())).is_err());
     }
 
     #[test]

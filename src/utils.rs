@@ -56,6 +56,7 @@ pub(crate) fn wallet_state_lock(
 }
 
 /// Lockfile of the legacy filesystem RGB runtime, skipped when backing up old wallet dirs.
+#[cfg(feature = "vss")]
 pub(crate) const RGB_RUNTIME_LOCK_FILE: &str = "rgb_runtime.lock";
 
 #[cfg(feature = "rgb_fs_store_migration")]

@@ -6,7 +6,7 @@ use super::offline::{
     SwapOutgoingState, swap_build_input, swap_consignment_dir, swap_consignment_path,
     swap_ensure_net_btc_outflow, swap_ensure_only_own_inputs_signed, swap_history_path,
     swap_history_recipient_id, swap_input_to_outpoint, swap_input_txout, swap_invalid,
-    swap_mpc_entropy, swap_parse_script, swap_proxy_transport_endpoint, swap_rgb_leg_coloring_info,
+    swap_mpc_entropy, swap_parse_script, swap_rgb_leg_coloring_info,
     swap_selected_inputs_total,
 };
 use super::*;
@@ -7503,7 +7503,6 @@ pub(crate) fn swap_prepare_rgb_leg(
     psbt: &Psbt,
     fascia: &Fascia,
     send: &SwapRgbSend,
-    proxy_url: Option<&str>,
     swap_id: &str,
     expiration_timestamp: Option<u64>,
 ) -> Result<(Vec<OnchainSwapConsignment>, SwapOutgoingState), Error> {
@@ -7527,7 +7526,6 @@ pub(crate) fn swap_prepare_rgb_leg(
     let consignments = swap_emit_consignments(
         wallet,
         vec![transfer],
-        proxy_url,
         swap_id,
         &txid,
         send.recipient_id,
@@ -7549,7 +7547,6 @@ pub(crate) fn swap_color_rgb_leg(
     wallet: &Wallet,
     psbt: &mut Psbt,
     send: &SwapRgbSend,
-    proxy_url: Option<&str>,
     swap_id: &str,
     expiration_timestamp: Option<u64>,
 ) -> Result<(Vec<OnchainSwapConsignment>, SwapOutgoingState), Error> {
@@ -7562,37 +7559,22 @@ pub(crate) fn swap_color_rgb_leg(
         psbt,
         &fascia,
         send,
-        proxy_url,
         swap_id,
         expiration_timestamp,
     )
 }
 
-/// Swap consignments travel out of band: proxy protocol 1.0 only carries consignments for invoices
-/// reserved through per-operation keys, which the swap messages do not exchange.
-fn swap_refuse_proxy_transport(proxy_url: Option<&str>) -> Result<(), Error> {
-    if proxy_url.is_some() {
-        return Err(Error::Proxy {
-            details: s!("swap consignments over a proxy are not supported by proxy protocol 1.0"),
-        });
-    }
-    Ok(())
-}
-
 pub(crate) fn swap_emit_consignments(
     wallet: &Wallet,
     transfers: Vec<RgbTransfer>,
-    proxy_url: Option<&str>,
     swap_id: &str,
     txid: &str,
     recipient_id: &str,
     recipient_vout: u32,
     blinding: u64,
 ) -> Result<Vec<OnchainSwapConsignment>, Error> {
-    swap_refuse_proxy_transport(proxy_url)?;
     let base_dir = swap_consignment_dir(wallet.wallet_dir(), swap_id);
     fs::create_dir_all(&base_dir)?;
-    let endpoint = proxy_url.map(swap_proxy_transport_endpoint).transpose()?;
 
     let mut consignments = vec![];
     for transfer in transfers {
@@ -7601,12 +7583,7 @@ pub(crate) fn swap_emit_consignments(
         transfer.save_file(&path)?;
         consignments.push(OnchainSwapConsignment {
             asset_id: transfer_asset_id,
-            path: if endpoint.is_some() {
-                String::new()
-            } else {
-                path.to_string_lossy().to_string()
-            },
-            endpoint: endpoint.clone(),
+            consignment: general_purpose::STANDARD.encode(fs::read(&path)?),
             txid: txid.to_string(),
             vout: recipient_vout,
             blinding,
@@ -7617,7 +7594,7 @@ pub(crate) fn swap_emit_consignments(
 }
 
 /// Export from the stash the history of the allocations of the leg's asset on `inputs` (the
-/// giver's declared inputs) and post it to the proxy, for the receiver to validate before it signs.
+/// giver's declared inputs) and return it, for the receiver to validate before it signs.
 ///
 /// The history is a transfer consignment without terminals: its bundles lead from genesis to the
 /// allocations on `inputs`, so it works for any holder of the asset, not only its issuer.
@@ -7625,13 +7602,11 @@ pub(crate) fn swap_emit_asset_history(
     wallet: &Wallet,
     leg: &OnchainSwapLeg,
     inputs: &[OnchainSwapInput],
-    proxy_url: Option<&str>,
     swap_id: &str,
 ) -> Result<Option<OnchainSwapAssetHistory>, Error> {
     if !matches!(leg.kind, OnchainSwapLegKind::Rgb) {
         return Ok(None);
     }
-    swap_refuse_proxy_transport(proxy_url)?;
     let asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
     let contract_id = ContractId::from_str(&asset_id)
         .map_err(|e| swap_invalid(format!("invalid RGB asset ID: {e}")))?;
@@ -7653,16 +7628,10 @@ pub(crate) fn swap_emit_asset_history(
     fs::create_dir_all(&base_dir)?;
     let path = swap_history_path(&base_dir, &asset_id);
     history.save_file(&path)?;
-    let endpoint = proxy_url.map(swap_proxy_transport_endpoint).transpose()?;
     let recipient_id = swap_history_recipient_id(swap_id, &asset_id);
     Ok(Some(OnchainSwapAssetHistory {
         asset_id,
-        path: if endpoint.is_some() {
-            String::new()
-        } else {
-            path.to_string_lossy().to_string()
-        },
-        endpoint,
+        consignment: general_purpose::STANDARD.encode(fs::read(&path)?),
         recipient_id,
     }))
 }
@@ -7959,7 +7928,7 @@ pub(crate) fn swap_validate_received_swap_leg(
     if consignment.recipient_id != recipient_id {
         return Err(swap_invalid("RGB swap consignment recipient mismatch"));
     }
-    let local_path = swap_fetch_consignment_to_file(wallet, consignment)?;
+    let local_path = swap_write_consignment_to_file(wallet, consignment)?;
     swap_validate_received_transfer_from_file(
         wallet,
         &local_path,
@@ -8095,7 +8064,7 @@ pub(crate) fn swap_import_asset_history(
             history.asset_id
         )));
     }
-    let path = swap_fetch_asset_history_to_file(wallet, history)?;
+    let path = swap_write_asset_history_to_file(wallet, history)?;
     let consignment = RgbTransfer::load_file(&path).map_err(InternalError::from)?;
     let contract_id = consignment.contract_id();
     let asset_id = contract_id.to_string();
@@ -8309,24 +8278,59 @@ pub(crate) fn swap_accept_transfer_from_file(
     Ok(assignments)
 }
 
-pub(crate) fn swap_fetch_consignment_to_file(
+pub(crate) fn swap_write_consignment_to_file(
     wallet: &Wallet,
     consignment: &OnchainSwapConsignment,
 ) -> Result<PathBuf, Error> {
-    let _ = (wallet, consignment);
-    Err(Error::Proxy {
-        details: s!("swap consignments over a proxy are not supported by proxy protocol 1.0"),
-    })
+    // the asset ID names the file: only accept a well-formed one from the counterparty
+    ContractId::from_str(&consignment.asset_id)
+        .map_err(|_| swap_invalid("RGB swap consignment has an invalid asset ID"))?;
+    let target_dir = wallet
+        .wallet_dir()
+        .join("swap-receive")
+        .join(hash_bytes_hex(consignment.recipient_id.as_bytes()));
+    swap_decode_consignment_to(
+        &consignment.consignment,
+        &target_dir.join(format!("{}.rgb", consignment.asset_id)),
+    )
 }
 
-pub(crate) fn swap_fetch_asset_history_to_file(
+pub(crate) fn swap_write_asset_history_to_file(
     wallet: &Wallet,
     history: &OnchainSwapAssetHistory,
 ) -> Result<PathBuf, Error> {
-    let _ = (wallet, history);
-    Err(Error::Proxy {
-        details: s!("swap consignments over a proxy are not supported by proxy protocol 1.0"),
-    })
+    ContractId::from_str(&history.asset_id)
+        .map_err(|_| swap_invalid("RGB swap asset history has an invalid asset ID"))?;
+    let target_dir = wallet
+        .wallet_dir()
+        .join("swap-receive")
+        .join(hash_bytes_hex(history.recipient_id.as_bytes()));
+    swap_decode_consignment_to(
+        &history.consignment,
+        &target_dir.join(format!("{}-history.rgb", history.asset_id)),
+    )
+}
+
+/// Max size of a swap consignment (or asset history) received from the counterparty.
+pub(crate) const SWAP_MAX_CONSIGNMENT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Decode a base64 swap consignment received from the counterparty and write it to `path`.
+fn swap_decode_consignment_to(consignment_b64: &str, path: &Path) -> Result<PathBuf, Error> {
+    // base64 expands 3 bytes into 4 chars: check before allocating the decoded bytes
+    if consignment_b64.len() / 4 * 3 > SWAP_MAX_CONSIGNMENT_BYTES {
+        return Err(swap_invalid("RGB swap consignment is too large"));
+    }
+    let bytes = general_purpose::STANDARD
+        .decode(consignment_b64)
+        .map_err(|_| swap_invalid("RGB swap consignment is not valid base64"))?;
+    if bytes.is_empty() {
+        return Err(swap_invalid("RGB swap consignment is empty"));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write(path, &bytes)?;
+    Ok(path.to_path_buf())
 }
 
 /// Pick coins out of `values` that together cover `needed`, keeping the overshoot small: the

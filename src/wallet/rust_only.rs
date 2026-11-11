@@ -4,9 +4,9 @@
 //!
 //! It also includes the submarine / HTLC helpers (`color_psbt_for_outpoints*`,
 //! `psbt_op_prepare` / `psbt_op_apply` / `psbt_op_abort` / `psbt_op_reconcile`,
-//! `fetch_and_accept_transfer_by_recipient_id`, `contract_assignments_for_outpoints`) that
+//! `accept_htlc_consignment`, `contract_assignments_for_outpoints`) that
 //! operate on escrow outpoints without treating them as wallet UTXOs. Of these, UniFFI exports
-//! the `psbt_op_*` methods, [`Wallet::fetch_and_accept_transfer_by_recipient_id`] and
+//! the `psbt_op_*` methods, [`Wallet::accept_htlc_consignment`] and
 //! [`Wallet::contract_assignments_for_outpoints`]; the low-level `color_psbt_*` /
 //! `consume_transfer_fascia` and the unchecked fetch/accept halves stay Rust-only.
 
@@ -270,19 +270,35 @@ pub struct PsbtOpAllocation {
     pub assignment: Assignment,
 }
 
-/// A consignment fetched from a proxy, before any validation.
+/// A consignment received from the counterparty, before any validation.
 ///
-/// **Unchecked:** `txid` and `vout` are what the proxy reported. Pass it to
+/// **Unchecked:** `txid` and `vout` are what the counterparty declared. Pass it to
 /// [`Wallet::accept_transfer_pinned`], which pins the witness output before accepting.
 #[cfg(feature = "_online")]
 #[derive(Debug, Clone)]
-pub struct FetchedConsignment {
+pub struct ReceivedConsignment {
     /// The consignment.
     pub consignment: RgbTransfer,
-    /// Witness transaction ID reported by the proxy.
+    /// Witness transaction ID declared by the counterparty.
     pub txid: String,
-    /// Witness output reported by the proxy.
+    /// Witness output declared by the counterparty.
     pub vout: u32,
+}
+
+#[cfg(feature = "_online")]
+impl ReceivedConsignment {
+    /// Decode a base64-encoded transfer consignment.
+    pub fn from_base64(consignment: &str, txid: String, vout: u32) -> Result<Self, Error> {
+        let bytes = general_purpose::STANDARD
+            .decode(consignment)
+            .map_err(|_| Error::InvalidConsignment)?;
+        let consignment = RgbTransfer::load(&bytes[..]).map_err(|_| Error::InvalidConsignment)?;
+        Ok(Self {
+            consignment,
+            txid,
+            vout,
+        })
+    }
 }
 
 /// Result of [`Wallet::accept_transfer_pinned`].
@@ -297,26 +313,6 @@ pub struct AcceptedTransfer {
     pub outpoint: Outpoint,
 }
 
-/// Fetch an RGB consignment by recipient_id (proxy lookup key), without a wallet: what
-/// [`Wallet::fetch_consignment_by_recipient_id_unchecked`] does, so it can run off the thread
-/// that owns the wallet.
-///
-/// **Unchecked:** `txid` and `vout` come from the proxy and are **not** validated here. Accept
-/// the result with [`Wallet::accept_transfer_pinned`], which pins the witness output first.
-///
-/// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
-#[cfg(feature = "_online")]
-pub fn fetch_consignment_by_recipient_id_unchecked(
-    recipient_id: String,
-    consignment_endpoint: &str,
-) -> Result<FetchedConsignment, Error> {
-    // proxy protocol 1.0 delivers consignments only for reserved invoices, through per-operation
-    // keys: a lookup by recipient ID (proxy 0.2) is gone, exchange HTLC consignments out of band
-    let _ = (recipient_id, consignment_endpoint);
-    Err(Error::Proxy {
-        details: s!("fetching a consignment by recipient ID is not supported by proxy protocol 1.0"),
-    })
-}
 
 /// What `fascia`'s transitions assign. Every owned-state type the wallet's schemas define is
 /// reported; any other is an error rather than left out.
@@ -1259,31 +1255,6 @@ impl Wallet {
         self.create_consignments_impl(psbt).map(|_| ())
     }
 
-    /// Fetch and accept a witness transfer through a proxy.
-    #[cfg(feature = "_online")]
-    pub fn accept_transfer(
-        &mut self,
-        online: Online,
-        txid: String,
-        vout: u32,
-        consignment_endpoint: &str,
-        blinding: u64,
-    ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
-        info!(self.logger(), "Accepting transfer...");
-        self.check_online(online)?;
-        let witness_id = RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;
-        let proxy_url = TransportEndpoint::new(consignment_endpoint.to_string())?.endpoint;
-
-        let consignment_res = self.get_consignment(&proxy_url, txid.clone())?;
-        let consignment_bytes = general_purpose::STANDARD
-            .decode(consignment_res.consignment)
-            .map_err(InternalError::from)?;
-        let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
-
-        let (consignment, assignments, _media_digests) =
-            self.accept_transfer_with_consignment(consignment, witness_id, vout, blinding, None)?;
-        Ok((consignment, assignments))
-    }
 
     fn create_consignments_impl(&self, psbt: String) -> Result<Vec<String>, Error> {
         info!(self.logger(), "Creating consignments...");
@@ -3696,34 +3667,13 @@ impl Wallet {
         Ok(meta.status)
     }
 
-    /// Fetch an RGB consignment by recipient_id (proxy lookup key).
-    ///
-    /// **Unchecked:** the returned `txid` and `vout` come from the proxy and are **not**
-    /// validated here. Prefer [`Self::fetch_and_accept_transfer_by_recipient_id`], which pins
-    /// the witness output before accept. If you must use this with
-    /// [`Self::accept_transfer_from_consignment_unchecked`], pin first: for witness recipient
-    /// IDs, assert `output[vout].script_pubkey == script_buf_from_recipient_id(recipient_id)`.
-    /// A malicious proxy can otherwise steer acceptance to an attacker-chosen witness.
-    ///
-    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
-    pub fn fetch_consignment_by_recipient_id_unchecked(
-        &self,
-        recipient_id: String,
-        consignment_endpoint: &str,
-    ) -> Result<(RgbTransfer, String, u32), Error> {
-        let fetched =
-            self::fetch_consignment_by_recipient_id_unchecked(recipient_id, consignment_endpoint)?;
-        Ok((fetched.consignment, fetched.txid, fetched.vout))
-    }
 
-    /// Fetch a consignment by proxy key, pin the witness output to `witness_recipient_id`, and
-    /// accept the transfer.
+    /// Accept an HTLC consignment received from the counterparty, pinning its witness output.
     ///
-    /// `proxy_recipient_id` is the proxy lookup key (often the witness TXID). `witness_recipient_id`
-    /// must be a witness recipient ID (`bc:wvout:...`) whose script is checked against
-    /// `output[vout]` on the witness transaction before acceptance. Blinded recipient IDs cannot
-    /// be pinned here; use the Rust-only [`Self::fetch_consignment_by_recipient_id_unchecked`] /
-    /// [`Self::accept_transfer_from_consignment_unchecked`] pair with your own pin check.
+    /// `consignment` is the base64-encoded transfer consignment, exchanged out of band (proxy
+    /// protocol 1.0 has no lookup by recipient ID). `witness_recipient_id` must be a witness
+    /// recipient ID (`bc:wvout:...`) whose script is checked against `output[vout]` of the witness
+    /// transaction `txid` before acceptance. Blinded recipient IDs cannot be pinned here.
     ///
     /// `expected` binds acceptance to the caller's intended contract, schema, assignment type, and
     /// amount; mismatches and empty assignment results are rejected.
@@ -3733,24 +3683,23 @@ impl Wallet {
     /// witness with at least that many confirmations (`tip - mined_height + 1`).
     ///
     /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
-    pub fn fetch_and_accept_transfer_by_recipient_id(
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_htlc_consignment(
         &mut self,
         online: Online,
-        proxy_recipient_id: String,
+        consignment: String,
+        txid: String,
+        vout: u32,
         witness_recipient_id: String,
-        consignment_endpoint: &str,
         blinding: u64,
         min_confirmations: u8,
         expected: ExpectedTransfer,
     ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
         self.check_online(online)?;
-        let fetched = self::fetch_consignment_by_recipient_id_unchecked(
-            proxy_recipient_id,
-            consignment_endpoint,
-        )?;
+        let received = ReceivedConsignment::from_base64(&consignment, txid, vout)?;
         let accepted = self.accept_transfer_pinned(
             online,
-            fetched,
+            received,
             witness_recipient_id,
             blinding,
             min_confirmations,
@@ -3759,11 +3708,11 @@ impl Wallet {
         Ok((accepted.consignment, accepted.assignments))
     }
 
-    /// Accept a consignment fetched with [`fetch_consignment_by_recipient_id_unchecked`]: pin
+    /// Accept a consignment received from the counterparty ([`ReceivedConsignment`]): pin
     /// `output[vout]` of the witness transaction to `witness_recipient_id` with at least
     /// `min_confirmations`, check the transfer matches `expected`, and accept it.
     ///
-    /// [`Self::fetch_and_accept_transfer_by_recipient_id`] is the fetch followed by this. Neither
+    /// [`Self::accept_htlc_consignment`] is the base64 decode followed by this. Neither
     /// saves the asset: a wallet that never held it calls [`Self::save_new_asset`] before coloring
     /// a spend of the received allocation.
     ///
@@ -3772,7 +3721,7 @@ impl Wallet {
     pub fn accept_transfer_pinned(
         &mut self,
         online: Online,
-        fetched: FetchedConsignment,
+        received: ReceivedConsignment,
         witness_recipient_id: String,
         blinding: u64,
         min_confirmations: u8,
@@ -3785,19 +3734,19 @@ impl Wallet {
             self.indexer(),
             self.chain_net(),
             &witness_recipient_id,
-            &fetched.txid,
-            fetched.vout,
+            &received.txid,
+            received.vout,
             min_confirmations,
         )?;
         let outpoint = Outpoint {
-            txid: fetched.txid.clone(),
-            vout: fetched.vout,
+            txid: received.txid.clone(),
+            vout: received.vout,
         };
         let (consignment, assignments) = self.accept_transfer_from_consignment_unchecked(
             online,
-            fetched.consignment,
-            fetched.txid,
-            fetched.vout,
+            received.consignment,
+            received.txid,
+            received.vout,
             blinding,
             expected,
         )?;
@@ -3809,12 +3758,12 @@ impl Wallet {
         })
     }
 
-    /// Accept an RGB transfer from a pre-fetched consignment.
+    /// Accept an RGB transfer from a consignment received out of band.
     ///
     /// **Unchecked:** `txid` and `vout` define the witness anchor used for validation but are
     /// not re-checked against a recipient ID or the blockchain. Prefer
-    /// [`Self::fetch_and_accept_transfer_by_recipient_id`]. If composing manually, pin first
-    /// (see [`Self::fetch_consignment_by_recipient_id_unchecked`]).
+    /// [`Self::accept_htlc_consignment`]. If composing manually, pin first (see
+    /// [`Self::accept_transfer_pinned`]).
     ///
     /// `expected` must match the consignment contract, schema, and the single assignment revealed
     /// for `(txid, vout, blinding)`; empty or mismatched assignments are rejected before the

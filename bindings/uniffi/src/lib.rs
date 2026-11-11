@@ -227,7 +227,7 @@ pub struct AcceptTransferResult {
     pub assignments: Vec<Assignment>,
 }
 
-/// Caller intent for `fetch_and_accept_transfer_by_recipient_id`.
+/// Caller intent for `accept_htlc_consignment`.
 pub struct ExpectedTransfer {
     pub asset_id: String,
     pub asset_schema: AssetSchema,
@@ -1654,23 +1654,26 @@ impl Wallet {
             .collect())
     }
 
-    fn fetch_and_accept_transfer_by_recipient_id(
+    #[allow(clippy::too_many_arguments)]
+    fn accept_htlc_consignment(
         &self,
         online: Online,
-        proxy_recipient_id: String,
+        consignment: String,
+        txid: String,
+        vout: u32,
         witness_recipient_id: String,
-        consignment_endpoint: String,
         blinding: u64,
         min_confirmations: u8,
         expected: ExpectedTransfer,
     ) -> Result<AcceptTransferResult, RgbLibError> {
         let (transfer, assignments) = self
             ._get_wallet()
-            .fetch_and_accept_transfer_by_recipient_id(
+            .accept_htlc_consignment(
                 online,
-                proxy_recipient_id,
+                consignment,
+                txid,
+                vout,
                 witness_recipient_id,
-                &consignment_endpoint,
                 blinding,
                 min_confirmations,
                 expected.into(),
@@ -2117,7 +2120,6 @@ impl Wallet {
         maker_receives: OnchainSwapLeg,
         network_fee_sat: u64,
         expiration_timestamp: Option<u64>,
-        proxy_url: Option<String>,
         extra_outputs: Vec<OnchainSwapExtraOutput>,
     ) -> Result<OnchainSwapOffer, RgbLibError> {
         self._get_wallet().create_swap_offer(
@@ -2125,7 +2127,6 @@ impl Wallet {
             maker_receives,
             network_fee_sat,
             expiration_timestamp,
-            proxy_url,
             extra_outputs,
         )
     }

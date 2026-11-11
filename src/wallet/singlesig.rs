@@ -12,13 +12,12 @@ use super::offline::{
     swap_load_state, swap_mpc_entropy, swap_random_blinding, swap_require_rgb_destination,
     swap_restore_input_metadata, swap_save_state, swap_side_rgb_output_cost, swap_state_path,
     swap_tx_fee, swap_validate_extra_outputs, swap_validate_legs, swap_validate_proposal_psbt,
-    swap_validate_proxy_url,
 };
 #[cfg(feature = "_online")]
 use super::online::{
     SwapRgbSend, swap_accept_transfer_from_file, swap_color_rgb_leg, swap_emit_asset_history,
     swap_ensure_inputs_confirmed, swap_ensure_inputs_foreign, swap_ensure_inputs_unspent,
-    swap_fetch_consignment_to_file, swap_finalize_psbt, swap_finalize_psbt_required,
+    swap_write_consignment_to_file, swap_finalize_psbt, swap_finalize_psbt_required,
     swap_import_asset_history, swap_input_rgb_amounts, swap_prepare_rgb_leg, swap_select_inputs,
     swap_sign_psbt, swap_stage_rgb_leg, swap_validate_fascia_received_leg,
     swap_validate_received_swap_leg, swap_validate_received_transfer,
@@ -1708,9 +1707,8 @@ impl Wallet {
     ///
     /// The maker specifies what they give (`maker_gives`) and what they want in return
     /// (`maker_receives`). `network_fee_sat` is the total miner fee the taker will reserve in
-    /// the swap transaction. `proxy_url` is required; consignments produced during the swap are
-    /// posted there so the counterparty can fetch them, and it is also used to publish the current
-    /// asset history so the taker can validate the asset before accepting.
+    /// the swap transaction. Consignments produced during the swap, and the current asset history
+    /// the taker validates before accepting, travel inside the swap messages.
     ///
     /// `extra_outputs` are further Bitcoin outputs the swap transaction pays, such as a fee owed
     /// to a third party. Each names the side that funds it. The offer commits to them, so the
@@ -1724,7 +1722,6 @@ impl Wallet {
         maker_receives: OnchainSwapLeg,
         network_fee_sat: u64,
         expiration_timestamp: Option<u64>,
-        proxy_url: Option<String>,
         extra_outputs: Vec<OnchainSwapExtraOutput>,
     ) -> Result<OnchainSwapOffer, Error> {
         info!(self.logger(), "Creating on-chain swap offer...");
@@ -1735,7 +1732,6 @@ impl Wallet {
             maker_receives,
             network_fee_sat,
             expiration_timestamp,
-            proxy_url,
             extra_outputs,
         )?;
         swap_save_state(self.wallet_dir(), &offer.swap_id, SWAP_OFFER_FILE, &offer)?;
@@ -1763,7 +1759,6 @@ impl Wallet {
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
         swap_validate_legs(&offer.maker_gives, &offer.maker_receives)?;
-        swap_validate_proxy_url(&offer.proxy_url)?;
         swap_ensure_not_expired(&offer)?;
         if offer.bitcoin_network != self.bitcoin_network() {
             return Err(Error::BitcoinNetworkMismatch);
@@ -1870,7 +1865,6 @@ impl Wallet {
             swap_load_state(self.wallet_dir(), &offer.swap_id, SWAP_OFFER_FILE)?;
         swap_ensure_state_matches(&local_offer, &offer, "offer")?;
         let direction = swap_validate_legs(&offer.maker_gives, &offer.maker_receives)?;
-        swap_validate_proxy_url(&offer.proxy_url)?;
         swap_ensure_not_expired(&offer)?;
         if offer.bitcoin_network != self.bitcoin_network() {
             return Err(Error::BitcoinNetworkMismatch);
@@ -1932,7 +1926,6 @@ impl Wallet {
                 self,
                 &offer.maker_gives,
                 &proposal.maker_inputs,
-                offer.proxy_url.as_deref(),
                 &offer.swap_id,
             )?;
             let send = SwapRgbSend {
@@ -1958,7 +1951,6 @@ impl Wallet {
                         self,
                         &mut psbt,
                         &send,
-                        offer.proxy_url.as_deref(),
                         &offer.swap_id,
                         offer.expiration_timestamp,
                     )?;
@@ -2028,7 +2020,6 @@ impl Wallet {
             swap_load_state(self.wallet_dir(), &offer.swap_id, SWAP_REQUEST_FILE)?;
         swap_ensure_state_matches(&local_request, &proposal.request, "request")?;
         let direction = swap_validate_legs(&offer.maker_gives, &offer.maker_receives)?;
-        swap_validate_proxy_url(&offer.proxy_url)?;
         swap_ensure_not_expired(offer)?;
         if offer.bitcoin_network != self.bitcoin_network() {
             return Err(Error::BitcoinNetworkMismatch);
@@ -2079,7 +2070,6 @@ impl Wallet {
                     self,
                     &mut psbt,
                     &taker_send,
-                    offer.proxy_url.as_deref(),
                     &offer.swap_id,
                     offer.expiration_timestamp,
                 )?;
@@ -2118,7 +2108,6 @@ impl Wallet {
                     self,
                     &offer.maker_receives,
                     &proposal.request.taker_inputs,
-                    offer.proxy_url.as_deref(),
                     &offer.swap_id,
                 )?;
                 swap_stage_rgb_leg(self, &mut psbt, &taker_send)?;
@@ -2175,7 +2164,6 @@ impl Wallet {
                     &psbt,
                     &fascia,
                     &taker_send,
-                    offer.proxy_url.as_deref(),
                     &offer.swap_id,
                     offer.expiration_timestamp,
                 )?;
@@ -2238,7 +2226,6 @@ impl Wallet {
             swap_load_state(self.wallet_dir(), &offer.swap_id, SWAP_PROPOSAL_FILE)?;
         swap_ensure_state_matches(&local_proposal, &completion.proposal, "proposal")?;
         let direction = swap_validate_legs(&offer.maker_gives, &offer.maker_receives)?;
-        swap_validate_proxy_url(&offer.proxy_url)?;
         // the maker signs last: never sign a swap whose offer has expired
         swap_ensure_not_expired(&offer)?;
         let mut psbt = Psbt::from_str(&completion.psbt)?;
@@ -2411,7 +2398,6 @@ impl Wallet {
                     &psbt,
                     &fascia,
                     &maker_send,
-                    offer.proxy_url.as_deref(),
                     &offer.swap_id,
                     offer.expiration_timestamp,
                 )?;
@@ -2457,7 +2443,6 @@ impl Wallet {
         self.check_online(online)?;
         let offer = &completion.proposal.request.offer;
         swap_validate_legs(&offer.maker_gives, &offer.maker_receives)?;
-        swap_validate_proxy_url(&offer.proxy_url)?;
         let finalized_psbt = completion
             .finalized_psbt
             .as_deref()
@@ -3211,7 +3196,6 @@ impl Wallet {
         info!(self.logger(), "Accepting on-chain swap transfers...");
         self.check_online(online)?;
         let offer = &completion.proposal.request.offer;
-        swap_validate_proxy_url(&offer.proxy_url)?;
         self.swap_apply_witness_tx(&completion)?;
         self.swap_apply_outgoing(online, &offer.swap_id, &completion.txid)?;
         let txn = self.database().begin_transaction()?;
@@ -3244,7 +3228,7 @@ impl Wallet {
             return Err(swap_invalid("missing RGB swap consignment"));
         }
         for consignment in matching_consignments {
-            let local_path = swap_fetch_consignment_to_file(self, consignment)?;
+            let local_path = swap_write_consignment_to_file(self, consignment)?;
             let mut accepted = swap_accept_transfer_from_file(
                 self,
                 &txn,

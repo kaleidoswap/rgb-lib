@@ -2108,10 +2108,8 @@ pub struct OnchainSwapLeg {
 pub struct OnchainSwapConsignment {
     /// RGB asset ID
     pub asset_id: String,
-    /// Local consignment cache path, empty for proxy-delivered swap payloads
-    pub path: String,
-    /// Proxy transport endpoint used to retrieve the consignment
-    pub endpoint: Option<String>,
+    /// The consignment, base64-encoded: swap consignments travel inside the swap messages
+    pub consignment: String,
     /// Witness transaction ID
     pub txid: String,
     /// Witness vout receiving the RGB assignment
@@ -2119,13 +2117,12 @@ pub struct OnchainSwapConsignment {
     /// Seal blinding needed by the receiver
     #[serde(deserialize_with = "from_str_or_number_mandatory")]
     pub blinding: u64,
-    /// Proxy lookup key (the receiver's RGB recipient ID). Distinct per consignment so that
-    /// RGB-for-RGB swaps with two consignments under the same witness transaction do not collide
-    /// in the proxy server's keyspace.
+    /// The receiver's RGB recipient ID, distinct per consignment so that the two consignments of
+    /// an RGB-for-RGB swap under the same witness transaction do not collide
     pub recipient_id: String,
 }
 
-/// History of the RGB allocations a swap party gives, posted to the proxy for the counterparty.
+/// History of the RGB allocations a swap party gives, sent to the counterparty.
 ///
 /// It is a transfer consignment exported from the giver's stash, leading from genesis to the
 /// allocations on the giver's declared inputs. The counterparty validates it and imports it into
@@ -2136,11 +2133,9 @@ pub struct OnchainSwapConsignment {
 pub struct OnchainSwapAssetHistory {
     /// RGB asset ID
     pub asset_id: String,
-    /// Local history cache path, empty for proxy-delivered swap payloads
-    pub path: String,
-    /// Proxy transport endpoint used to retrieve the history file
-    pub endpoint: Option<String>,
-    /// Proxy lookup key
+    /// The history consignment, base64-encoded
+    pub consignment: String,
+    /// Identifier of the history within the swap
     pub recipient_id: String,
 }
 
@@ -2202,8 +2197,6 @@ pub struct OnchainSwapOffer {
     pub maker_rgb_script_pubkey_hex: Option<String>,
     /// Maker RGB receive blinding, present if maker receives RGB
     pub maker_rgb_blinding: Option<u64>,
-    /// Required proxy URL for consignment and asset-history delivery
-    pub proxy_url: Option<String>,
     /// Additional Bitcoin outputs the swap transaction pays, each funded by one side
     #[serde(default)]
     pub extra_outputs: Vec<OnchainSwapExtraOutput>,
