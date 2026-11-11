@@ -7,6 +7,8 @@ fn success() {
     initialize();
 
     let amount: u64 = 66;
+    // allow operations expiring within seconds
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(1));
     let expiration_secs = 60i64;
 
     // wallets
@@ -26,6 +28,9 @@ fn success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -39,8 +44,11 @@ fn success() {
     assert!(!txid.is_empty());
     let (transfer, _, _) = party.get_test_transfer_sender(&txid);
     let tte_data = party.db_transfer_transport_endpoints_data(transfer.idx);
-    assert_eq!(tte_data.len(), 1);
-    let ce = tte_data.first().unwrap();
+    // v1.0: outgoing transfers also store the sender's own proxy endpoint, so filter to the used
+    // (recipient) one
+    let used_tte: Vec<_> = tte_data.iter().filter(|(t, _)| t.used).collect();
+    assert_eq!(used_tte.len(), 1);
+    let ce = used_tte.first().unwrap();
     assert_eq!(ce.1.endpoint, PROXY_URL);
     assert!(ce.0.used);
     let (transfer_data, _) = party.get_test_transfer_data(&transfer);
@@ -105,8 +113,8 @@ fn success() {
     assert!(rcv_asset_transfer.user_driven);
     assert!(asset_transfer.user_driven);
 
-    // after a refresh the receiver waits for the broadcast while the sender, once it sees the ACK,
-    // broadcasts and progresses to WaitingConfirmations
+    // transfers progress to status WaitingConfirmations after a refresh (v1.0: the recipient's ACK
+    // releases the TX, which it then decrypts and broadcasts)
     std::thread::sleep(Duration::from_millis(1000)); // make sure updated_at will be at least +1s
     rcv_party.wait_for_refresh(None);
     let rcv_transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
@@ -115,7 +123,10 @@ fn success() {
     let (transfer, _, _) = party.get_test_transfer_sender(&txid);
     let (transfer_data, _) = party.get_test_transfer_data(&transfer);
 
-    assert_eq!(rcv_transfer_data.status, TransferStatus::WaitingBroadcast);
+    assert_eq!(
+        rcv_transfer_data.status,
+        TransferStatus::WaitingConfirmations
+    );
     assert_eq!(transfer_data.status, TransferStatus::WaitingConfirmations);
     // ack is now true on the sender side
     assert_eq!(transfer.ack, Some(true));
@@ -189,6 +200,9 @@ fn success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data_api_proto.recipient_id.clone(),
+            public_key: Some(receive_data_api_proto.public_key.clone()),
+            expiration_timestamp: Some(receive_data_api_proto.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints,
         }],
@@ -212,20 +226,17 @@ fn success() {
     assert!(!ce_0.0.used);
     assert!(!ce_1.0.used);
     assert!(ce_2.0.used);
+    let transfer_id = transfer.proxy_transfer_id.clone().unwrap();
     let proxy_client_mod_api = get_proxy_client(Some(PROXY_URL_MOD_API));
-    let consignment = proxy_client_mod_api
-        .get_consignment(&receive_data_api_proto.recipient_id)
-        .unwrap();
+    let consignment = proxy_client_mod_api.get_consignment(&transfer_id).unwrap();
     assert!(consignment.error.is_some());
     let proxy_client_mod_proto = get_proxy_client(Some(PROXY_URL_MOD_PROTO));
     let consignment = proxy_client_mod_proto
-        .get_consignment(&receive_data_api_proto.recipient_id)
+        .get_consignment(&transfer_id)
         .unwrap();
     assert!(consignment.error.is_some());
     let proxy_client = get_proxy_client(Some(PROXY_URL));
-    let consignment = proxy_client
-        .get_consignment(&receive_data_api_proto.recipient_id)
-        .unwrap();
+    let consignment = proxy_client.get_consignment(&transfer_id).unwrap();
     assert!(consignment.result.is_some());
     // settle transfer
     rcv_party.wait_for_refresh(None);
@@ -259,6 +270,9 @@ fn success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data_invalid_unreachable.recipient_id.clone(),
+            public_key: Some(receive_data_invalid_unreachable.public_key.clone()),
+            expiration_timestamp: Some(receive_data_invalid_unreachable.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints,
         }],
@@ -282,13 +296,12 @@ fn success() {
     assert!(!ce_0.0.used);
     assert!(!ce_1.0.used);
     assert!(ce_2.0.used);
+    let transfer_id = transfer.proxy_transfer_id.clone().unwrap();
     let consignment = proxy_client_mod_proto
-        .get_consignment(&receive_data_invalid_unreachable.recipient_id)
+        .get_consignment(&transfer_id)
         .unwrap();
     assert!(consignment.error.is_some());
-    let consignment = proxy_client
-        .get_consignment(&receive_data_invalid_unreachable.recipient_id)
-        .unwrap();
+    let consignment = proxy_client.get_consignment(&transfer_id).unwrap();
     assert!(consignment.result.is_some());
     // settle transfer
     rcv_party.wait_for_refresh(None);
@@ -302,6 +315,82 @@ fn success() {
     let unspents = party.list_unspents(false);
     let unspents_color_count_after = unspents.iter().filter(|u| u.utxo.colorable).count();
     assert_eq!(unspents_color_count_after, unspents_color_count_before - 2);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn encryption_variants() {
+    initialize();
+
+    let amount: u64 = AMOUNT_SMALL;
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    // (recipient encryption preference, whether the consignment stored on the proxy must be encrypted)
+    for (encryption, expect_encrypted) in [
+        (Encryption::Required, true),
+        (Encryption::Unsupported, false),
+    ] {
+        let receive_data = rcv_party
+            .wallet
+            .blind_receive(
+                Some(rcv_party.online),
+                None,
+                Assignment::Any,
+                default_rcv_expiration(),
+                TRANSPORT_ENDPOINTS.clone(),
+                MIN_CONFIRMATIONS,
+                Some(encryption),
+            )
+            .unwrap();
+        let recipient_map = HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            }],
+        )]);
+        let txid = party.send(recipient_map, FEE_RATE, None).txid;
+        assert!(!txid.is_empty());
+
+        // the consignment stored on the proxy carries the encryption version prefix (0x01) only when
+        // the recipient's preference is not Unsupported (Required/Optional encrypt, Unsupported posts
+        // cleartext)
+        let consignment_b64 = get_proxy_client(Some(PROXY_URL))
+            .get_consignment(&party.transfer_id_sender(&txid))
+            .unwrap()
+            .result
+            .unwrap()
+            .consignment;
+        let consignment_bytes = general_purpose::STANDARD.decode(&consignment_b64).unwrap();
+        let is_encrypted = consignment_bytes.first() == Some(&ENC_VERSION);
+        assert_eq!(
+            is_encrypted, expect_encrypted,
+            "unexpected on-proxy encryption for {encryption:?}"
+        );
+
+        // the transfer settles end-to-end, proving the recipient reads the consignment with the
+        // matching scheme (decrypt for Required, raw for Unsupported)
+        rcv_party.wait_for_refresh(None);
+        party.wait_for_refresh(Some(&asset.asset_id));
+        mine(false);
+        rcv_party.wait_for_refresh(None);
+        party.wait_for_refresh(Some(&asset.asset_id));
+        assert!(rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Settled
+        ));
+        assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+    }
 }
 
 #[cfg(feature = "electrum")]
@@ -345,6 +434,9 @@ fn spend_all() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -396,7 +488,10 @@ fn spend_all() {
     assert_eq!(transfers_for_asset.len(), 1);
     let transfer = transfers_for_asset.first().unwrap();
     let (transfer_data, _) = party.get_test_transfer_data(transfer);
-    assert_eq!(rcv_transfer_data.status, TransferStatus::WaitingBroadcast);
+    assert_eq!(
+        rcv_transfer_data.status,
+        TransferStatus::WaitingConfirmations
+    );
     assert_eq!(transfer_data.status, TransferStatus::WaitingConfirmations);
 
     // transfers progress to status Settled after tx mining + refresh
@@ -459,6 +554,9 @@ fn send_twice_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_1),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -512,6 +610,9 @@ fn send_twice_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_2),
             recipient_id: receive_data_2.recipient_id.clone(),
+            public_key: Some(receive_data_2.public_key.clone()),
+            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -612,6 +713,9 @@ fn send_extra_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_1),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -695,6 +799,9 @@ fn send_extra_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_2),
             recipient_id: receive_data_1b.recipient_id.clone(),
+            public_key: Some(receive_data_1b.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1b.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -790,6 +897,9 @@ fn send_extra_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_3),
             recipient_id: receive_data_2.recipient_id.clone(),
+            public_key: Some(receive_data_2.public_key.clone()),
+            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -880,6 +990,9 @@ fn send_extra_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_4),
             recipient_id: receive_data_4.recipient_id.clone(),
+            public_key: Some(receive_data_4.public_key.clone()),
+            expiration_timestamp: Some(receive_data_4.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -985,6 +1098,9 @@ fn send_extra_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_5),
             recipient_id: receive_data_5.recipient_id.clone(),
+            public_key: Some(receive_data_5.public_key.clone()),
+            expiration_timestamp: Some(receive_data_5.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -1041,6 +1157,9 @@ fn send_extra_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(supply_nia),
             recipient_id: receive_data_6.recipient_id.clone(),
+            public_key: Some(receive_data_6.public_key.clone()),
+            expiration_timestamp: Some(receive_data_6.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -1120,6 +1239,9 @@ fn send_received_success() {
             vec![Recipient {
                 assignment: Assignment::Fungible(amount_1a),
                 recipient_id: receive_data_a20.recipient_id.clone(),
+                public_key: Some(receive_data_a20.public_key.clone()),
+                expiration_timestamp: Some(receive_data_a20.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             }],
@@ -1129,6 +1251,9 @@ fn send_received_success() {
             vec![Recipient {
                 assignment: Assignment::Fungible(amount_1b),
                 recipient_id: receive_data_a25.recipient_id.clone(),
+                public_key: Some(receive_data_a25.public_key.clone()),
+                expiration_timestamp: Some(receive_data_a25.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             }],
@@ -1216,6 +1341,9 @@ fn send_received_success() {
             vec![Recipient {
                 assignment: Assignment::Fungible(amount_2a),
                 recipient_id: receive_data_b20.recipient_id.clone(),
+                public_key: Some(receive_data_b20.public_key.clone()),
+                expiration_timestamp: Some(receive_data_b20.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             }],
@@ -1225,6 +1353,9 @@ fn send_received_success() {
             vec![Recipient {
                 assignment: Assignment::Fungible(amount_2b),
                 recipient_id: receive_data_b25.recipient_id.clone(),
+                public_key: Some(receive_data_b25.public_key.clone()),
+                expiration_timestamp: Some(receive_data_b25.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             }],
@@ -1341,6 +1472,9 @@ fn send_received_uda_success() {
         vec![Recipient {
             assignment: Assignment::NonFungible,
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -1376,6 +1510,9 @@ fn send_received_uda_success() {
         vec![Recipient {
             assignment: Assignment::NonFungible,
             recipient_id: receive_data_2.recipient_id.clone(),
+            public_key: Some(receive_data_2.public_key.clone()),
+            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -1482,6 +1619,9 @@ fn send_received_cfa_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_1),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -1535,6 +1675,9 @@ fn send_received_cfa_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_2),
             recipient_id: receive_data_2.recipient_id.clone(),
+            public_key: Some(receive_data_2.public_key.clone()),
+            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -1631,12 +1774,18 @@ fn receive_multiple_same_asset_success() {
             Recipient {
                 assignment: Assignment::Fungible(amount_1),
                 recipient_id: receive_data_1.recipient_id.clone(),
+                public_key: Some(receive_data_1.public_key.clone()),
+                expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
             Recipient {
                 assignment: Assignment::Fungible(amount_2),
                 recipient_id: receive_data_2.recipient_id.clone(),
+                public_key: Some(receive_data_2.public_key.clone()),
+                expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
@@ -1781,8 +1930,14 @@ fn receive_multiple_same_asset_success() {
     let (transfer_data_1, _) = party.get_test_transfer_data(transfer_1);
     let (transfer_data_2, _) = party.get_test_transfer_data(transfer_2);
 
-    assert_eq!(rcv_transfer_data_1.status, TransferStatus::WaitingBroadcast);
-    assert_eq!(rcv_transfer_data_2.status, TransferStatus::WaitingBroadcast);
+    assert_eq!(
+        rcv_transfer_data_1.status,
+        TransferStatus::WaitingConfirmations
+    );
+    assert_eq!(
+        rcv_transfer_data_2.status,
+        TransferStatus::WaitingConfirmations
+    );
     assert_eq!(transfer_data_1.status, TransferStatus::WaitingConfirmations);
     assert_eq!(transfer_data_2.status, TransferStatus::WaitingConfirmations);
     // ack is now true on the sender side
@@ -1888,6 +2043,9 @@ fn receive_multiple_different_assets_success() {
             vec![Recipient {
                 assignment: Assignment::Fungible(amount_1),
                 recipient_id: receive_data_1.recipient_id.clone(),
+                public_key: Some(receive_data_1.public_key.clone()),
+                expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             }],
@@ -1897,6 +2055,9 @@ fn receive_multiple_different_assets_success() {
             vec![Recipient {
                 assignment: Assignment::Fungible(amount_2),
                 recipient_id: receive_data_2.recipient_id.clone(),
+                public_key: Some(receive_data_2.public_key.clone()),
+                expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             }],
@@ -2042,8 +2203,14 @@ fn receive_multiple_different_assets_success() {
     let (transfer_data_1, _) = party.get_test_transfer_data(transfer_1);
     let (transfer_data_2, _) = party.get_test_transfer_data(transfer_2);
 
-    assert_eq!(rcv_transfer_data_1.status, TransferStatus::WaitingBroadcast);
-    assert_eq!(rcv_transfer_data_2.status, TransferStatus::WaitingBroadcast);
+    assert_eq!(
+        rcv_transfer_data_1.status,
+        TransferStatus::WaitingConfirmations
+    );
+    assert_eq!(
+        rcv_transfer_data_2.status,
+        TransferStatus::WaitingConfirmations
+    );
     assert_eq!(transfer_data_1.status, TransferStatus::WaitingConfirmations);
     assert_eq!(transfer_data_2.status, TransferStatus::WaitingConfirmations);
     // ack is now true on the sender side
@@ -2194,12 +2361,18 @@ fn batch_donation_success() {
                 Recipient {
                     assignment: Assignment::Fungible(amount_a1),
                     recipient_id: receive_data_a1.recipient_id.clone(),
+                    public_key: Some(receive_data_a1.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_a1.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
                 Recipient {
                     assignment: Assignment::Fungible(amount_a2),
                     recipient_id: receive_data_a2.recipient_id.clone(),
+                    public_key: Some(receive_data_a2.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_a2.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
@@ -2211,12 +2384,18 @@ fn batch_donation_success() {
                 Recipient {
                     assignment: Assignment::Fungible(amount_b1),
                     recipient_id: receive_data_b1.recipient_id.clone(),
+                    public_key: Some(receive_data_b1.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_b1.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
                 Recipient {
                     assignment: Assignment::Fungible(amount_b2),
                     recipient_id: receive_data_b2.recipient_id.clone(),
+                    public_key: Some(receive_data_b2.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_b2.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
@@ -2232,6 +2411,7 @@ fn batch_donation_success() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap()
@@ -2347,13 +2527,15 @@ fn reuse_failed_blinded_success() {
     let asset = party.issue_asset_nia(None);
 
     // 1st transfer
-    let receive_data =
-        rcv_party.blind_receive_asset_expiry(None, Some((now().unix_timestamp() + 60) as u64));
+    let receive_data = rcv_party.blind_receive();
     let recipient_map = HashMap::from([(
         asset.asset_id.clone(),
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -2368,9 +2550,9 @@ fn reuse_failed_blinded_success() {
     // fail transfer so asset allocation can be spent again
     party.fail_transfers_single(send_result.batch_transfer_idx);
 
-    // 2nd transfer using the same blinded UTXO
+    // 2nd transfer to the same (single-use) invoice
     let result = party.send_result(&recipient_map);
-    assert!(matches!(result, Err(Error::RecipientIDAlreadyUsed)));
+    assert!(matches!(result, Err(Error::InvoiceQuotaExceeded)));
 }
 
 #[cfg(feature = "electrum")]
@@ -2398,12 +2580,18 @@ fn ack() {
             Recipient {
                 assignment: Assignment::Fungible(amount),
                 recipient_id: receive_data_1.recipient_id.clone(),
+                public_key: Some(receive_data_1.public_key.clone()),
+                expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
             Recipient {
                 assignment: Assignment::Fungible(amount),
                 recipient_id: receive_data_2.recipient_id.clone(),
+                public_key: Some(receive_data_2.public_key.clone()),
+                expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
@@ -2431,11 +2619,18 @@ fn ack() {
     ));
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
 
-    // ack from recipient 2 > its transfer status changes to WaitingBroadcast
+    // ack from recipient 2 (last) > the TX is released and recipient 2 broadcasts it
     rcv_party_2.wait_for_refresh(None);
     assert!(rcv_party_2.check_test_transfer_status_recipient(
         &receive_data_2.recipient_id,
-        TransferStatus::WaitingBroadcast
+        TransferStatus::WaitingConfirmations
+    ));
+
+    // recipient 1 refreshes again to retrieve the released TX and broadcast
+    rcv_party_1.wait_for_refresh(None);
+    assert!(rcv_party_1.check_test_transfer_status_recipient(
+        &receive_data_1.recipient_id,
+        TransferStatus::WaitingConfirmations
     ));
 
     // now sender can broadcast and move on to WaitingConfirmations
@@ -2465,6 +2660,9 @@ fn nack() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -2480,14 +2678,779 @@ fn nack() {
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
 
     // manually NACK the transfer (consignment is valid so refreshing receiver would yield an ACK)
+    let consignment_hash = party.consignment_hash_sender(&txid);
+    let transfer_id = party.transfer_id_sender(&txid);
+    let nack_sig = rcv_party.sign_proxy_ack(
+        &receive_data.recipient_id,
+        &transfer_id,
+        false,
+        &consignment_hash,
+    );
     let proxy_client = get_proxy_client(None);
     proxy_client
-        .post_ack(&receive_data.recipient_id, false)
+        .post_ack(&transfer_id, false, &nack_sig)
         .unwrap();
 
     // refreshing sender transfer now has it fail
     party.wait_for_refresh(Some(&asset.asset_id));
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
+}
+
+/// a NACK already recorded on the sender proxy for this recipient (only the recipient itself can
+/// post one, as ACKs are signed) makes the ACK fail with "cannot change": the sender will fail the
+/// operation, so the receive must be failed too instead of being left waiting
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn nack_pre_existing_receiver_fails() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingCounterparty
+    ));
+
+    // a NACK signed by the recipient is recorded on the proxy before the consignment is processed
+    let consignment_hash = party.consignment_hash_sender(&txid);
+    let transfer_id = party.transfer_id_sender(&txid);
+    let nack_sig = rcv_party.sign_proxy_ack(
+        &receive_data.recipient_id,
+        &transfer_id,
+        false,
+        &consignment_hash,
+    );
+    get_proxy_client(None)
+        .post_ack(&transfer_id, false, &nack_sig)
+        .unwrap();
+
+    // the receiver validates the consignment but its ACK is refused by the proxy: the sender will
+    // never see an ACK, so the receive must be failed rather than left waiting
+    rcv_party.wait_for_refresh(None);
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Failed
+        )
+    );
+
+    // the sender fails as usual
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn forged_ack_signature_rejected() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+
+    // a forged ACK signature (valid length, wrong bytes) is rejected by the proxy, which verifies it
+    // against the recipient pubkey registered at ack.prepare: a third party cannot forge an ACK
+    let forged_sig = "00".repeat(64);
+    let resp = get_proxy_client(None)
+        .post_ack(&party.transfer_id_sender(&txid), true, &forged_sig)
+        .unwrap();
+    let err = map_proxy_error(resp.error.expect("proxy must reject a forged signature"));
+    assert!(matches!(err, Error::InvalidContentSignature));
+
+    // the forged ACK was not stored, so the sender is not tricked into broadcasting
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
+}
+
+/// The sender proxy serves an ACK whose signature doesn't verify against the recipient pubkey
+/// (simulated by corrupting the pubkey the sender stored for the recipient): the sender trusts
+/// neither the ACK nor the proxy and, since the TX may have been released, cannot fail the
+/// transfer until its broadcast deadline (expiration plus the sender proxy retention grace) has
+/// passed on the proxy's clock too (`v1.0-changes-spec.md` 6.3).
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn invalid_ack_signature_fails_once_expired() {
+    initialize();
+
+    let amount: u64 = 66;
+    let skew_margin: u32 = 5;
+    let retention_grace: u32 = 10;
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(skew_margin));
+    MOCK_RETENTION_GRACE.replace(Some(retention_grace));
+    MOCK_MIN_RETENTION_GRACE.replace(Some(0));
+
+    let mut party = get_funded_party!();
+    let mut rcv_party_1 = get_funded_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    // batch send (2 recipients) with a short operation expiration: recipient 1 ACKs, recipient 2
+    // never responds, so the TX is never released nor broadcast
+    let receive_data_1 = rcv_party_1.blind_receive();
+    let receive_data_2 = rcv_party_2.blind_receive();
+    let expiration = now().unix_timestamp() + 20;
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![
+            Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data_1.recipient_id.clone(),
+                public_key: Some(receive_data_1.public_key.clone()),
+                expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            },
+            Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data_2.recipient_id.clone(),
+                public_key: Some(receive_data_2.public_key.clone()),
+                expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            },
+        ],
+    )]);
+    let send_result = party.send(recipient_map, FEE_RATE, Some(expiration as u64));
+    let txid = send_result.txid;
+    let batch_transfer_idx = send_result.batch_transfer_idx;
+    assert!(!txid.is_empty());
+
+    // corrupt the pubkey the sender stored for recipient 1, so its (genuine) ACK signature no
+    // longer verifies: from the sender's point of view the proxy serves a forged ACK
+    let txn = party.wallet.database().begin_transaction().unwrap();
+    let transfer_1 = txn
+        .iter_transfers()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.recipient_id.as_deref() == Some(receive_data_1.recipient_id.as_str()))
+        .unwrap();
+    let mut updated_transfer: DbTransferActMod = transfer_1.into();
+    updated_transfer.recipient_pubkey =
+        ActiveValue::Set(Some(hex::decode(&receive_data_2.public_key).unwrap()));
+    txn.update_transfer(&mut updated_transfer).unwrap();
+    txn.commit().unwrap();
+
+    // recipient 1 ACKs; the TX is not released as recipient 2 never responds
+    rcv_party_1.wait_for_refresh(None);
+    assert!(rcv_party_1.check_test_transfer_status_recipient(
+        &receive_data_1.recipient_id,
+        TransferStatus::WaitingBroadcast
+    ));
+
+    // before the expiration the sender reports the invalid signature and the transfer stays
+    // pending: it cannot be failed, as the proxy may have released the TX
+    let refresh_res = party.refresh_result(None, &[]).unwrap();
+    assert!(matches!(
+        refresh_res[&batch_transfer_idx].failure,
+        Some(Error::InvalidContentSignature)
+    ));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
+    let assert_cannot_fail_yet = |party: &mut SinglesigParty| {
+        let res = party.fail_transfers(Some(batch_transfer_idx), false, false);
+        assert!(
+            matches!(res, Err(Error::CannotFailBatchTransfer)),
+            "expected CannotFailBatchTransfer, got: {res:?}"
+        );
+        assert!(!party.fail_transfers_all());
+        assert!(
+            party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty)
+        );
+    };
+    assert_cannot_fail_yet(&mut party);
+    let sleep_until = |timestamp: i64| {
+        let sleep_secs = std::cmp::max(timestamp - now().unix_timestamp(), 0) as u64;
+        std::thread::sleep(Duration::from_secs(sleep_secs));
+    };
+
+    // past the expiration, on the proxy's clock too, it still cannot be failed, as the proxy may
+    // hand out a released TX until the end of its retention grace
+    sleep_until(expiration + i64::from(skew_margin) + 2);
+    let refresh_res = party.refresh_result(None, &[]).unwrap();
+    assert!(matches!(
+        refresh_res[&batch_transfer_idx].failure,
+        Some(Error::InvalidContentSignature)
+    ));
+    assert_cannot_fail_yet(&mut party);
+
+    // once the broadcast deadline has passed on the proxy's clock too, the TX (not on-chain) can no
+    // longer be handed out and the transfer is failed
+    sleep_until(expiration + i64::from(retention_grace) + i64::from(skew_margin) + 2);
+    let refresh_res = party.refresh_result(None, &[]).unwrap();
+    assert!(refresh_res[&batch_transfer_idx].failure.is_none());
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
+
+    // recipient 1 polls again: the proxy reports the operation expired and its transfer fails too
+    rcv_party_1.wait_for_refresh(None);
+    assert!(rcv_party_1.check_test_transfer_status_recipient(
+        &receive_data_1.recipient_id,
+        TransferStatus::Failed
+    ));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn recipient_refuses_tampered_consignment() {
+    initialize();
+
+    let mut rcv_party = get_funded_party!();
+
+    // the recipient advertises cleartext, so we can post arbitrary plaintext bytes whose SHA256 does
+    // not match the declared consignment_hash (the proxy stores the hash opaquely: it only ever sees
+    // ciphertext, so it cannot detect the mismatch - the recipient must)
+    let receive_data = rcv_party
+        .wallet
+        .blind_receive(
+            Some(rcv_party.online),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            TRANSPORT_ENDPOINTS.clone(),
+            MIN_CONFIRMATIONS,
+            Some(Encryption::Unsupported),
+        )
+        .unwrap();
+
+    let consignment_path = std::env::temp_dir().join("rgb_lib_tampered_consignment");
+    std::fs::write(&consignment_path, b"tampered consignment bytes").unwrap();
+    let bogus_hash = "00".repeat(32); // != SHA256(the bytes above)
+    // the sender proxy for the NACK has no operation for it, which is tolerated
+    post_test_consignment(
+        &get_proxy_client(None),
+        &receive_data.recipient_id,
+        &receive_data.public_key,
+        &consignment_path,
+        &bogus_hash,
+    );
+
+    // on refresh the recipient downloads it, the plaintext-hash check fails, and it refuses -> Failed
+    rcv_party.wait_for_refresh(None);
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Failed
+        )
+    );
+}
+
+/// A consignment paying someone else, posted to the invoice of the recipient (which anyone can do,
+/// the invoice being public), pays the recipient nothing, so it's refused.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn recipient_refuses_consignment_not_paying_it() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party_1 = get_funded_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    // issue
+    let asset = party.issue_asset_nia(None);
+
+    // send to rcv_party_1 and settle
+    let receive_data_1 = rcv_party_1.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![blind_recipient(
+            &receive_data_1,
+            Assignment::Fungible(amount),
+        )],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+    rcv_party_1.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    mine(false);
+    rcv_party_1.wait_for_refresh(Some(&asset.asset_id));
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+
+    // post the same consignment to the invoice of rcv_party_2 (which advertises cleartext, so the
+    // consignment can be posted as is)
+    let receive_data_2 = rcv_party_2
+        .wallet
+        .blind_receive(
+            Some(rcv_party_2.online),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            TRANSPORT_ENDPOINTS.clone(),
+            MIN_CONFIRMATIONS,
+            Some(Encryption::Unsupported),
+        )
+        .unwrap();
+    let consignment_path = party
+        .wallet
+        .get_send_consignment_path(&asset.asset_id, &txid);
+    let (_, transfer_id) = post_test_consignment(
+        &get_proxy_client(None),
+        &receive_data_2.recipient_id,
+        &receive_data_2.public_key,
+        &consignment_path,
+        &hash_bytes_hex(&std::fs::read(&consignment_path).unwrap()),
+    );
+
+    // rcv_party_2 downloads the consignment and refuses it, receiving nothing: the consignment is
+    // genuine, carries the hash it's posted with, comes from a valid sender key and is of a schema
+    // the any-asset invoice accepts, so the only check left to refuse it is the one looking for a
+    // terminal paying the recipient (the refusal reason isn't observable otherwise, as the NACK
+    // finds no operation on the sender proxy)
+    rcv_party_2.wait_for_refresh(None);
+    let transfer = rcv_party_2.get_test_transfer_recipient(&receive_data_2.recipient_id);
+    assert_eq!(transfer.proxy_transfer_id, Some(transfer_id));
+    assert!(rcv_party_2.check_test_transfer_status_recipient(
+        &receive_data_2.recipient_id,
+        TransferStatus::Failed
+    ));
+    assert!(rcv_party_2.list_unspents(false).iter().all(|u| {
+        u.rgb_allocations
+            .iter()
+            .all(|a| a.asset_id.as_ref() != Some(&asset.asset_id))
+    }));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn recipient_operation_expired() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    let mut party = get_funded_party!();
+    let mut rcv_party_1 = get_funded_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data_1 = rcv_party_1.blind_receive();
+    let receive_data_2 = rcv_party_2.blind_receive();
+    // batch send (2 recipients) with a short operation expiration
+    // allow operations expiring within seconds
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(1));
+    let expiration = (now().unix_timestamp() + 20) as u64;
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![
+            Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data_1.recipient_id.clone(),
+                public_key: Some(receive_data_1.public_key.clone()),
+                expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            },
+            Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data_2.recipient_id.clone(),
+                public_key: Some(receive_data_2.public_key.clone()),
+                expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            },
+        ],
+    )]);
+    let txid = party.send(recipient_map, FEE_RATE, Some(expiration)).txid;
+    assert!(!txid.is_empty());
+
+    // recipient 1 ACKs but recipient 2 does not, so the TX is not released: recipient 1 sits in
+    // WaitingBroadcast
+    rcv_party_1.wait_for_refresh(None);
+    assert!(rcv_party_1.check_test_transfer_status_recipient(
+        &receive_data_1.recipient_id,
+        TransferStatus::WaitingBroadcast
+    ));
+
+    // wait for the operation to expire on the proxy
+    let sleep_secs = std::cmp::max(expiration as i64 - now().unix_timestamp() + 2, 0) as u64;
+    std::thread::sleep(Duration::from_secs(sleep_secs));
+
+    // recipient 1 polls again: the proxy reports the operation expired (-105) and the transfer fails
+    rcv_party_1.wait_for_refresh(None);
+    assert!(rcv_party_1.check_test_transfer_status_recipient(
+        &receive_data_1.recipient_id,
+        TransferStatus::Failed
+    ));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn sender_expired_after_recipient_ack() {
+    initialize();
+
+    let amount: u64 = 66;
+    let skew_margin: u32 = 5;
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(skew_margin));
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let expiration = (now().unix_timestamp() + 20) as u64;
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send(recipient_map, FEE_RATE, Some(expiration)).txid;
+    assert!(!txid.is_empty());
+
+    // the recipient ACKs before the expiration: the proxy releases the TX, which gets broadcast
+    rcv_party.wait_for_refresh(None);
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+
+    // the sender only learns about the ACK after the expiration (passed on the proxy's clock too)
+    let sleep_secs = std::cmp::max(
+        expiration as i64 + i64::from(skew_margin) - now().unix_timestamp() + 2,
+        0,
+    ) as u64;
+    std::thread::sleep(Duration::from_secs(sleep_secs));
+
+    // the TX has been released, so the expired transfer must not be failed: it progresses instead
+    party.fail_transfers_all();
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+
+    // the transfer settles on both sides
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(None);
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Settled
+        )
+    );
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+}
+
+/// The sender proxy drops its data (e.g. a reset) while outgoing operations are pending: ack.get
+/// reports them as unknown, which the sender tolerates by resolving each one via the chain. An
+/// operation whose TX is not on-chain can only be failed once its broadcast deadline (expiration
+/// plus the sender proxy retention grace) has passed on the proxy's clock too
+/// (`v1.0-changes-spec.md` 6.2).
+#[cfg(feature = "electrum")]
+#[test]
+#[serial]
+fn sender_proxy_lost_operation() {
+    initialize();
+
+    let amount: u64 = 66;
+    let skew_margin: u32 = 15;
+    let retention_grace: u32 = 10;
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(skew_margin));
+    MOCK_RETENTION_GRACE.replace(Some(retention_grace));
+    MOCK_MIN_RETENTION_GRACE.replace(Some(0));
+    let sleep_until = |timestamp: i64| {
+        let sleep_secs = std::cmp::max(timestamp - now().unix_timestamp(), 0) as u64;
+        std::thread::sleep(Duration::from_secs(sleep_secs));
+    };
+
+    let mut party = get_funded_party!();
+    let mut rcv_party_1 = get_funded_party!();
+    let mut rcv_party_2 = get_funded_party!();
+    let mut rcv_party_3 = get_funded_party!();
+
+    // one asset per transfer, as the change of a pending transfer is not spendable yet
+    let asset_1 = party.issue_asset_nia(None);
+    let asset_2 = party.issue_asset_nia(None);
+    let asset_3 = party.issue_asset_nia(None);
+
+    // transfer 1: the recipient ACKs, obtains the TX and broadcasts it, before the sender
+    // retrieves the ACK
+    let receive_data_1 = rcv_party_1.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset_1.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid_1 = party.send_retry(&recipient_map);
+    assert!(!txid_1.is_empty());
+    rcv_party_1.wait_for_refresh(None);
+    assert!(rcv_party_1.check_test_transfer_status_recipient(
+        &receive_data_1.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+
+    // transfers 2 and 3: the recipients never respond, so their TXs are never released nor
+    // broadcast; both have a short operation expiration
+    let expiration = now().unix_timestamp() + 30;
+    let mut send_unanswered = |asset_id: &str, rcv_party: &mut SinglesigParty| {
+        let receive_data = rcv_party.blind_receive();
+        let recipient_map = HashMap::from([(
+            asset_id.to_string(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            }],
+        )]);
+        let txid = party
+            .send(recipient_map, FEE_RATE, Some(expiration as u64))
+            .txid;
+        assert!(!txid.is_empty());
+        txid
+    };
+    let txid_2 = send_unanswered(&asset_2.asset_id, &mut rcv_party_2);
+    let txid_3 = send_unanswered(&asset_3.asset_id, &mut rcv_party_3);
+
+    // the sender proxy loses all operations
+    reset_proxy();
+
+    // transfer 1 (TX on-chain): failing it is denied, as its TX is found on-chain and the
+    // transfer progresses instead
+    let (_, _, batch_transfer_1) = party.get_test_transfer_sender(&txid_1);
+    let res = party.fail_transfers(Some(batch_transfer_1.idx), false, false);
+    assert!(
+        matches!(res, Err(Error::CannotFailBatchTransfer)),
+        "expected CannotFailBatchTransfer, got: {res:?}"
+    );
+    assert!(party.check_test_transfer_status_sender(&txid_1, TransferStatus::WaitingConfirmations));
+
+    // transfers 2 and 3 (TX not on-chain): the refresh reports the unknown operation and leaves
+    // them pending
+    let (_, _, batch_transfer_2) = party.get_test_transfer_sender(&txid_2);
+    let (_, _, batch_transfer_3) = party.get_test_transfer_sender(&txid_3);
+    let refresh_res = party.refresh_result(None, &[]).unwrap();
+    assert_matches!(
+        refresh_res[&batch_transfer_2.idx].failure,
+        Some(Error::OperationNotFound)
+    );
+    assert_matches!(
+        refresh_res[&batch_transfer_3.idx].failure,
+        Some(Error::OperationNotFound)
+    );
+    assert!(party.check_test_transfer_status_sender(&txid_2, TransferStatus::WaitingCounterparty));
+    assert!(party.check_test_transfer_status_sender(&txid_3, TransferStatus::WaitingCounterparty));
+    let assert_cannot_fail_yet = |party: &mut SinglesigParty| {
+        let res = party.fail_transfers(Some(batch_transfer_2.idx), false, false);
+        assert!(
+            matches!(res, Err(Error::CannotFailBatchTransfer)),
+            "expected CannotFailBatchTransfer, got: {res:?}"
+        );
+        assert!(!party.fail_transfers_all());
+        assert!(
+            party.check_test_transfer_status_sender(&txid_2, TransferStatus::WaitingCounterparty)
+        );
+        assert!(
+            party.check_test_transfer_status_sender(&txid_3, TransferStatus::WaitingCounterparty)
+        );
+    };
+
+    // before the expiration they cannot be failed: the proxy might recover the operations and
+    // release the TXs until then
+    assert!(
+        now().unix_timestamp() < expiration,
+        "the operations expired before the check: the test setup took longer than the expiration \
+        margin, use a later expiration"
+    );
+    assert_cannot_fail_yet(&mut party);
+
+    // past the expiration, on the proxy's clock too, they still cannot be failed: the proxy might
+    // recover the operations and hand out the released TXs until the end of its retention grace
+    sleep_until(expiration + i64::from(skew_margin) + 2);
+    assert_cannot_fail_yet(&mut party);
+
+    // once the broadcast deadline has passed on the proxy's clock too, nothing is left to wait for
+    // and they can be failed, both deliberately and as expired
+    sleep_until(expiration + i64::from(retention_grace) + i64::from(skew_margin) + 2);
+    assert!(party.fail_transfers_single(batch_transfer_2.idx));
+    assert!(party.check_test_transfer_status_sender(&txid_2, TransferStatus::Failed));
+    assert!(party.fail_transfers_all());
+    assert!(party.check_test_transfer_status_sender(&txid_3, TransferStatus::Failed));
+
+    // transfer 1 settles on both sides
+    mine(false);
+    rcv_party_1.wait_for_refresh(None);
+    party.wait_for_refresh(None);
+    assert!(rcv_party_1.check_test_transfer_status_recipient(
+        &receive_data_1.recipient_id,
+        TransferStatus::Settled
+    ));
+    assert!(party.check_test_transfer_status_sender(&txid_1, TransferStatus::Settled));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn fail_before_ack_revokes_operation() {
+    initialize();
+
+    let amount: u64 = 66;
+    // allow the short operation expiration below
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(5));
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let expiration = now().unix_timestamp() + 20;
+    let txid = party
+        .send(recipient_map, FEE_RATE, Some(expiration as u64))
+        .txid;
+    assert!(!txid.is_empty());
+
+    // the recipient has not ACKed yet, so the sender can still fail the transfer: ack.clean succeeds
+    // and revokes the released-TX copy on the proxy
+    let (_, _, batch_transfer) = party.get_test_transfer_sender(&txid);
+    assert!(party.fail_transfers_single(batch_transfer.idx));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
+
+    // the recipient can no longer obtain the TX: it ACKs, gets no TX back and, as for a
+    // non-compliant proxy, waits for the broadcast, posting the ACK again (v1.0-changes-spec.md 6.4)
+    rcv_party.wait_for_refresh(None);
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingBroadcast
+    ));
+
+    // once the operation has expired the proxy reports it, as the TX never will be released, and
+    // the recipient fails the transfer
+    let sleep_secs = std::cmp::max(expiration + 2 - now().unix_timestamp(), 0) as u64;
+    std::thread::sleep(Duration::from_secs(sleep_secs));
+    rcv_party.wait_for_refresh(None);
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Failed
+        )
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn fail_after_recipient_ack_refused() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+
+    // the recipient ACKs: a single-recipient operation releases the TX on the one ACK and the
+    // recipient broadcasts it
+    rcv_party.wait_for_refresh(None);
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+
+    // the sender can no longer fail the transfer once the recipient has accepted it: the fail's
+    // internal refresh sees the ACK and progresses the transfer (and, in the not-yet-broadcast case,
+    // the sender-proxy ack.clean would itself be denied because the TX was already released, mapped
+    // internally to ProxyTxAlreadyReleased). Either way the user-facing outcome is the same:
+    let (_, _, batch_transfer) = party.get_test_transfer_sender(&txid);
+    let res = party.fail_transfers(Some(batch_transfer.idx), false, false);
+    assert!(
+        matches!(res, Err(Error::CannotFailBatchTransfer)),
+        "expected CannotFailBatchTransfer, got: {res:?}"
+    );
 }
 
 #[cfg(feature = "electrum")]
@@ -2526,6 +3489,9 @@ fn no_change_on_pending_send() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_1),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -2541,6 +3507,9 @@ fn no_change_on_pending_send() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -2566,6 +3535,9 @@ fn no_change_on_pending_send() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -2575,6 +3547,56 @@ fn no_change_on_pending_send() {
     party.show_unspent_colorings("after 3rd send");
     // check change was not allocated on issue 1 UTXO (pending Input coloring)
     assert!(!unspent_1.rgb_allocations.iter().any(|a| !a.settled));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn schema_assignment_combinations() {
+    initialize();
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+    // more UTXOs to have free allocation slots
+    party.create_utxos_default();
+
+    let receive_data = rcv_party.blind_receive();
+    // all the assignment kinds, with a zero amount where they have one (the iterator's default),
+    // so that a supported assignment is rejected right after passing the assignment check, before
+    // sending anything
+    let assignments: Vec<Assignment> = Assignment::iter().collect();
+    for schema in AssetSchema::iter() {
+        let asset_id = party.issue_asset_of_schema(schema);
+        for assignment in &assignments {
+            let recipient_map = HashMap::from([(
+                asset_id.clone(),
+                vec![blind_recipient(&receive_data, assignment.clone())],
+            )]);
+            let supported = schema_supports_assignment(schema, assignment);
+            let has_amount = matches!(
+                assignment,
+                Assignment::Fungible(_) | Assignment::InflationRight(_)
+            );
+            if supported && !has_amount {
+                // there's no way to fail right after the assignment check, a successful send is
+                // covered by the other tests
+                continue;
+            }
+            let result = party.send_begin_result(&recipient_map);
+            let context = format!("schema {schema:?}, assignment {assignment:?}");
+            if supported {
+                assert!(
+                    matches!(result, Err(Error::InvalidAmountZero)),
+                    "{context}: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::InvalidAssignment)),
+                    "{context}: {result:?}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(feature = "electrum")]
@@ -2596,6 +3618,7 @@ fn fail() {
         FEE_RATE,
         MIN_CONFIRMATIONS,
         default_send_expiration(),
+        Some(PROXY_ENDPOINT.clone()),
         None,
     );
     assert_matches!(result, Err(Error::Offline));
@@ -2606,6 +3629,7 @@ fn fail() {
         FEE_RATE,
         MIN_CONFIRMATIONS,
         default_send_expiration(),
+        Some(PROXY_ENDPOINT.clone()),
         false,
         None,
     );
@@ -2622,8 +3646,7 @@ fn fail() {
     // issue asset
     let asset = party.issue_asset_nia(None);
     // blind
-    let receive_data =
-        rcv_party.blind_receive_asset_expiry(None, Some((now().unix_timestamp() + 60) as u64));
+    let receive_data = rcv_party.blind_receive();
 
     // invalid recipient map: empty
     let recipient_map = HashMap::new();
@@ -2641,6 +3664,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT / 2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -2654,6 +3680,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT + 1),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -2672,6 +3701,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT / 2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints,
         }],
@@ -2683,6 +3715,205 @@ fn fail() {
         Err(Error::InvalidTransportEndpoints { details: m }) if m == msg
     ));
 
+    // public key: required for a proxy recipient
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(AMOUNT / 2),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: None,
+            expiration_timestamp: None,
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let result = party.send_begin_result(&recipient_map);
+    let msg = s!("missing recipient public key");
+    assert!(matches!(
+        result,
+        Err(Error::InvalidPubkey { details: m }) if m == msg
+    ));
+
+    // public key: not hex
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(AMOUNT / 2),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(s!("not hex")),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let result = party.send_begin_result(&recipient_map);
+    let msg = s!("recipient public key is not valid hex");
+    assert!(matches!(
+        result,
+        Err(Error::InvalidPubkey { details: m }) if m == msg
+    ));
+
+    // public key: not an Ed25519 key
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(AMOUNT / 2),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(s!("0011")),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let result = party.send_begin_result(&recipient_map);
+    assert!(matches!(result, Err(Error::InvalidPubkey { details: _ })));
+
+    // invoice expiration: required for a proxy recipient, must not have passed and must leave
+    // enough time after the operation expiration
+    let recipient_map_with_expiration = |expiration_timestamp: Option<u64>| {
+        HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(AMOUNT / 2),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp,
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            }],
+        )])
+    };
+    let result = party.send_begin_result(&recipient_map_with_expiration(None));
+    let msg = s!("missing invoice expiration");
+    assert!(matches!(
+        result,
+        Err(Error::InvalidRecipientData { details: m }) if m == msg
+    ));
+    let now_ts = now().unix_timestamp() as u64;
+    let result = party.send_begin_result(&recipient_map_with_expiration(Some(now_ts - 1)));
+    assert_matches!(result, Err(Error::InvoiceExpired));
+    let invoice_expiration = default_send_expiration() + INVOICE_EXPIRATION_MARGIN_SECS as u64 - 60;
+    let result = party.send_begin_result(&recipient_map_with_expiration(Some(invoice_expiration)));
+    assert_matches!(result, Err(Error::InvalidExpiration));
+    // an invoice expiration too far in the future is refused as well, as it bounds the broadcast
+    // deadline derived from the expiration the sender proxy returns. The timestamp is derived from
+    // a fresh clock reading at each use, with a margin over the limit, so the time spent in the
+    // other calls cannot bring it back inside the allowed range
+    let far_expiration = || now().unix_timestamp() as u64 + u64::from(MAX_EXPIRATION_SECS) + 60;
+    let result = party.send_begin_result(&recipient_map_with_expiration(Some(far_expiration())));
+    assert_matches!(result, Err(Error::InvalidExpiration));
+
+    // operation expiration too far in the future
+    let result = party.wallet.send_begin(
+        party.online,
+        recipient_map_with_expiration(Some(default_rcv_expiration())),
+        false,
+        FEE_RATE,
+        MIN_CONFIRMATIONS,
+        far_expiration(),
+        Some(PROXY_ENDPOINT.clone()),
+        false,
+    );
+    assert_matches!(result, Err(Error::InvalidExpiration));
+
+    // operation expiration: must leave at least the clock skew margin
+    let result = party.wallet.send_begin(
+        party.online,
+        recipient_map_with_expiration(Some(receive_data.expiration_timestamp)),
+        false,
+        FEE_RATE,
+        MIN_CONFIRMATIONS,
+        now().unix_timestamp() as u64 + PROXY_CLOCK_SKEW_MARGIN_SECS as u64 - 60,
+        Some(PROXY_ENDPOINT.clone()),
+        false,
+    );
+    assert_matches!(result, Err(Error::InvalidExpiration));
+
+    // witness blinding: derived for a proxy recipient, so it cannot be provided
+    let witness_receive_data = rcv_party.witness_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(AMOUNT / 2),
+            recipient_id: witness_receive_data.recipient_id.clone(),
+            public_key: Some(witness_receive_data.public_key.clone()),
+            expiration_timestamp: Some(witness_receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: Some(WitnessData {
+                amount_sat: 1000,
+                blinding: Some(7777),
+            }),
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let result = party.send_begin_result(&recipient_map);
+    let msg = s!("cannot provide a blinding for a witness recipient with transport endpoints");
+    assert!(matches!(
+        result,
+        Err(Error::InvalidRecipientData { details: m }) if m == msg
+    ));
+
+    // sender transport endpoint: required for a proxy recipient
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(AMOUNT / 2),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let result = party.wallet.send_begin(
+        party.online,
+        recipient_map,
+        false,
+        FEE_RATE,
+        MIN_CONFIRMATIONS,
+        default_send_expiration(),
+        None,
+        false,
+    );
+    let msg = s!("missing sender transport endpoint");
+    assert!(matches!(
+        result,
+        Err(Error::InvalidTransportEndpoint { details: m }) if m == msg
+    ));
+
+    // sender transport endpoint: validated even when unused (out-of-band recipient)
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(AMOUNT / 2),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: None,
+            expiration_timestamp: None,
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: vec![],
+        }],
+    )]);
+    let result = party.wallet.send_begin(
+        party.online,
+        recipient_map,
+        false,
+        FEE_RATE,
+        MIN_CONFIRMATIONS,
+        default_send_expiration(),
+        Some(s!("not a transport endpoint")),
+        false,
+    );
+    assert!(matches!(
+        result,
+        Err(Error::InvalidTransportEndpoint { details: _ })
+    ));
+
     // transport endpoints: malformed
     let transport_endpoints = vec![s!("malformed")];
     let recipient_map = HashMap::from([(
@@ -2690,6 +3921,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT / 2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints,
         }],
@@ -2707,6 +3941,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT / 2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints,
         }],
@@ -2727,6 +3964,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT / 2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints,
         }],
@@ -2750,6 +3990,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT / 2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints,
         }],
@@ -2767,6 +4010,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT / 2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -2778,6 +4024,7 @@ fn fail() {
         0,
         MIN_CONFIRMATIONS,
         default_send_expiration(),
+        Some(PROXY_ENDPOINT.clone()),
         false,
         None,
     );
@@ -2791,6 +4038,7 @@ fn fail() {
         u64::MAX,
         MIN_CONFIRMATIONS,
         default_send_expiration(),
+        Some(PROXY_ENDPOINT.clone()),
         false,
         None,
     );
@@ -2803,12 +4051,18 @@ fn fail() {
             Recipient {
                 assignment: Assignment::Fungible(AMOUNT / 2),
                 recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
             Recipient {
                 assignment: Assignment::Fungible(AMOUNT / 3),
                 recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
@@ -2823,6 +4077,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(0),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -2837,6 +4094,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(1),
             recipient_id: receive_data_blinded.recipient_id.clone(),
+            public_key: Some(receive_data_blinded.public_key.clone()),
+            expiration_timestamp: Some(receive_data_blinded.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -2855,6 +4115,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(1),
             recipient_id: receive_data_witness.recipient_id.clone(),
+            public_key: Some(receive_data_witness.public_key.clone()),
+            expiration_timestamp: Some(receive_data_witness.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -2869,6 +4132,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT / 2),
             recipient_id: receive_data_witness.recipient_id.clone(),
+            public_key: Some(receive_data_witness.public_key.clone()),
+            expiration_timestamp: Some(receive_data_witness.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 0,
                 blinding: None,
@@ -2888,6 +4154,9 @@ fn fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(1),
             recipient_id: receive_data_liquid.recipient_id,
+            public_key: Some(receive_data_liquid.public_key.clone()),
+            expiration_timestamp: Some(receive_data_liquid.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -2898,20 +4167,32 @@ fn fail() {
     let result = party.send_begin_result(&recipient_map);
     assert!(matches!(result, Err(Error::InvalidRecipientNetwork)));
 
-    // transport endpoints: no valid endpoints
-    let transport_endpoints = vec![format!("rpc://{PROXY_HOST_MOD_API}")];
-    let receive_data_te = rcv_party.blind_receive_with_endpoints(None, transport_endpoints.clone());
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(AMOUNT / 2),
-            recipient_id: receive_data_te.recipient_id,
-            witness_data: None,
-            transport_endpoints,
-        }],
-    )]);
-    let result = party.send_result(&recipient_map);
+    // transport endpoints: no valid endpoints. In v1.0 the recipient reserves its ID on a proxy at
+    // receive time, so a receive whose only endpoint is a proxy with an unsupported protocol
+    // version fails immediately
+    let transport_endpoints = vec![format!("rpc://{PROXY_HOST_MOD_PROTO}")];
+    let result = rcv_party.wallet.blind_receive(
+        Some(rcv_party.online),
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        transport_endpoints,
+        MIN_CONFIRMATIONS,
+        None,
+    );
     assert!(matches!(result, Err(Error::NoValidTransportEndpoint)));
+
+    // send_end with the PSBT of another operation
+    let asset_ifa = party.issue_asset_ifa(None, None, None);
+    let unsigned_psbt = party.burn_begin(&asset_ifa.asset_id, 1, None);
+    let signed_psbt = party.wallet.sign_psbt(unsigned_psbt, None).unwrap();
+    let txid = Psbt::from_str(&signed_psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    let result = party.wallet.send_end(party.online, signed_psbt);
+    assert_matches!(result, Err(Error::WrongOperation { txid: t }) if t == txid);
 }
 
 #[cfg(feature = "electrum")]
@@ -2942,6 +4223,9 @@ fn pending_incoming_transfer_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_1),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -2974,6 +4258,9 @@ fn pending_incoming_transfer_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -3014,6 +4301,9 @@ fn pending_outgoing_transfer_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -3059,6 +4349,9 @@ fn pending_outgoing_transfer_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount / 2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -3105,6 +4398,9 @@ fn pending_transfer_input_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -3129,13 +4425,15 @@ fn already_used_fail() {
     let asset = party.issue_asset_nia(Some(&[AMOUNT, AMOUNT * 2, AMOUNT * 3]));
 
     // 1st transfer
-    let receive_data =
-        rcv_party.blind_receive_asset_expiry(None, Some((now().unix_timestamp() + 60) as u64));
+    let receive_data = rcv_party.blind_receive();
     let recipient_map = HashMap::from([(
         asset.asset_id,
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -3143,9 +4441,43 @@ fn already_used_fail() {
     let txid = party.send_retry(&recipient_map);
     assert!(!txid.is_empty());
 
-    // 2nd transfer using the same blinded UTXO
+    // 2nd transfer to the same (single-use) invoice
     let result = party.send_result(&recipient_map);
-    assert!(matches!(result, Err(Error::RecipientIDAlreadyUsed)));
+    assert!(matches!(result, Err(Error::InvoiceQuotaExceeded)));
+}
+
+/// A send to an invoice that no proxy knows is refused before anything is posted.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn invoice_not_reserved_fail() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    // the recipient ID of a receive with the pubkey of another one derive an unreserved invoice
+    let receive_data_1 = rcv_party.blind_receive();
+    let receive_data_2 = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id,
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_2.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let result = party.send_begin_result(&recipient_map);
+    assert!(matches!(result, Err(Error::InvoiceNotReserved)));
 }
 
 #[cfg(feature = "electrum")]
@@ -3176,6 +4508,9 @@ fn cfa_extra_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(1),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -3232,6 +4567,9 @@ fn uda_extra_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(1),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -3292,6 +4630,9 @@ fn psbt_rgb_consumer_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(1),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -3309,6 +4650,9 @@ fn psbt_rgb_consumer_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(1),
             recipient_id: receive_data_2.recipient_id.clone(),
+            public_key: Some(receive_data_2.public_key.clone()),
+            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -3328,6 +4672,9 @@ fn psbt_rgb_consumer_success() {
             vec![Recipient {
                 assignment: Assignment::Fungible(1),
                 recipient_id: receive_data_3a.recipient_id.clone(),
+                public_key: Some(receive_data_3a.public_key.clone()),
+                expiration_timestamp: Some(receive_data_3a.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             }],
@@ -3337,6 +4684,9 @@ fn psbt_rgb_consumer_success() {
             vec![Recipient {
                 assignment: Assignment::Fungible(1),
                 recipient_id: receive_data_3b.recipient_id.clone(),
+                public_key: Some(receive_data_3b.public_key.clone()),
+                expiration_timestamp: Some(receive_data_3b.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             }],
@@ -3373,6 +4723,9 @@ fn insufficient_bitcoins() {
         vec![Recipient {
             assignment: Assignment::Fungible(1),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -3389,6 +4742,105 @@ fn insufficient_bitcoins() {
     party.wait_for_unspents(false, 2);
     let txid = party.send_retry(&recipient_map);
     assert!(!txid.is_empty());
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn pending_sends_no_shared_inputs() {
+    initialize();
+
+    // wallets
+    let mut party = get_funded_noutxo_party!();
+    let mut rcv_party = get_funded_party!();
+
+    // issue 2 NIA assets, each on a UTXO with not enough bitcoins for a send
+    party.create_utxos(false, Some(2), Some(TINY_BTC_AMOUNT), FEE_RATE, None);
+    let asset_1 = party.issue_asset_nia(None);
+    let asset_2 = party.issue_asset_nia(None);
+    let unspents = party.list_unspents(false);
+    let asset_outpoints: HashSet<Outpoint> = unspents
+        .iter()
+        .filter(|u| !u.rgb_allocations.is_empty())
+        .map(|u| u.utxo.outpoint.clone())
+        .collect();
+    assert_eq!(asset_outpoints.len(), 2);
+
+    // create 2 UTXOs with no allocations, to be used as additional bitcoin inputs
+    party.create_utxos(false, Some(2), Some(5000), FEE_RATE, None);
+
+    // begin a witness send for each asset, without ending them
+    let mut sends = vec![];
+    for asset in [&asset_1, &asset_2] {
+        let receive_data = rcv_party.witness_receive();
+        let recipient_map = HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(1),
+                recipient_id: receive_data.recipient_id,
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: Some(WitnessData {
+                    amount_sat: 1000,
+                    blinding: None,
+                }),
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            }],
+        )]);
+        let send_result = party.send_begin_result(&recipient_map).unwrap();
+        let psbt = Psbt::from_str(&send_result.psbt).unwrap();
+        let inputs: HashSet<Outpoint> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|i| Outpoint::from(i.previous_output))
+            .collect();
+        // each send needs an additional bitcoin input
+        assert!(inputs.iter().any(|o| !asset_outpoints.contains(o)));
+        sends.push((send_result, inputs));
+    }
+    let (send_1, inputs_1) = &sends[0];
+    let (send_2, inputs_2) = &sends[1];
+    let batch_transfer_idx_1 = send_1.batch_transfer_idx.unwrap();
+    let batch_transfer_idx_2 = send_2.batch_transfer_idx.unwrap();
+
+    // the 2 pending sends must not spend the same UTXO
+    assert!(inputs_1.is_disjoint(inputs_2));
+
+    // all inputs of the pending sends are reserved for their batch transfer
+    let reserved_for = |party: &SinglesigParty, batch_transfer_idx: i32| -> HashSet<Outpoint> {
+        party
+            .db_reserved_txos()
+            .into_iter()
+            .filter(|r| r.reserved_for_colored == Some(batch_transfer_idx))
+            .map(Outpoint::from)
+            .collect()
+    };
+    assert_eq!(&reserved_for(&party, batch_transfer_idx_1), inputs_1);
+    assert_eq!(&reserved_for(&party, batch_transfer_idx_2), inputs_2);
+
+    // reserved UTXOs can't be used to receive
+    let result = party.blind_receive_result();
+    assert!(matches!(result, Err(Error::InsufficientAllocationSlots)));
+
+    // failing a pending send releases its reservations
+    assert!(party.fail_transfers_single(batch_transfer_idx_1));
+    assert!(reserved_for(&party, batch_transfer_idx_1).is_empty());
+    assert_eq!(&reserved_for(&party, batch_transfer_idx_2), inputs_2);
+
+    // broadcasting a pending send releases its reservations
+    let signed_psbt = party.wallet.sign_psbt(send_2.psbt.clone(), None).unwrap();
+    let txid_2 = party
+        .wallet
+        .send_end(party.online, signed_psbt)
+        .unwrap()
+        .txid;
+    assert_eq!(&reserved_for(&party, batch_transfer_idx_2), inputs_2);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset_2.asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid_2, TransferStatus::WaitingConfirmations));
+    assert!(party.db_reserved_txos().is_empty());
 }
 
 #[cfg(feature = "electrum")]
@@ -3416,6 +4868,9 @@ fn insufficient_allocations_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(1),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -3460,6 +4915,9 @@ fn insufficient_allocations_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(1),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -3492,12 +4950,18 @@ fn send_to_oneself() {
             Recipient {
                 assignment: Assignment::Fungible(amount_1),
                 recipient_id: receive_data_1.recipient_id.clone(),
+                public_key: Some(receive_data_1.public_key.clone()),
+                expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
             Recipient {
                 assignment: Assignment::Fungible(amount_2),
                 recipient_id: receive_data_2.recipient_id.clone(),
+                public_key: Some(receive_data_2.public_key.clone()),
+                expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: Some(WitnessData {
                     amount_sat: 1000,
                     blinding: None,
@@ -3590,12 +5054,18 @@ fn send_to_oneself_crash_dry_run() {
             Recipient {
                 assignment: Assignment::Fungible(amount_1),
                 recipient_id: receive_data_1.recipient_id.clone(),
+                public_key: Some(receive_data_1.public_key.clone()),
+                expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
             Recipient {
                 assignment: Assignment::Fungible(amount_2),
                 recipient_id: receive_data_2.recipient_id.clone(),
+                public_key: Some(receive_data_2.public_key.clone()),
+                expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: Some(WitnessData {
                     amount_sat: 1000,
                     blinding: None,
@@ -3615,6 +5085,7 @@ fn send_to_oneself_crash_dry_run() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             true,
             None,
         )
@@ -3704,6 +5175,9 @@ fn send_to_oneself_crash_no_dry_run() {
                 recipient_id: receive_data_1.recipient_id.clone(),
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+                public_key: Some(receive_data_1.public_key.clone()),
+                expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+                encryption: Encryption::Optional,
             },
             Recipient {
                 assignment: Assignment::Fungible(amount_2),
@@ -3713,6 +5187,9 @@ fn send_to_oneself_crash_no_dry_run() {
                     blinding: None,
                 }),
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+                public_key: Some(receive_data_2.public_key.clone()),
+                expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
             },
         ],
     )]);
@@ -3727,6 +5204,7 @@ fn send_to_oneself_crash_no_dry_run() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             false,
             None,
         )
@@ -3778,6 +5256,154 @@ fn send_to_oneself_crash_no_dry_run() {
     );
 }
 
+/// A send ended again (e.g. retried after a crash) is completed only while it's still in progress:
+/// one that has failed (which revoked its signed TX on the sender proxy) or already progressed must
+/// not be brought back to waiting for the counterparty nor have its status changed.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn send_end_after_fail_or_end() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    // begin a send and sign its PSBT
+    let begin = |party: &mut SinglesigParty, rcv_party: &mut SinglesigParty, donation: bool| {
+        let receive_data = rcv_party.blind_receive();
+        let recipient_map = HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            }],
+        )]);
+        let res = party
+            .wallet
+            .send_begin(
+                party.online,
+                recipient_map,
+                donation,
+                FEE_RATE,
+                MIN_CONFIRMATIONS,
+                default_send_expiration(),
+                Some(PROXY_ENDPOINT.clone()),
+                false,
+            )
+            .unwrap();
+        party.wallet.sign_psbt(res.psbt, None).unwrap()
+    };
+
+    // a failed send, whose signed TX has been revoked on the sender proxy, is not ended again
+    let signed_psbt = begin(&mut party, &mut rcv_party, false);
+    let res = party
+        .wallet
+        .send_end(party.online, signed_psbt.clone())
+        .unwrap();
+    assert!(
+        party.check_test_transfer_status_sender(&res.txid, TransferStatus::WaitingCounterparty)
+    );
+    assert!(party.fail_transfers_single(res.batch_transfer_idx));
+    assert!(party.check_test_transfer_status_sender(&res.txid, TransferStatus::Failed));
+    let result = party.wallet.send_end(party.online, signed_psbt);
+    assert_matches!(result, Err(Error::CannotEndTransfer { txid }) if txid == res.txid);
+    assert!(party.check_test_transfer_status_sender(&res.txid, TransferStatus::Failed));
+
+    // an ended donation (which has progressed to waiting for confirmations) is not ended again
+    let signed_psbt = begin(&mut party, &mut rcv_party, true);
+    let res = party
+        .wallet
+        .send_end(party.online, signed_psbt.clone())
+        .unwrap();
+    assert!(
+        party.check_test_transfer_status_sender(&res.txid, TransferStatus::WaitingConfirmations)
+    );
+    let result = party.wallet.send_end(party.online, signed_psbt);
+    assert_matches!(result, Err(Error::CannotEndTransfer { txid }) if txid == res.txid);
+    assert!(
+        party.check_test_transfer_status_sender(&res.txid, TransferStatus::WaitingConfirmations)
+    );
+}
+
+/// A send ended again after its operation has expired (e.g. retried after a crash, or completed
+/// by another multisig cosigner) is completed if the sender proxy knows the operation, without
+/// posting anything, and is then failed as an expired operation whose TX was never released.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn send_end_after_expiration() {
+    initialize();
+
+    let amount: u64 = 66;
+    let skew_margin: u32 = 2;
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(skew_margin));
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let expiration = now().unix_timestamp() + 10;
+    let begin = party
+        .wallet
+        .send_begin(
+            party.online,
+            recipient_map,
+            false,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            expiration as u64,
+            Some(PROXY_ENDPOINT.clone()),
+            false,
+        )
+        .unwrap();
+    let signed_psbt = party.wallet.sign_psbt(begin.psbt, None).unwrap();
+
+    // the first send_end registers the operation and posts the consignment, then "crashes"
+    println!("setting MOCK_SEND_END_CRASH");
+    MOCK_SEND_END_CRASH.replace(Some(()));
+    let crashed = party.wallet.send_end(party.online, signed_psbt.clone());
+    assert_matches!(crashed, Err(Error::Internal { .. }));
+
+    // once the operation has expired the send is still completed
+    let wait_secs = (expiration - now().unix_timestamp()).clamp(0, i64::MAX) as u64 + 1;
+    std::thread::sleep(Duration::from_secs(wait_secs));
+    let res = party.wallet.send_end(party.online, signed_psbt).unwrap();
+    assert!(
+        party.check_test_transfer_status_sender(&res.txid, TransferStatus::WaitingCounterparty)
+    );
+
+    // the TX was never released, so the expired send is failed
+    let wait_secs = (expiration + i64::from(skew_margin) - now().unix_timestamp())
+        .clamp(0, i64::MAX) as u64
+        + 1;
+    std::thread::sleep(Duration::from_secs(wait_secs));
+    assert!(party.fail_transfers_all());
+    assert!(party.check_test_transfer_status_sender(&res.txid, TransferStatus::Failed));
+}
+
 /// Regression test for `send_end` panicking with "exists at this point" when a non-dry-run
 /// `send_begin` produced `extra_allocations`.
 ///
@@ -3825,6 +5451,9 @@ fn send_extra_allocations_no_dry_run_impl(donation: bool) {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -3838,6 +5467,7 @@ fn send_extra_allocations_no_dry_run_impl(donation: bool) {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             false,
             None,
         )
@@ -3977,6 +5607,9 @@ fn send_received_back_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_1),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -4030,6 +5663,9 @@ fn send_received_back_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_2),
             recipient_id: receive_data_2.recipient_id.clone(),
+            public_key: Some(receive_data_2.public_key.clone()),
+            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -4087,6 +5723,9 @@ fn send_received_back_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_3),
             recipient_id: receive_data_3.recipient_id.clone(),
+            public_key: Some(receive_data_3.public_key.clone()),
+            expiration_timestamp: Some(receive_data_3.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -4157,6 +5796,9 @@ fn witness_success() {
             Recipient {
                 assignment: Assignment::Fungible(amount),
                 recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: Some(WitnessData {
                     amount_sat: 1000,
                     blinding: None,
@@ -4166,18 +5808,24 @@ fn witness_success() {
             Recipient {
                 assignment: Assignment::Fungible(amount * 2),
                 recipient_id: receive_data_2.recipient_id,
+                public_key: Some(receive_data_2.public_key.clone()),
+                expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: Some(WitnessData {
                     amount_sat: 1200,
-                    blinding: Some(7777),
+                    blinding: None,
                 }),
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
             Recipient {
                 assignment: Assignment::Fungible(amount * 3),
                 recipient_id: receive_data_3.recipient_id,
+                public_key: Some(receive_data_3.public_key.clone()),
+                expiration_timestamp: Some(receive_data_3.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: Some(WitnessData {
                     amount_sat: 1400,
-                    blinding: Some(8888),
+                    blinding: None,
                 }),
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
@@ -4204,7 +5852,10 @@ fn witness_success() {
     }
 
     assert_eq!(rcv_transfer_data.kind, TransferKind::ReceiveWitness);
-    assert_eq!(rcv_transfer_data.status, TransferStatus::WaitingBroadcast);
+    assert_eq!(
+        rcv_transfer_data.status,
+        TransferStatus::WaitingConfirmations
+    );
     assert_eq!(
         rcv_transfer_data.assignments,
         vec![Assignment::Fungible(amount)]
@@ -4299,6 +5950,9 @@ fn witness_multiple_assets_success() {
                 Recipient {
                     assignment: Assignment::Fungible(amount),
                     recipient_id: receive_data_1a.recipient_id.clone(),
+                    public_key: Some(receive_data_1a.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_1a.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: Some(WitnessData {
                         amount_sat: btc_amount_1a,
                         blinding: None,
@@ -4308,9 +5962,12 @@ fn witness_multiple_assets_success() {
                 Recipient {
                     assignment: Assignment::Fungible(amount * 2),
                     recipient_id: receive_data_1b.recipient_id.clone(),
+                    public_key: Some(receive_data_1b.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_1b.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: Some(WitnessData {
                         amount_sat: btc_amount_1b,
-                        blinding: Some(7777),
+                        blinding: None,
                     }),
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
@@ -4322,6 +5979,9 @@ fn witness_multiple_assets_success() {
                 Recipient {
                     assignment: Assignment::Fungible(amount * 3),
                     recipient_id: receive_data_2a.recipient_id.clone(),
+                    public_key: Some(receive_data_2a.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_2a.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: Some(WitnessData {
                         amount_sat: btc_amount_2a,
                         blinding: None,
@@ -4331,9 +5991,12 @@ fn witness_multiple_assets_success() {
                 Recipient {
                     assignment: Assignment::Fungible(amount * 4),
                     recipient_id: receive_data_2b.recipient_id.clone(),
+                    public_key: Some(receive_data_2b.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_2b.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: Some(WitnessData {
                         amount_sat: btc_amount_2b,
-                        blinding: Some(8888),
+                        blinding: None,
                     }),
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
@@ -4341,6 +6004,8 @@ fn witness_multiple_assets_success() {
         ),
     ]);
     party.create_utxos(false, None, None, FEE_RATE, None);
+    // no blocks until the transfers have been checked in status WaitingConfirmations
+    let guard = stop_mining();
     let txid = party.send_retry(&recipient_map);
     assert!(!txid.is_empty());
 
@@ -4361,10 +6026,22 @@ fn witness_multiple_assets_success() {
     assert_eq!(rcv_xfer_data_1b.kind, TransferKind::ReceiveWitness);
     assert_eq!(rcv_xfer_data_2a.kind, TransferKind::ReceiveWitness);
     assert_eq!(rcv_xfer_data_2b.kind, TransferKind::ReceiveWitness);
-    assert_eq!(rcv_xfer_data_1a.status, TransferStatus::WaitingBroadcast);
-    assert_eq!(rcv_xfer_data_1b.status, TransferStatus::WaitingBroadcast);
-    assert_eq!(rcv_xfer_data_2a.status, TransferStatus::WaitingBroadcast);
-    assert_eq!(rcv_xfer_data_2b.status, TransferStatus::WaitingBroadcast);
+    assert_eq!(
+        rcv_xfer_data_1a.status,
+        TransferStatus::WaitingConfirmations
+    );
+    assert_eq!(
+        rcv_xfer_data_1b.status,
+        TransferStatus::WaitingConfirmations
+    );
+    assert_eq!(
+        rcv_xfer_data_2a.status,
+        TransferStatus::WaitingConfirmations
+    );
+    assert_eq!(
+        rcv_xfer_data_2b.status,
+        TransferStatus::WaitingConfirmations
+    );
     assert_eq!(
         rcv_xfer_data_1a.assignments,
         vec![Assignment::Fungible(amount)]
@@ -4463,6 +6140,7 @@ fn witness_multiple_assets_success() {
     });
 
     // transfers progress to status Settled after tx mining + refresh
+    drop(guard);
     mine(false);
     // check receiver transfers
     rcv_party.wait_for_refresh(None);
@@ -4537,6 +6215,9 @@ fn witness_multiple_assets_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount * 5),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -4544,6 +6225,8 @@ fn witness_multiple_assets_success() {
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
     )]);
+    // no blocks until the transfer has been checked in status WaitingConfirmations
+    let guard = stop_mining();
     let txid = party.send_retry(&recipient_map);
     assert!(!txid.is_empty());
 
@@ -4571,7 +6254,7 @@ fn witness_multiple_assets_success() {
     // check receiver transfer
     let rcv_xfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
     let (rcv_xfer_data, rcv_asset_xfer) = rcv_party.get_test_transfer_data(&rcv_xfer);
-    assert_eq!(rcv_xfer_data.status, TransferStatus::WaitingBroadcast);
+    assert_eq!(rcv_xfer_data.status, TransferStatus::WaitingConfirmations);
     assert_eq!(
         rcv_xfer_data.assignments,
         vec![Assignment::Fungible(amount * 5)]
@@ -4589,6 +6272,7 @@ fn witness_multiple_assets_success() {
     );
 
     // transfers progress to status Settled after tx mining + refresh
+    drop(guard);
     mine(false);
     rcv_party.wait_for_refresh(None);
     party.wait_for_refresh(None);
@@ -4634,6 +6318,9 @@ fn witness_multiple_inputs_success() {
             Recipient {
                 assignment: Assignment::Fungible(amount),
                 recipient_id: receive_data_1a.recipient_id.clone(),
+                public_key: Some(receive_data_1a.public_key.clone()),
+                expiration_timestamp: Some(receive_data_1a.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: Some(WitnessData {
                     amount_sat: 1000,
                     blinding: None,
@@ -4643,9 +6330,12 @@ fn witness_multiple_inputs_success() {
             Recipient {
                 assignment: Assignment::Fungible(amount * 2),
                 recipient_id: receive_data_1b.recipient_id.clone(),
+                public_key: Some(receive_data_1b.public_key.clone()),
+                expiration_timestamp: Some(receive_data_1b.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: Some(WitnessData {
                     amount_sat: 1200,
-                    blinding: Some(7777),
+                    blinding: None,
                 }),
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
@@ -4668,6 +6358,9 @@ fn witness_multiple_inputs_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(77),
             recipient_id: receive_data_2.recipient_id.clone(),
+            public_key: Some(receive_data_2.public_key.clone()),
+            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -4692,6 +6385,9 @@ fn witness_multiple_inputs_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(40),
             recipient_id: receive_data_3.recipient_id.clone(),
+            public_key: Some(receive_data_3.public_key.clone()),
+            expiration_timestamp: Some(receive_data_3.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -4718,73 +6414,7 @@ fn witness_multiple_inputs_success() {
     assert_eq!(transfer_data.status, TransferStatus::Settled);
 }
 
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn witness_fail_wrong_vout() {
-    initialize();
-
-    let amount: u64 = 66;
-
-    // wallets
-    let mut party = get_funded_party!();
-    let mut rcv_party_1 = get_funded_party!();
-    let mut rcv_party_2 = get_funded_party!();
-
-    // issue
-    let asset = party.issue_asset_nia(None);
-
-    // send
-    let receive_data_1 = rcv_party_1.witness_receive();
-    let receive_data_2 = rcv_party_2.witness_receive();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![
-            Recipient {
-                assignment: Assignment::Fungible(amount),
-                recipient_id: receive_data_1.recipient_id.clone(),
-                witness_data: Some(WitnessData {
-                    amount_sat: 1000,
-                    blinding: None,
-                }),
-                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-            },
-            Recipient {
-                assignment: Assignment::Fungible(amount * 2),
-                recipient_id: receive_data_2.recipient_id.clone(),
-                witness_data: Some(WitnessData {
-                    amount_sat: 2000,
-                    blinding: None,
-                }),
-                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-            },
-        ],
-    )]);
-    println!("setting MOCK_VOUT");
-    MOCK_VOUT.replace(Some(2));
-    let txid = party.send_retry(&recipient_map);
-    assert!(!txid.is_empty());
-
-    // transfers progress to status Failed after a refresh
-    rcv_party_2.wait_for_refresh(None);
-    rcv_party_1.wait_for_refresh(None);
-    let rcv_transfer = rcv_party_1.get_test_transfer_recipient(&receive_data_1.recipient_id);
-    let (rcv_transfer_data, _rcv_asset_transfer) =
-        rcv_party_1.get_test_transfer_data(&rcv_transfer);
-    party.wait_for_refresh(Some(&asset.asset_id));
-    let batch_transfers = party.db_batch_transfers_filtered(&txid);
-    let batch_transfer = batch_transfers.first().unwrap();
-    let asset_transfer = party.get_test_asset_transfer(batch_transfer.idx);
-    let transfers = party.db_transfers_filtered(asset_transfer.idx);
-    for transfer in transfers {
-        let (transfer_data, _) = party.get_test_transfer_data(&transfer);
-        assert_eq!(transfer_data.status, TransferStatus::Failed);
-    }
-    assert_eq!(rcv_transfer_data.kind, TransferKind::ReceiveWitness);
-    assert_eq!(rcv_transfer_data.status, TransferStatus::Failed);
-}
-
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn min_confirmations_common(
     party: &mut SinglesigParty,
     rcv_party: &mut SinglesigParty,
@@ -4807,11 +6437,13 @@ fn min_confirmations_common(
     let receive_data = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             min_confirmations,
+            None,
         )
         .unwrap();
     let recipient_map = HashMap::from([(
@@ -4819,6 +6451,9 @@ fn min_confirmations_common(
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -4832,6 +6467,7 @@ fn min_confirmations_common(
             FEE_RATE,
             min_confirmations,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap()
@@ -4852,11 +6488,9 @@ fn min_confirmations_common(
     );
     assert_eq!(transfer_data.status, TransferStatus::WaitingCounterparty);
 
-    // transfers progress to status WaitingConfirmations after a refresh (the receiver needs an
-    // extra refresh to see the broadcast and leave WaitingBroadcast)
+    // transfers progress to status WaitingConfirmations after a refresh
     rcv_party.wait_for_refresh(None);
     party.wait_for_refresh(Some(&asset.asset_id));
-    rcv_party.wait_for_refresh(None);
 
     let (rcv_transfer_data, _) = rcv_party.get_test_transfer_data(&rcv_transfer);
     let (transfer_data, _) = party.get_test_transfer_data(&transfer);
@@ -4897,11 +6531,13 @@ fn min_confirmations_common(
     let receive_data = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             min_confirmations,
+            None,
         )
         .unwrap();
     let recipient_map = HashMap::from([(
@@ -4909,6 +6545,9 @@ fn min_confirmations_common(
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -4922,6 +6561,7 @@ fn min_confirmations_common(
             FEE_RATE,
             min_confirmations,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap()
@@ -4942,14 +6582,16 @@ fn min_confirmations_common(
     );
     assert_eq!(transfer_data.status, TransferStatus::WaitingCounterparty);
 
-    // after a refresh the receiver waits for the broadcast while the sender progresses to
-    // WaitingConfirmations
+    // transfers progress to status WaitingConfirmations after a refresh
     rcv_party.wait_for_refresh(None);
     party.wait_for_refresh(Some(&asset.asset_id));
 
     let (rcv_transfer_data, _) = rcv_party.get_test_transfer_data(&rcv_transfer);
     let (transfer_data, _) = party.get_test_transfer_data(&transfer);
-    assert_eq!(rcv_transfer_data.status, TransferStatus::WaitingBroadcast);
+    assert_eq!(
+        rcv_transfer_data.status,
+        TransferStatus::WaitingConfirmations
+    );
     assert_eq!(transfer_data.status, TransferStatus::WaitingConfirmations);
 
     // transfers progress to status Settled before a block is mined
@@ -4968,6 +6610,9 @@ fn min_confirmations_common(
         vec![Recipient {
             assignment: Assignment::Fungible(amount * 2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -4989,6 +6634,19 @@ fn min_confirmations_common(
     let (transfer_data, _) = rcv_party.get_test_transfer_data(&transfer);
     assert_eq!(rcv_transfer_data.status, TransferStatus::Settled);
     assert_eq!(transfer_data.status, TransferStatus::Settled);
+}
+
+#[cfg(feature = "bitcoind")]
+#[test]
+#[parallel]
+fn min_confirmations_bitcoind() {
+    initialize();
+
+    // wallets
+    let mut party = get_funded_party!(BITCOIND_URL.to_string());
+    let mut rcv_party = get_funded_party!(BITCOIND_URL.to_string());
+
+    min_confirmations_common(&mut party, &mut rcv_party, false);
 }
 
 #[cfg(feature = "electrum")]
@@ -5020,6 +6678,116 @@ fn min_confirmations_esplora() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
+fn spv_proofs() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    // issue and send: the consignment carries no proof, its only witness is not mined yet
+    let asset = party.issue_asset_nia(None);
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+        }],
+    )]);
+    let txid_1 = party.send(recipient_map, FEE_RATE, None).txid;
+    let consignment_path = party
+        .wallet
+        .get_send_consignment_path(&asset.asset_id, &txid_1);
+    let consignment = RgbTransfer::load_file(consignment_path).unwrap();
+    assert!(
+        consignment
+            .bundled_witnesses()
+            .all(|bw| bw.spv_proof.is_none())
+    );
+
+    // settle the transfer
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Settled
+        )
+    );
+
+    // spend the received allocation: the consignment now carries a proof for the mined
+    // witness of the first transfer, while its own (unmined) witness has none
+    let receive_data_2 = party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount / 2),
+            recipient_id: receive_data_2.recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data_2.public_key.clone()),
+            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+            encryption: Encryption::Optional,
+        }],
+    )]);
+    let txid_2 = rcv_party.send(recipient_map, FEE_RATE, None).txid;
+    let consignment_path = rcv_party
+        .wallet
+        .get_send_consignment_path(&asset.asset_id, &txid_2);
+    let consignment = RgbTransfer::load_file(consignment_path).unwrap();
+    let proofs: HashMap<String, bool> = consignment
+        .bundled_witnesses()
+        .map(|bw| (bw.witness_id().to_string(), bw.spv_proof.is_some()))
+        .collect();
+    assert_eq!(proofs.get(&txid_1), Some(&true));
+    assert_eq!(proofs.get(&txid_2), Some(&false));
+
+    // the retrieved proof has been stored
+    let txn = rcv_party.wallet.database().begin_transaction().unwrap();
+    let stock = rcv_party.wallet.rgb_stock(&txn).unwrap();
+    let proof = stock
+        .witness_spv_proof(RgbTxid::from_str(&txid_1).unwrap())
+        .unwrap();
+    assert!(proof.is_some());
+    drop(txn);
+
+    // the receiver validates the consignment via the proof alone: looking up the mined witness
+    // is refused, so validation can only succeed through the proof and the block header
+    MOCK_SPV_ONLY.replace(true);
+    party.wait_for_refresh(None);
+    MOCK_SPV_ONLY.replace(false);
+    let rcv_transfer = party.get_test_transfer_recipient(&receive_data_2.recipient_id);
+    let (rcv_transfer_data, _) = party.get_test_transfer_data(&rcv_transfer);
+    assert_eq!(
+        rcv_transfer_data.status,
+        TransferStatus::WaitingConfirmations
+    );
+
+    // and the transfer settles
+    rcv_party.wait_for_refresh(Some(&asset.asset_id));
+    mine(false);
+    party.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(party.check_test_transfer_status_recipient(
+        &receive_data_2.recipient_id,
+        TransferStatus::Settled
+    ));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
 fn spend_double_receive() {
     initialize();
 
@@ -5045,6 +6813,9 @@ fn spend_double_receive() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_1),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -5058,6 +6829,7 @@ fn spend_double_receive() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap()
@@ -5084,9 +6856,12 @@ fn spend_double_receive() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
-                blinding: Some(777),
+                blinding: None,
             }),
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -5100,6 +6875,7 @@ fn spend_double_receive() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap()
@@ -5162,6 +6938,9 @@ fn spend_double_receive() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_1),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -5263,6 +7042,9 @@ fn input_sorting() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -5320,6 +7102,9 @@ fn spend_witness_receive_utxo() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -5339,14 +7124,14 @@ fn spend_witness_receive_utxo() {
     let (transfer_1_send_data, _) = party_1.get_test_transfer_data(&transfer_1_send);
     assert_eq!(
         transfer_1_recv_data.status,
-        TransferStatus::WaitingBroadcast
+        TransferStatus::WaitingConfirmations
     );
     assert_eq!(
         transfer_1_send_data.status,
         TransferStatus::WaitingConfirmations
     );
 
-    // mine and refresh the sender wallet only (receiver transfer still WaitingBroadcast)
+    // mine and refresh the sender wallet only (receiver transfer still WaitingConfirmations)
     mine(false);
     party_1.wait_for_refresh(Some(&asset_a.asset_id));
 
@@ -5386,6 +7171,9 @@ fn rgb_change_on_btc_change() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -5424,7 +7212,10 @@ fn rgb_change_on_btc_change() {
     let (transfer, _, _) = party.get_test_transfer_sender(&txid);
     let (transfer_data, _) = party.get_test_transfer_data(&transfer);
 
-    assert_eq!(rcv_transfer_data.status, TransferStatus::WaitingBroadcast);
+    assert_eq!(
+        rcv_transfer_data.status,
+        TransferStatus::WaitingConfirmations
+    );
     assert_eq!(transfer_data.status, TransferStatus::WaitingConfirmations);
 
     // transfers progress to status Settled after tx mining + refresh
@@ -5466,6 +7257,9 @@ fn no_inexistent_utxos() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id,
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: UTXO_SIZE as u64,
                 blinding: None,
@@ -5506,6 +7300,9 @@ fn no_inexistent_utxos() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id,
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: UTXO_SIZE as u64,
                 blinding: None,
@@ -5543,6 +7340,9 @@ fn min_fee_rate() {
                 Recipient {
                     assignment: Assignment::Fungible(amount),
                     recipient_id: receive_data.recipient_id,
+                    public_key: Some(receive_data.public_key.clone()),
+                    expiration_timestamp: Some(receive_data.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: Some(WitnessData {
                         amount_sat,
                         blinding: None,
@@ -5563,6 +7363,7 @@ fn min_fee_rate() {
             fee_rate,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             false,
             None,
         )
@@ -5582,6 +7383,7 @@ fn min_fee_rate() {
             fee_rate,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap()
@@ -5594,7 +7396,7 @@ fn min_fee_rate() {
     assert!(party.refresh_asset(&asset.asset_id));
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn max_fee_exceeded_common(
     asset_id: &str,
     party: &mut SinglesigParty,
@@ -5616,6 +7418,9 @@ fn max_fee_exceeded_common(
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id,
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat,
                 blinding: None,
@@ -5634,6 +7439,7 @@ fn max_fee_exceeded_common(
             fee_rate,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap();
@@ -5641,7 +7447,19 @@ fn max_fee_exceeded_common(
 
     // ACK transfer
     // broadcast tx
-    rcv_party.wait_for_refresh(None);
+    let result = rcv_party.refresh_result(None, &[]).unwrap();
+    assert_eq!(
+        result,
+        HashMap::from([(
+            transfer_idx - 1,
+            RefreshedTransfer {
+                updated_status: None,
+                failure: Some(Error::MaxFeeExceeded {
+                    txid: send_result.txid.clone()
+                }),
+            }
+        )])
+    );
     let result = party.refresh_result(None, &[]).unwrap();
     assert_eq!(
         result,
@@ -5655,9 +7473,31 @@ fn max_fee_exceeded_common(
             }
         )])
     );
-    party.fail_transfers_single(send_result.batch_transfer_idx);
-    let result = party.refresh_result(None, &[]).unwrap();
-    assert_eq!(result, HashMap::new());
+    // v1.0: the signed TX was released to the recipient(s) when they ACKed, so the sender can no
+    // longer revoke it (ack.clean is denied) and the transfer can no longer be failed
+    assert!(matches!(
+        party.wallet.fail_transfers(
+            party.online,
+            Some(send_result.batch_transfer_idx),
+            false,
+            false
+        ),
+        Err(Error::CannotFailBatchTransfer)
+    ));
+}
+
+#[cfg(feature = "bitcoind")]
+#[test]
+#[serial]
+fn max_fee_exceeded_bitcoind() {
+    initialize();
+
+    let mut party = get_funded_party!(BITCOIND_URL.to_string());
+    let mut rcv_party = get_empty_party!(BITCOIND_URL.to_string());
+
+    let asset = party.issue_asset_nia(None);
+
+    max_fee_exceeded_common(&asset.asset_id, &mut party, &mut rcv_party, 2);
 }
 
 #[cfg(feature = "electrum")]
@@ -5688,7 +7528,7 @@ fn max_fee_exceeded_esplora() {
     max_fee_exceeded_common(&asset.asset_id, &mut party, &mut rcv_party, 2);
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn min_relay_fee_common(
     asset_id: &str,
     party: &mut SinglesigParty,
@@ -5708,6 +7548,9 @@ fn min_relay_fee_common(
                 Recipient {
                     assignment: Assignment::Fungible(amount),
                     recipient_id: receive_data.recipient_id,
+                    public_key: Some(receive_data.public_key.clone()),
+                    expiration_timestamp: Some(receive_data.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: Some(WitnessData {
                         amount_sat,
                         blinding: None,
@@ -5730,6 +7573,7 @@ fn min_relay_fee_common(
             fee_rate,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             false,
             None,
         )
@@ -5751,14 +7595,20 @@ fn min_relay_fee_common(
             fee_rate,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap();
     assert!(!send_result.txid.is_empty());
 
-    // ACK transfer
-    // broadcast tx
-    rcv_party.wait_for_refresh(None);
+    // ACK transfer: the recipients post their ACKs; in v1.0 the recipient also broadcasts the
+    // released TX, which hits the same fee error, so a single tolerant refresh is used here (the
+    // sender-side failure is what this test asserts below)
+    let changed = rcv_party
+        .refresh_result(None, &[])
+        .unwrap()
+        .transfers_changed();
+    assert!(changed);
     let result = party.refresh_result(None, &[]).unwrap();
     assert_eq!(
         result,
@@ -5772,9 +7622,31 @@ fn min_relay_fee_common(
             }
         )])
     );
-    party.fail_transfers_single(send_result.batch_transfer_idx);
-    let result = party.refresh_result(None, &[]).unwrap();
-    assert_eq!(result, HashMap::new());
+    // v1.0: the signed TX was released to the recipient(s) when they ACKed, so the sender can no
+    // longer revoke it (ack.clean is denied) and the transfer can no longer be failed
+    assert!(matches!(
+        party.wallet.fail_transfers(
+            party.online,
+            Some(send_result.batch_transfer_idx),
+            false,
+            false
+        ),
+        Err(Error::CannotFailBatchTransfer)
+    ));
+}
+
+#[cfg(feature = "bitcoind")]
+#[test]
+#[parallel]
+fn min_relay_fee_bitcoind() {
+    initialize();
+
+    let mut party = get_funded_party!(BITCOIND_URL.to_string());
+    let mut rcv_party = get_empty_party!(BITCOIND_URL.to_string());
+
+    let asset = party.issue_asset_nia(None);
+
+    min_relay_fee_common(&asset.asset_id, &mut party, &mut rcv_party, 3);
 }
 
 #[cfg(feature = "electrum")]
@@ -5864,6 +7736,9 @@ fn skip_sync() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -5877,6 +7752,7 @@ fn skip_sync() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap()
@@ -5913,6 +7789,9 @@ fn skip_sync() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data_2.recipient_id.clone(),
+            public_key: Some(receive_data_2.public_key.clone()),
+            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -5929,6 +7808,7 @@ fn skip_sync() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap()
@@ -5973,6 +7853,9 @@ fn skip_sync() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data_3.recipient_id.clone(),
+            public_key: Some(receive_data_3.public_key.clone()),
+            expiration_timestamp: Some(receive_data_3.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -5989,6 +7872,7 @@ fn skip_sync() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap()
@@ -6035,7 +7919,10 @@ fn skip_sync() {
         transfer_data.assignments,
         vec![Assignment::Fungible(asset.issued_supply - amount * 3)]
     );
-    assert_eq!(rcv_transfer_data.status, TransferStatus::WaitingBroadcast);
+    assert_eq!(
+        rcv_transfer_data.status,
+        TransferStatus::WaitingConfirmations
+    );
     assert_eq!(transfer_data.status, TransferStatus::WaitingConfirmations);
 
     // mine and refresh skipping sync > cannot refresh ReceiveWitness transfer as a sync is needed
@@ -6113,12 +8000,18 @@ fn ifa_success() {
             Recipient {
                 assignment: Assignment::Fungible(amount_fungible),
                 recipient_id: receive_data_fungible.recipient_id.clone(),
+                public_key: Some(receive_data_fungible.public_key.clone()),
+                expiration_timestamp: Some(receive_data_fungible.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
             Recipient {
                 assignment: Assignment::InflationRight(amount_inflation),
                 recipient_id: receive_data_inflation.recipient_id.clone(),
+                public_key: Some(receive_data_inflation.public_key.clone()),
+                expiration_timestamp: Some(receive_data_inflation.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
@@ -6174,6 +8067,9 @@ fn ifa_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(asset_total),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6203,6 +8099,9 @@ fn ifa_success() {
         vec![Recipient {
             assignment: Assignment::InflationRight(inflation_right_amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6290,6 +8189,9 @@ fn test_reject_list_scenario_1() {
         vec![Recipient {
             assignment: Assignment::Fungible(amt),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6313,6 +8215,9 @@ fn test_reject_list_scenario_1() {
         vec![Recipient {
             assignment: Assignment::Fungible(50),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6342,6 +8247,9 @@ fn test_reject_list_scenario_1() {
         vec![Recipient {
             assignment: Assignment::Fungible(amt + 1),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6355,9 +8263,10 @@ fn test_reject_list_scenario_1() {
 
     // now the previously failed send works since enough allowed allocations
     let receive_data = party_3.blind_receive(); // avoid RecipientIDAlreadyUsed
-    recipient_map_2
-        .entry(asset.asset_id)
-        .and_modify(|r| r[0].recipient_id = receive_data.recipient_id.clone());
+    recipient_map_2.entry(asset.asset_id).and_modify(|r| {
+        r[0].recipient_id = receive_data.recipient_id.clone();
+        r[0].public_key = Some(receive_data.public_key.clone());
+    });
     let _txid = party_2.send_retry(&recipient_map_2);
     party_3.wait_for_refresh(None);
     party_2.wait_for_refresh(None);
@@ -6388,6 +8297,9 @@ fn test_reject_list_scenario_2() {
         vec![Recipient {
             assignment: Assignment::Fungible(70),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6406,6 +8318,9 @@ fn test_reject_list_scenario_2() {
         vec![Recipient {
             assignment: Assignment::Fungible(amt),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6429,6 +8344,9 @@ fn test_reject_list_scenario_2() {
         vec![Recipient {
             assignment: Assignment::Fungible(50),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6458,6 +8376,9 @@ fn test_reject_list_scenario_2() {
         vec![Recipient {
             assignment: Assignment::Fungible(amt + 1),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6471,9 +8392,10 @@ fn test_reject_list_scenario_2() {
 
     // now the previously failed send works since enough allowed allocations
     let receive_data = party_4.blind_receive(); // avoid RecipientIDAlreadyUsed
-    recipient_map_3
-        .entry(asset.asset_id)
-        .and_modify(|r| r[0].recipient_id = receive_data.recipient_id.clone());
+    recipient_map_3.entry(asset.asset_id).and_modify(|r| {
+        r[0].recipient_id = receive_data.recipient_id.clone();
+        r[0].public_key = Some(receive_data.public_key.clone());
+    });
     let _txid = party_3.send_retry(&recipient_map_3);
     party_4.wait_for_refresh(None);
     party_3.wait_for_refresh(None);
@@ -6504,6 +8426,9 @@ fn test_reject_list_scenario_3() {
         vec![Recipient {
             assignment: Assignment::Fungible(amt),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6529,6 +8454,9 @@ fn test_reject_list_scenario_3() {
         vec![Recipient {
             assignment: Assignment::Fungible(50),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6564,6 +8492,9 @@ fn test_reject_list_scenario_4() {
         vec![Recipient {
             assignment: Assignment::Fungible(80),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6581,6 +8512,9 @@ fn test_reject_list_scenario_4() {
         vec![Recipient {
             assignment: Assignment::Fungible(70),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6598,6 +8532,9 @@ fn test_reject_list_scenario_4() {
         vec![Recipient {
             assignment: Assignment::Fungible(65),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6627,6 +8564,9 @@ fn test_reject_list_scenario_4() {
         vec![Recipient {
             assignment: Assignment::Fungible(50),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6661,6 +8601,9 @@ fn test_reject_list_scenario_5() {
         vec![Recipient {
             assignment: Assignment::Fungible(60),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6678,6 +8621,9 @@ fn test_reject_list_scenario_5() {
         vec![Recipient {
             assignment: Assignment::Fungible(70),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6703,6 +8649,9 @@ fn test_reject_list_scenario_5() {
         vec![Recipient {
             assignment: Assignment::Fungible(40),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -6740,6 +8689,9 @@ fn pending_witness_ma1_blind_receive_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -6756,6 +8708,7 @@ fn pending_witness_ma1_blind_receive_fail() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap();
@@ -6814,6 +8767,9 @@ fn pending_witness_txo() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -6854,11 +8810,14 @@ fn pending_witness_txo() {
     let rcv_pending_witness_scripts = rcv_party.db_pending_witness_scripts();
     assert_eq!(rcv_pending_witness_scripts.len(), 1);
 
-    // refresh the recipient: it ACKs and waits for the sender's broadcast
+    // refresh the recipient to move the transfer to WaitingConfirmations
     rcv_party.refresh_all();
     let rcv_transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
     let (rcv_transfer_data, _) = rcv_party.get_test_transfer_data(&rcv_transfer);
-    assert_eq!(rcv_transfer_data.status, TransferStatus::WaitingBroadcast);
+    assert_eq!(
+        rcv_transfer_data.status,
+        TransferStatus::WaitingConfirmations
+    );
 
     // check the recipient now sees the TXO yet as inexistent + pending witness
     let rcv_txos = rcv_party.db_txos();
@@ -6930,6 +8889,9 @@ fn pending_witness_txo() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -6946,6 +8908,7 @@ fn pending_witness_txo() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap();
@@ -7047,11 +9010,13 @@ fn blinded_change_failed_xfer() {
     let receive_data = party_2
         .wallet
         .blind_receive(
+            Some(party_2.online),
             None,
             Assignment::Any,
-            (now().unix_timestamp() + 1) as u64, // expire early so can fail
+            default_rcv_expiration(), // v1.0: keep the proxy reservation valid for the send; the recipient is failed via its explicit batch idx (is_fallible, no expiry needed)
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let recipient_map = HashMap::from([(
@@ -7059,6 +9024,9 @@ fn blinded_change_failed_xfer() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7084,6 +9052,9 @@ fn blinded_change_failed_xfer() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7112,6 +9083,9 @@ fn blinded_change_failed_xfer() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7137,6 +9111,9 @@ fn blinded_change_failed_xfer() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7189,11 +9166,13 @@ fn blinded_change_send_begin_only() {
     let receive_data = party_2
         .wallet
         .blind_receive(
+            Some(party_2.online),
             None,
             Assignment::Any,
-            (now().unix_timestamp() + 1) as u64, // expire early so can fail
+            default_rcv_expiration(), // v1.0: keep the proxy reservation valid for the send; the recipient is failed via its explicit batch idx (is_fallible, no expiry needed)
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let recipient_map = HashMap::from([(
@@ -7201,6 +9180,9 @@ fn blinded_change_send_begin_only() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7230,6 +9212,9 @@ fn blinded_change_send_begin_only() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7259,6 +9244,9 @@ fn blinded_change_send_begin_only() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7284,6 +9272,9 @@ fn blinded_change_send_begin_only() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7333,11 +9324,13 @@ fn donation_recipient_nack() {
     let receive_data = party_2
         .wallet
         .blind_receive(
+            Some(party_2.online),
             None,
             Assignment::Any,
-            (now().unix_timestamp() + 1) as u64, // expire early so can fail
+            default_rcv_expiration(), // v1.0: keep the proxy reservation valid for the send; the recipient is failed via its explicit batch idx (is_fallible, no expiry needed)
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let recipient_map = HashMap::from([(
@@ -7345,6 +9338,9 @@ fn donation_recipient_nack() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7362,17 +9358,15 @@ fn donation_recipient_nack() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .unwrap()
         .txid;
     assert!(!txid.is_empty());
-    // manually NACK the transfer
+    // a donation broadcasts immediately and has no sender-proxy ACK machinery, so a recipient NACK
+    // cannot stop it
     assert!(party_1.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
-    let proxy_client = get_proxy_client(None);
-    proxy_client
-        .post_ack(&receive_data.recipient_id, false)
-        .unwrap();
     // settle on sender side
     mine(false);
     party_1.wait_for_refresh(None);
@@ -7396,6 +9390,9 @@ fn donation_recipient_nack() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7421,6 +9418,9 @@ fn donation_recipient_nack() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7468,6 +9468,9 @@ fn send_end_without_send_begin() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7696,24 +9699,36 @@ fn allocations() {
                 Recipient {
                     assignment: Assignment::Fungible(amount_1),
                     recipient_id: receive_data_1.recipient_id.clone(),
+                    public_key: Some(receive_data_1.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
                 Recipient {
                     assignment: Assignment::Fungible(amount_2),
                     recipient_id: receive_data_2.recipient_id.clone(),
+                    public_key: Some(receive_data_2.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
                 Recipient {
                     assignment: Assignment::Fungible(amount_3),
                     recipient_id: receive_data_3.recipient_id.clone(),
+                    public_key: Some(receive_data_3.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_3.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
                 Recipient {
                     assignment: Assignment::Fungible(amount_4),
                     recipient_id: receive_data_4.recipient_id.clone(),
+                    public_key: Some(receive_data_4.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_4.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
@@ -7725,12 +9740,18 @@ fn allocations() {
                 Recipient {
                     assignment: Assignment::Fungible(amount_5),
                     recipient_id: receive_data_5.recipient_id.clone(),
+                    public_key: Some(receive_data_5.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_5.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
                 Recipient {
                     assignment: Assignment::Fungible(amount_6),
                     recipient_id: receive_data_6.recipient_id.clone(),
+                    public_key: Some(receive_data_6.public_key.clone()),
+                    expiration_timestamp: Some(receive_data_6.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
@@ -7764,6 +9785,9 @@ fn allocations() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_1 + amount_2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7841,6 +9865,9 @@ fn allocations() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_3 / 2),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -7981,12 +10008,18 @@ fn p2wpkh_send_receive_nia() {
             Recipient {
                 assignment: Assignment::Fungible(amount_blind),
                 recipient_id: receive_blind.recipient_id.clone(),
+                public_key: Some(receive_blind.public_key.clone()),
+                expiration_timestamp: Some(receive_blind.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
             Recipient {
                 assignment: Assignment::Fungible(amount_witness),
                 recipient_id: receive_witness.recipient_id.clone(),
+                public_key: Some(receive_witness.public_key.clone()),
+                expiration_timestamp: Some(receive_witness.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: Some(WitnessData {
                     amount_sat: 1000,
                     blinding: None,
@@ -8034,6 +10067,9 @@ fn cross_type_p2tr_to_p2wpkh() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -8060,6 +10096,9 @@ fn cross_type_p2tr_to_p2wpkh() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_back),
             recipient_id: receive_back.recipient_id.clone(),
+            public_key: Some(receive_back.public_key.clone()),
+            expiration_timestamp: Some(receive_back.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -8102,6 +10141,9 @@ fn unsafe_history_waits_for_safe_height() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_1),
             recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -8125,11 +10167,13 @@ fn unsafe_history_waits_for_safe_height() {
     let receive_data_2 = party_2
         .wallet
         .blind_receive(
+            Some(party_2.online),
             None,
             Assignment::Any,
             (now().unix_timestamp() + DURATION_RCV_TRANSFER as i64) as u64,
             vec![],
             2,
+            None,
         )
         .unwrap();
     let recipient_map_2 = HashMap::from([(
@@ -8137,6 +10181,9 @@ fn unsafe_history_waits_for_safe_height() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount_2),
             recipient_id: receive_data_2.recipient_id.clone(),
+            public_key: Some(receive_data_2.public_key.clone()),
+            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: vec![],
         }],
@@ -8228,6 +10275,9 @@ fn begin_end() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -8244,6 +10294,7 @@ fn begin_end() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             true,
             None,
         )
@@ -8265,6 +10316,7 @@ fn begin_end() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             false,
             None,
         )
@@ -8301,21 +10353,25 @@ fn out_of_band_success() {
     let receive_blind = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let receive_witness = rcv_party
         .wallet
         .witness_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     // the out-of-band exchange stores no transport endpoint at all
@@ -8330,15 +10386,23 @@ fn out_of_band_success() {
     let recipient_map = HashMap::from([(
         asset.asset_id.clone(),
         vec![
+            // the out-of-band exchange has no use for the recipient's public key: it may be left
+            // out (as here) or provided (as for the witness recipient below), it is ignored
             Recipient {
                 assignment: Assignment::Fungible(amount_blind),
                 recipient_id: receive_blind.recipient_id.clone(),
+                public_key: None,
+                expiration_timestamp: None,
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: vec![],
             },
             Recipient {
                 assignment: Assignment::Fungible(amount_witness),
                 recipient_id: receive_witness.recipient_id.clone(),
+                public_key: Some(receive_witness.public_key.clone()),
+                expiration_timestamp: Some(receive_witness.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: Some(WitnessData {
                     amount_sat,
                     blinding: None,
@@ -8347,7 +10411,19 @@ fn out_of_band_success() {
             },
         ],
     )]);
-    let operation_result = party.send(recipient_map, FEE_RATE, None);
+    // every recipient is out-of-band: no sender transport endpoint is needed either
+    let operation_result = party
+        .wallet
+        .send(
+            party.online,
+            recipient_map,
+            false,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            default_send_expiration(),
+            None,
+        )
+        .unwrap();
     let txid = operation_result.txid;
     assert!(!txid.is_empty());
 
@@ -8447,11 +10523,13 @@ fn out_of_band_fail() {
     let receive_data = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let recipient_map = HashMap::from([(
@@ -8459,6 +10537,9 @@ fn out_of_band_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: vec![s!("")],
         }],
@@ -8477,6 +10558,9 @@ fn out_of_band_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -8557,11 +10641,13 @@ fn out_of_band_fail() {
     let receive_out_of_band = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let recipient_map = HashMap::from([(
@@ -8569,21 +10655,31 @@ fn out_of_band_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_out_of_band.recipient_id.clone(),
+            public_key: Some(receive_out_of_band.public_key.clone()),
+            expiration_timestamp: Some(receive_out_of_band.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: vec![],
         }],
     )]);
     let operation_result = party.send(recipient_map, FEE_RATE, None);
-    // swapping in a different schema doesn't change the contract ID (which comes from the
-    // genesis), so the consignment still matches the pending receive, but it no longer validates
-    // against its own genesis
+    // tampering with a transition doesn't change the contract ID (which comes from the genesis),
+    // so the consignment still matches the pending receive, but it no longer validates
     let consignment_path = party
         .wallet
         .get_send_consignment_path(&asset.asset_id, &operation_result.txid)
         .to_string_lossy()
         .to_string();
     let mut consignment = RgbTransfer::load_file(&consignment_path).unwrap();
-    consignment.schema = CollectibleFungibleAsset::schema();
+    let witness_id = consignment.bundled_witnesses().next().unwrap().witness_id();
+    assert!(consignment.modify_bundle(witness_id, |witness_bundle| {
+        let bundle = witness_bundle.bundle_mut();
+        let mut known_transitions = bundle.known_transitions.to_unconfined();
+        known_transitions[0].transition.nonce =
+            known_transitions[0].transition.nonce.wrapping_add(1);
+        bundle.known_transitions =
+            amplify::confinement::NonEmptyVec::from_iter_checked(known_transitions);
+    }));
     assert_eq!(consignment.contract_id().to_string(), asset.asset_id);
     let invalid_file = tempfile::NamedTempFile::with_prefix("out_of_band_fail::").unwrap();
     consignment.save_file(invalid_file.path()).unwrap();
@@ -8622,15 +10718,19 @@ fn out_of_band_fail() {
     ));
 
     // provide_out_of_band_ack on an expired transfer
-    let expiration_secs: u64 = 1;
+    // allow operations expiring within seconds
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(1));
+    let expiration_secs: u64 = 2;
     let receive_expiring = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let recipient_map = HashMap::from([(
@@ -8638,6 +10738,9 @@ fn out_of_band_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_expiring.recipient_id.clone(),
+            public_key: Some(receive_expiring.public_key.clone()),
+            expiration_timestamp: Some(receive_expiring.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: vec![],
         }],
@@ -8679,6 +10782,7 @@ fn out_of_band_media() {
     fn out_of_band_recipient_map(
         asset_id: &str,
         recipient_id: &str,
+        public_key: &str,
         amount: u64,
     ) -> HashMap<String, Vec<Recipient>> {
         HashMap::from([(
@@ -8686,6 +10790,9 @@ fn out_of_band_media() {
             vec![Recipient {
                 assignment: Assignment::Fungible(amount),
                 recipient_id: recipient_id.to_string(),
+                public_key: Some(public_key.to_string()),
+                expiration_timestamp: None,
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: vec![],
             }],
@@ -8701,38 +10808,48 @@ fn out_of_band_media() {
     let receive_data_1 = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let receive_data_2 = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let receive_data_3 = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
 
     // three separate sends (one per receiver)
     let (consignment_path_1, batch_transfer_idx_1) = {
-        let recipient_map =
-            out_of_band_recipient_map(&asset_a.asset_id, &receive_data_1.recipient_id, amount);
+        let recipient_map = out_of_band_recipient_map(
+            &asset_a.asset_id,
+            &receive_data_1.recipient_id,
+            &receive_data_1.public_key,
+            amount,
+        );
         let op_result = party.send(recipient_map, FEE_RATE, None);
         (
             party
@@ -8746,8 +10863,12 @@ fn out_of_band_media() {
     party.fail_transfers_single(batch_transfer_idx_1);
     party.show_unspent_colorings("party after send 1");
     let (consignment_path_2, batch_transfer_idx_2) = {
-        let recipient_map =
-            out_of_band_recipient_map(&asset_a.asset_id, &receive_data_2.recipient_id, amount);
+        let recipient_map = out_of_band_recipient_map(
+            &asset_a.asset_id,
+            &receive_data_2.recipient_id,
+            &receive_data_2.public_key,
+            amount,
+        );
         let op_result = party.send(recipient_map, FEE_RATE, None);
         (
             party
@@ -8761,8 +10882,12 @@ fn out_of_band_media() {
     party.fail_transfers_single(batch_transfer_idx_2);
     party.show_unspent_colorings("party after send 2");
     let consignment_path_3 = {
-        let recipient_map =
-            out_of_band_recipient_map(&asset_b.asset_id, &receive_data_3.recipient_id, amount);
+        let recipient_map = out_of_band_recipient_map(
+            &asset_b.asset_id,
+            &receive_data_3.recipient_id,
+            &receive_data_3.public_key,
+            amount,
+        );
         let op_result = party.send(recipient_map, FEE_RATE, None);
         party
             .wallet
@@ -8836,11 +10961,13 @@ fn out_of_band_media_cleanup() {
     let receive_data = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
 
@@ -8849,6 +10976,9 @@ fn out_of_band_media_cleanup() {
         vec![Recipient {
             assignment: Assignment::NonFungible,
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: vec![],
         }],
@@ -8931,6 +11061,9 @@ fn proxy_media_cleanup() {
             vec![Recipient {
                 assignment: Assignment::NonFungible,
                 recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: vec![],
             }],
@@ -8947,14 +11080,28 @@ fn proxy_media_cleanup() {
 
         // post the consignment and the token media; for the mismatching case also post the
         // attachment under its contract digest but with the token's contents
-        proxy_client
-            .post_consignment(&receive_data.recipient_id, &consignment_path, &txid, None)
-            .unwrap();
-        proxy_client.post_media(&token_digest, FILE_STR).unwrap();
+        let (sender_sk, transfer_id) = post_test_consignment(
+            &proxy_client,
+            &receive_data.recipient_id,
+            &receive_data.public_key,
+            &consignment_path,
+            &hash_bytes_hex(&std::fs::read(&consignment_path).unwrap()),
+        );
+        post_test_media(
+            &proxy_client,
+            &sender_sk,
+            &transfer_id,
+            &token_digest,
+            Path::new(FILE_STR),
+        );
         if post_mismatching_media {
-            proxy_client
-                .post_media(&attachment_digest, FILE_STR)
-                .unwrap();
+            post_test_media(
+                &proxy_client,
+                &sender_sk,
+                &transfer_id,
+                &attachment_digest,
+                Path::new(FILE_STR),
+            );
         }
 
         rcv_party.wait_for_refresh(None);
@@ -9014,11 +11161,13 @@ fn out_of_band_mixed_batch() {
     let receive_out_of_band = rcv_out_of_band
         .wallet
         .blind_receive(
+            Some(rcv_out_of_band.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
 
@@ -9029,12 +11178,18 @@ fn out_of_band_mixed_batch() {
             Recipient {
                 assignment: Assignment::Fungible(amount_proxy),
                 recipient_id: receive_proxy.recipient_id.clone(),
+                public_key: Some(receive_proxy.public_key.clone()),
+                expiration_timestamp: Some(receive_proxy.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
             Recipient {
                 assignment: Assignment::Fungible(amount_out_of_band),
                 recipient_id: receive_out_of_band.recipient_id.clone(),
+                public_key: None, // not needed for the out-of-band exchange
+                expiration_timestamp: None,
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: vec![],
             },
@@ -9044,6 +11199,18 @@ fn out_of_band_mixed_batch() {
     let txid = operation_result.txid;
     assert!(!txid.is_empty());
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
+
+    // only the proxy recipient is registered on the sender proxy: its transfer stores the
+    // recipient proxy (and the sender proxy) endpoints, the out-of-band one stores none
+    let (send_transfers, _, _) = party.get_test_transfers_sender(&txid);
+    for send_transfer in send_transfers.get(&asset.asset_id).unwrap() {
+        let send_tte_data = party.db_transfer_transport_endpoints_data(send_transfer.idx);
+        if send_transfer.recipient_id.as_deref() == Some(&receive_proxy.recipient_id) {
+            assert_eq!(send_tte_data.len(), 1);
+        } else {
+            assert!(send_tte_data.is_empty());
+        }
+    }
 
     // the out-of-band recipient validates its consignment (delivered out-of-band)
     let consignment_path = party
@@ -9135,21 +11302,25 @@ fn out_of_band_consignment_multiple_receives() {
     let receive_1 = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let receive_2 = rcv_party
         .wallet
         .blind_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
 
@@ -9161,12 +11332,18 @@ fn out_of_band_consignment_multiple_receives() {
             Recipient {
                 assignment: Assignment::Fungible(amount_1),
                 recipient_id: receive_1.recipient_id.clone(),
+                public_key: Some(receive_1.public_key.clone()),
+                expiration_timestamp: Some(receive_1.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: vec![],
             },
             Recipient {
                 assignment: Assignment::Fungible(amount_2),
                 recipient_id: receive_2.recipient_id.clone(),
+                public_key: Some(receive_2.public_key.clone()),
+                expiration_timestamp: Some(receive_2.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: vec![],
             },
@@ -9241,48 +11418,897 @@ fn out_of_band_consignment_multiple_receives() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn invalid_proxy_consignment_bytes() {
+fn fail_no_terminals() {
     initialize();
 
-    let mut server = mockito::Server::new();
-    let server_url = server.url();
-    let host = server_url.trim_start_matches("http://");
-    let transport_endpoints = vec![format!("rpc://{host}")];
+    let amount: u64 = 66;
 
-    let consignment_mock = server
-        .mock("POST", "/")
-        .match_header("content-type", "application/json")
-        .match_body(mockito::Matcher::Regex("consignment\\.get".to_string()))
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"jsonrpc":"2.0","id":null,"result":{"consignment":"!!!","txid":"0000000000000000000000000000000000000000000000000000000000000000","vout":null}}"#,
-        )
-        .create();
-
-    let ack_mock = server
-        .mock("POST", "/")
-        .match_header("content-type", "application/json")
-        .match_body(mockito::Matcher::Regex("ack\\.post".to_string()))
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(r#"{"jsonrpc":"2.0","id":null,"result":true}"#)
-        .create();
-
+    // wallets
+    let mut party = get_funded_party!();
     let mut rcv_party = get_funded_party!();
-    let receive_data = rcv_party.blind_receive_with_endpoints(None, transport_endpoints);
 
+    // issue
+    let asset = party.issue_asset_nia(None);
+
+    // send, stripping the terminals from the generated consignment
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+        }],
+    )]);
+    println!("setting MOCK_STRIP_TERMINALS");
+    MOCK_STRIP_TERMINALS.replace(Some(()));
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+
+    // the receiver refuses the consignment and both sides end up Failed
     rcv_party.wait_for_refresh(None);
+    let rcv_transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
+    let (rcv_transfer_data, _) = rcv_party.get_test_transfer_data(&rcv_transfer);
+    assert_eq!(rcv_transfer_data.status, TransferStatus::Failed);
 
+    party.wait_for_refresh(Some(&asset.asset_id));
+    let batch_transfers = party.db_batch_transfers_filtered(&txid);
+    let batch_transfer = batch_transfers.first().unwrap();
+    let asset_transfer = party.get_test_asset_transfer(batch_transfer.idx);
+    for transfer in party.db_transfers_filtered(asset_transfer.idx) {
+        let (transfer_data, _) = party.get_test_transfer_data(&transfer);
+        assert_eq!(transfer_data.status, TransferStatus::Failed);
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn proxy_auth() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    // issue
+    let asset = party.issue_asset_nia(None);
+
+    // receive on the authenticated proxy (the recipient needs the key to reserve its ID)
+    let transport_endpoints = vec![PROXY_ENDPOINT_AUTH.clone()];
+    rcv_party.set_proxy_auth_keys(HashMap::from([(
+        PROXY_ENDPOINT_AUTH.clone(),
+        PROXY_AUTH_SEED.to_string(),
+    )]));
+    let receive_data = rcv_party.blind_receive_with_endpoints(None, transport_endpoints.clone());
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints,
+        }],
+    )]);
+
+    // the authenticated proxy rejects an unsigned ack.prepare from the sender
+    let result = party.wallet.send(
+        party.online,
+        recipient_map.clone(),
+        false,
+        FEE_RATE,
+        MIN_CONFIRMATIONS,
+        default_send_expiration(),
+        Some(PROXY_ENDPOINT_AUTH.clone()),
+    );
+    assert!(matches!(result, Err(Error::Proxy { details }) if details == "Missing: signature"));
+    // the failed send was rolled back entirely, only the issuance transfer is left
+    assert_eq!(party.list_transfers(Some(&asset.asset_id)).len(), 1);
+
+    // the authenticated proxy rejects an ack.prepare signed with the wrong key
+    let mut wrong_seed = hex::decode(PROXY_AUTH_SEED).unwrap();
+    wrong_seed[0] ^= 1;
+    party.set_proxy_auth_keys(HashMap::from([(
+        PROXY_ENDPOINT_AUTH.clone(),
+        hex::encode(wrong_seed),
+    )]));
+    let result = party.wallet.send(
+        party.online,
+        recipient_map.clone(),
+        false,
+        FEE_RATE,
+        MIN_CONFIRMATIONS,
+        default_send_expiration(),
+        Some(PROXY_ENDPOINT_AUTH.clone()),
+    );
+    assert!(matches!(result, Err(Error::InvalidProxyAuthSignature)));
+    // the failed send was rolled back entirely, only the issuance transfer is left
+    assert_eq!(party.list_transfers(Some(&asset.asset_id)).len(), 1);
+
+    // the send goes through once the sender sets the proxy authentication key
+    party.set_proxy_auth_keys(HashMap::from([(
+        PROXY_ENDPOINT_AUTH.clone(),
+        PROXY_AUTH_SEED.to_string(),
+    )]));
+    let txid = party
+        .wallet
+        .send(
+            party.online,
+            recipient_map,
+            false,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            default_send_expiration(),
+            Some(PROXY_ENDPOINT_AUTH.clone()),
+        )
+        .unwrap()
+        .txid;
+    assert!(!txid.is_empty());
+    let (transfer, _, _) = party.get_test_transfer_sender(&txid);
+    let tte_data = party.db_transfer_transport_endpoints_data(transfer.idx);
+    assert_eq!(tte_data.len(), 1);
+    assert_eq!(tte_data[0].1.endpoint, PROXY_URL_AUTH);
+    assert!(tte_data[0].0.used);
+
+    // settle the transfer
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    let rcv_transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
+    let (rcv_transfer_data, _) = rcv_party.get_test_transfer_data(&rcv_transfer);
+    let (transfer, _, _) = party.get_test_transfer_sender(&txid);
+    let (transfer_data, _) = party.get_test_transfer_data(&transfer);
+    assert_eq!(rcv_transfer_data.status, TransferStatus::Settled);
+    assert_eq!(transfer_data.status, TransferStatus::Settled);
+}
+
+/// A recipient NACKs a transfer whose sender proxy retention grace is below its acceptable minimum,
+/// as it may not obtain a released TX in time (`v1.0-changes-spec.md` 6.4).
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn recipient_nacks_short_retention_grace() {
+    initialize();
+
+    let amount: u64 = 66;
+    // the test proxy grants the default retention grace, which is below this minimum
+    MOCK_MIN_RETENTION_GRACE.replace(Some(u32::MAX));
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+
+    // the recipient NACKs and fails the transfer
+    rcv_party.wait_for_refresh(None);
     assert!(
         rcv_party.check_test_transfer_status_recipient(
             &receive_data.recipient_id,
             TransferStatus::Failed
         )
     );
+    let transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
+    assert_eq!(transfer.ack, None);
 
-    consignment_mock.assert();
-    ack_mock.assert();
+    // the sender sees the NACK and fails the transfer too
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
+}
+
+/// A recipient that ACKed a batch transfer without obtaining the TX keeps posting its ACK and, if no
+/// definite answer is obtained, fails the transfer only once the broadcast deadline (the operation
+/// `expires_at` returned by `ack.post` plus the sender proxy retention grace) and the confirmation
+/// margin have passed (`v1.0-changes-spec.md` 6.4).
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn recipient_waits_broadcast_deadline() {
+    initialize();
+
+    let amount: u64 = 66;
+    let retention_grace: u32 = 5;
+    let confirmation_margin: u32 = 5;
+    MOCK_RETENTION_GRACE.replace(Some(retention_grace));
+    MOCK_MIN_RETENTION_GRACE.replace(Some(0));
+    MOCK_CONFIRMATION_MARGIN.replace(Some(confirmation_margin));
+    // allow the short operation expiration below
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(5));
+
+    let mut party = get_funded_party!();
+    let mut rcv_party_1 = get_funded_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    // the sender proxy is reached through a proxy that can be made to fail ack.post calls
+    let fail_ack = Arc::new(AtomicBool::new(false));
+    let (server, _mock, _) = failing_ack_proxy(fail_ack.clone());
+    let failing_ack_endpoint = format!("rpc://{}/json-rpc", server.host_with_port());
+
+    // batch send: recipient 1 ACKs, recipient 2 never responds, so the TX is never released
+    let receive_data_1 = rcv_party_1.blind_receive();
+    let receive_data_2 = rcv_party_2.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        [&receive_data_1, &receive_data_2]
+            .iter()
+            .map(|receive_data| Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            })
+            .collect(),
+    )]);
+    let expiration = now().unix_timestamp() + 20;
+    let send_result = party
+        .wallet
+        .send(
+            party.online,
+            recipient_map,
+            false,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            expiration as u64,
+            Some(failing_ack_endpoint),
+        )
+        .unwrap();
+    assert!(!send_result.txid.is_empty());
+    // the sender saved the broadcast deadline
+    let deadline = expiration + i64::from(retention_grace);
+    let batch_transfer = party.db_batch_transfer(send_result.batch_transfer_idx);
+    assert_eq!(batch_transfer.broadcast_deadline, Some(deadline));
+
+    // recipient 1 ACKs, gets no TX and saves the broadcast deadline from the returned expires_at
+    rcv_party_1.wait_for_refresh(None);
+    assert!(rcv_party_1.check_test_transfer_status_recipient(
+        &receive_data_1.recipient_id,
+        TransferStatus::WaitingBroadcast
+    ));
+    let batch_transfer = rcv_party_1.db_batch_transfer(receive_data_1.batch_transfer_idx);
+    assert_eq!(batch_transfer.broadcast_deadline, Some(deadline));
+
+    // the sender proxy stops answering: before the broadcast deadline plus the confirmation margin
+    // the transfer keeps waiting and cannot be failed
+    fail_ack.store(true, Ordering::Relaxed);
+    let sleep_until = |timestamp: i64| {
+        let sleep_secs = std::cmp::max(timestamp - now().unix_timestamp(), 0) as u64;
+        std::thread::sleep(Duration::from_secs(sleep_secs));
+    };
+    // past the operation expiration, which alone doesn't allow failing it
+    sleep_until(expiration + 2);
+    let refresh_res = rcv_party_1.refresh_result(None, &[]).unwrap();
+    let refreshed = &refresh_res[&receive_data_1.batch_transfer_idx];
+    assert!(refreshed.updated_status.is_none());
+    assert_matches!(refreshed.failure, Some(Error::Proxy { .. }));
+    let res = rcv_party_1.fail_transfers(Some(receive_data_1.batch_transfer_idx), false, false);
+    assert_matches!(res, Err(Error::CannotFailBatchTransfer));
+    assert!(!rcv_party_1.fail_transfers_all());
+    assert!(rcv_party_1.check_test_transfer_status_recipient(
+        &receive_data_1.recipient_id,
+        TransferStatus::WaitingBroadcast
+    ));
+
+    // past the broadcast deadline plus the confirmation margin the TX is not on-chain, so the
+    // transfer is failed
+    sleep_until(deadline + i64::from(confirmation_margin) + 2);
+    let refresh_res = rcv_party_1.refresh_result(None, &[]).unwrap();
+    let refreshed = &refresh_res[&receive_data_1.batch_transfer_idx];
+    assert!(refreshed.failure.is_none());
+    assert_eq!(refreshed.updated_status, Some(TransferStatus::Failed));
+}
+
+/// A recipient whose released TX is not confirmed by the broadcast deadline plus the confirmation
+/// margin fails the transfer (`v1.0-changes-spec.md` 6.4). Mining is stopped, as the TX must not
+/// get confirmed.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn recipient_fails_unconfirmed_past_deadline() {
+    initialize();
+
+    let amount: u64 = 66;
+    let retention_grace: u32 = 5;
+    let confirmation_margin: u32 = 5;
+    MOCK_RETENTION_GRACE.replace(Some(retention_grace));
+    MOCK_MIN_RETENTION_GRACE.replace(Some(0));
+    MOCK_CONFIRMATION_MARGIN.replace(Some(confirmation_margin));
+    // allow the short operation expiration below
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(5));
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let expiration = now().unix_timestamp() + 20;
+    let _guard = stop_mining();
+    let txid = party
+        .send(recipient_map, FEE_RATE, Some(expiration as u64))
+        .txid;
+    assert!(!txid.is_empty());
+
+    // the recipient ACKs, obtains the TX and broadcasts it, saving it
+    rcv_party.wait_for_refresh(None);
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+    let deadline = expiration + i64::from(retention_grace);
+    let batch_transfer = rcv_party.db_batch_transfer(receive_data.batch_transfer_idx);
+    assert_eq!(batch_transfer.broadcast_deadline, Some(deadline));
+    let saved_tx = rcv_party
+        .wallet
+        .get_receive_consignment_path(&receive_data.recipient_id)
+        .with_file_name("rcv_signed.tx");
+    assert!(saved_tx.exists());
+
+    // before the broadcast deadline plus the confirmation margin the transfer keeps waiting
+    let refresh_res = rcv_party.refresh_result(None, &[]).unwrap();
+    assert!(
+        refresh_res[&receive_data.batch_transfer_idx]
+            .updated_status
+            .is_none()
+    );
+
+    // the TX is never mined: past the broadcast deadline plus the confirmation margin the
+    // transfer is failed
+    let sleep_secs = std::cmp::max(
+        deadline + i64::from(confirmation_margin) + 2 - now().unix_timestamp(),
+        0,
+    ) as u64;
+    std::thread::sleep(Duration::from_secs(sleep_secs));
+    let refresh_res = rcv_party.refresh_result(None, &[]).unwrap();
+    let refreshed = &refresh_res[&receive_data.batch_transfer_idx];
+    assert!(refreshed.failure.is_none());
+    assert_eq!(refreshed.updated_status, Some(TransferStatus::Failed));
+}
+
+/// The operation `expires_at` an `ack.post` returns comes from the sender proxy, which the sender
+/// picks, so a recipient cannot trust it: an expiration beyond the invoice one is refused instead
+/// of being saved as the broadcast deadline, since the margins the deadline checks add to it would
+/// overflow, leaving the transfer impossible to refresh or fail (`v1.0-changes-spec.md` 6.1, 6.4).
+/// Mining is stopped, as the deadline of an unconfirmed TX is the one being checked.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn hostile_sender_proxy_expiration() {
+    initialize();
+
+    let amount: u64 = 66;
+    let retention_grace: u32 = 5;
+    MOCK_RETENTION_GRACE.replace(Some(retention_grace));
+    MOCK_MIN_RETENTION_GRACE.replace(Some(0));
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    // the sender proxy returns the highest expiration whose deadline doesn't overflow on the spot:
+    // saving it would overflow the confirmation margin added to it by every later check
+    let hostile_expiration = i64::MAX - i64::from(retention_grace);
+    let (server, _mock) = expires_at_proxy(hostile_expiration.to_string());
+    let sender_endpoint = format!("rpc://{}/json-rpc", server.host_with_port());
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let _guard = stop_mining();
+    let txid = party
+        .wallet
+        .send(
+            party.online,
+            recipient_map,
+            false,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            default_send_expiration(),
+            Some(sender_endpoint),
+        )
+        .unwrap()
+        .txid;
+    assert!(!txid.is_empty());
+
+    // the recipient ACKs and obtains the TX
+    rcv_party.wait_for_refresh(None);
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+
+    // a further refresh checks the broadcast deadline of the TX, not confirmed yet, against the
+    // confirmation margin: saving the expiration the sender proxy returned as the deadline would
+    // make that check overflow, here and on every later refresh
+    let refresh_res = rcv_party.refresh_result(None, &[]).unwrap();
+    let refreshed = &refresh_res[&receive_data.batch_transfer_idx];
+    assert!(refreshed.failure.is_none());
+    assert!(refreshed.updated_status.is_none());
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+
+    // the expiration the sender proxy returned is past the invoice one, so it cannot be the
+    // operation expiration and gives no broadcast deadline
+    let batch_transfer = rcv_party.db_batch_transfer(receive_data.batch_transfer_idx);
+    assert_eq!(batch_transfer.broadcast_deadline, None);
+}
+
+/// A recipient that ACKed a transfer whose sender proxy returned a hostile operation expiration
+/// saves no broadcast deadline for it (see `hostile_sender_proxy_expiration`), so it keeps polling
+/// the sender proxy and fails the transfer once the proxy reports the operation expired, as the
+/// TX can then no longer be released (`v1.0-changes-spec.md` 6.4). Recipient 2 never responds, so
+/// the TX is never released and recipient 1 keeps waiting for it.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn hostile_sender_proxy_expiration_can_be_failed() {
+    initialize();
+
+    let amount: u64 = 66;
+    let retention_grace: u32 = 5;
+    MOCK_RETENTION_GRACE.replace(Some(retention_grace));
+    MOCK_MIN_RETENTION_GRACE.replace(Some(0));
+    // allow the short operation expiration below
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(5));
+
+    let mut party = get_funded_party!();
+    let mut rcv_party_1 = get_funded_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    // the sender proxy returns the highest expiration whose deadline doesn't overflow on the spot:
+    // saving it would overflow the margins added to it by every later check
+    let hostile_expiration = i64::MAX - i64::from(retention_grace);
+    let (server, _mock) = expires_at_proxy(hostile_expiration.to_string());
+    let sender_endpoint = format!("rpc://{}/json-rpc", server.host_with_port());
+
+    let receive_data_1 = rcv_party_1.blind_receive();
+    let receive_data_2 = rcv_party_2.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        [&receive_data_1, &receive_data_2]
+            .iter()
+            .map(|receive_data| Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            })
+            .collect(),
+    )]);
+    let expiration = now().unix_timestamp() + 20;
+    let send_result = party
+        .wallet
+        .send(
+            party.online,
+            recipient_map,
+            false,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            expiration as u64,
+            Some(sender_endpoint),
+        )
+        .unwrap();
+    assert!(!send_result.txid.is_empty());
+
+    // recipient 1 ACKs, gets no TX and refuses the expiration the sender proxy returned, so it
+    // saves no broadcast deadline
+    rcv_party_1.wait_for_refresh(None);
+    assert!(rcv_party_1.check_test_transfer_status_recipient(
+        &receive_data_1.recipient_id,
+        TransferStatus::WaitingBroadcast
+    ));
+    let batch_transfer = rcv_party_1.db_batch_transfer(receive_data_1.batch_transfer_idx);
+    assert_eq!(batch_transfer.broadcast_deadline, None);
+
+    // a further refresh polls the sender proxy again, checking the deadlines that saving the
+    // returned expiration would have made overflow, here and on every later refresh
+    let refresh_res = rcv_party_1.refresh_result(None, &[]).unwrap();
+    let refreshed = &refresh_res[&receive_data_1.batch_transfer_idx];
+    assert!(refreshed.failure.is_none());
+    assert!(refreshed.updated_status.is_none());
+
+    // before the operation expiration the TX can still be released, so the transfer is kept
+    let res = rcv_party_1.fail_transfers(Some(receive_data_1.batch_transfer_idx), false, false);
+    assert_matches!(res, Err(Error::CannotFailBatchTransfer));
+    assert!(rcv_party_1.check_test_transfer_status_recipient(
+        &receive_data_1.recipient_id,
+        TransferStatus::WaitingBroadcast
+    ));
+
+    // past the operation expiration the sender proxy reports it and the transfer is failed
+    let sleep_secs = std::cmp::max(expiration + 2 - now().unix_timestamp(), 0) as u64;
+    std::thread::sleep(Duration::from_secs(sleep_secs));
+    let refresh_res = rcv_party_1.refresh_result(None, &[]).unwrap();
+    let refreshed = &refresh_res[&receive_data_1.batch_transfer_idx];
+    assert!(refreshed.failure.is_none());
+    assert_eq!(refreshed.updated_status, Some(TransferStatus::Failed));
+}
+
+/// A draining proxy refuses the calls starting a new transfer (`-115`): the consignment is posted
+/// to another transport endpoint of the invoice if there is one, while an operation cannot start on
+/// a draining sender proxy.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn proxy_draining() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let draining = Arc::new(AtomicBool::new(false));
+    let (server, _mock) = draining_proxy(draining.clone());
+    let draining_endpoint = format!("rpc://{}/json-rpc", server.host_with_port());
+
+    // invoices reserved before the proxy starts draining
+    let receive_data_1 =
+        rcv_party.blind_receive_with_endpoints(None, vec![draining_endpoint.clone()]);
+    let receive_data_2 = rcv_party.blind_receive_with_endpoints(
+        None,
+        vec![draining_endpoint.clone(), PROXY_ENDPOINT.clone()],
+    );
+    draining.store(true, Ordering::Relaxed);
+
+    let recipient_map = |receive_data: &ReceiveData, transport_endpoints: Vec<String>| {
+        HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints,
+            }],
+        )])
+    };
+
+    // the only recipient proxy is draining: the consignment cannot be posted
+    let result = party.send_result(&recipient_map(
+        &receive_data_1,
+        vec![draining_endpoint.clone()],
+    ));
+    assert_matches!(result, Err(Error::ProxyDraining));
+
+    // the sender proxy is draining: the operation cannot start
+    let recipient_map_2 = recipient_map(
+        &receive_data_2,
+        vec![draining_endpoint.clone(), PROXY_ENDPOINT.clone()],
+    );
+    let result = party.wallet.send(
+        party.online,
+        recipient_map_2.clone(),
+        false,
+        FEE_RATE,
+        MIN_CONFIRMATIONS,
+        default_send_expiration(),
+        Some(draining_endpoint),
+    );
+    assert_matches!(result, Err(Error::ProxyDraining));
+
+    // the draining recipient proxy is skipped, the consignment is posted to the other one
+    let send_result = party.send_result(&recipient_map_2).unwrap();
+    let (transfer, _, _) = party.get_test_transfer_sender(&send_result.txid);
+    let tte_data = party.db_transfer_transport_endpoints_data(transfer.idx);
+    let used_tte: Vec<_> = tte_data.iter().filter(|(t, _)| t.used).collect();
+    assert_eq!(used_tte.len(), 1);
+    assert_eq!(used_tte[0].1.endpoint, PROXY_URL);
+
+    // the transfer completes through it
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data_2.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+    assert!(party.check_test_transfer_status_sender(
+        &send_result.txid,
+        TransferStatus::WaitingConfirmations
+    ));
+}
+
+/// A proxy accepting fewer media per transfer than the transfer has (`max_media`) is skipped before
+/// posting the consignment, trying the other transport endpoints of the invoice, as is one not
+/// advertising it; media with the same digest count once.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn proxy_max_media() {
+    initialize();
+
+    let image_str = ["tests", "qrcode.png"].join(MAIN_SEPARATOR_STR);
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    // UDA with 3 media but 2 distinct digests (the 2nd attachment is the same file as the media)
+    let asset = party.issue_asset_uda(Some(DETAILS), Some(FILE_STR), vec![&image_str, FILE_STR]);
+
+    let max_media = Arc::new(AtomicUsize::new(1));
+    let (server, _mock) = max_media_proxy(max_media.clone());
+    let mock_url = format!("http://{}/json-rpc", server.host_with_port());
+    let mock_endpoint = format!("rpc://{}/json-rpc", server.host_with_port());
+
+    let recipient_map = |receive_data: &ReceiveData, transport_endpoints: Vec<String>| {
+        HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::NonFungible,
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints,
+            }],
+        )])
+    };
+
+    // the only recipient proxy accepts too few media: the consignment cannot be posted
+    let receive_data_1 = rcv_party.blind_receive_with_endpoints(None, vec![mock_endpoint.clone()]);
+    let result = party.send_result(&recipient_map(&receive_data_1, vec![mock_endpoint.clone()]));
+    assert_matches!(result, Err(Error::ProxyTooManyMedia));
+
+    // the only recipient proxy doesn't advertise max_media: it's skipped as well
+    max_media.store(0, Ordering::Relaxed);
+    let result = party.send_result(&recipient_map(&receive_data_1, vec![mock_endpoint.clone()]));
+    assert_matches!(result, Err(Error::NoValidTransportEndpoint));
+    max_media.store(1, Ordering::Relaxed);
+
+    // the proxy accepting too few media is skipped, the consignment is posted to the other one
+    let endpoints = vec![mock_endpoint.clone(), PROXY_ENDPOINT.clone()];
+    let receive_data_2 = rcv_party.blind_receive_with_endpoints(None, endpoints.clone());
+    let send_result = party
+        .send_result(&recipient_map(&receive_data_2, endpoints))
+        .unwrap();
+    let (transfer, _, _) = party.get_test_transfer_sender(&send_result.txid);
+    let tte_data = party.db_transfer_transport_endpoints_data(transfer.idx);
+    let used_tte: Vec<_> = tte_data.iter().filter(|(t, _)| t.used).collect();
+    assert_eq!(used_tte.len(), 1);
+    assert_eq!(used_tte[0].1.endpoint, PROXY_URL);
+
+    // the transfer completes through it, with all the media
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data_2.recipient_id,
+        TransferStatus::Settled
+    ));
+    let uda_assets = rcv_party.list_assets(&[AssetSchema::Uda]).uda.unwrap();
+    let token = uda_assets[0].token.as_ref().unwrap();
+    assert!(token.media.is_some());
+    assert_eq!(token.attachments.len(), 2);
+
+    // a proxy accepting exactly the distinct media of the transfer is used
+    max_media.store(2, Ordering::Relaxed);
+    let receive_data_3 = party.blind_receive_with_endpoints(None, vec![mock_endpoint.clone()]);
+    let send_result = rcv_party
+        .send_result(&recipient_map(&receive_data_3, vec![mock_endpoint]))
+        .unwrap();
+    let (transfer, _, _) = rcv_party.get_test_transfer_sender(&send_result.txid);
+    let tte_data = rcv_party.db_transfer_transport_endpoints_data(transfer.idx);
+    let used_tte: Vec<_> = tte_data.iter().filter(|(t, _)| t.used).collect();
+    assert_eq!(used_tte.len(), 1);
+    assert_eq!(used_tte[0].1.endpoint, mock_url);
+    party.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(party.check_test_transfer_status_recipient(
+        &receive_data_3.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn batch_send_keeps_allocations_on_inputs_selected_for_other_assets() {
+    initialize();
+
+    let amount_a_sent: u64 = 100;
+    let amount_a_received: u64 = 10;
+    let amount_b_sent: u64 = 50;
+    let amount_a_change = AMOUNT - amount_a_sent;
+
+    // wallets
+    let mut party = get_funded_noutxo_party!();
+    let mut rcv_party = get_funded_party!();
+    party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // the settled amounts of the asset with ID `asset_id` held by each UTXO holding it
+    let utxo_amounts = |party: &mut SinglesigParty, asset_id: &str| -> HashMap<Outpoint, u64> {
+        party
+            .list_unspents(true)
+            .into_iter()
+            .filter_map(|u| {
+                let amount: u64 = u
+                    .rgb_allocations
+                    .iter()
+                    .filter(|a| a.asset_id.as_deref() == Some(asset_id) && a.settled)
+                    .map(|a| a.assignment.main_amount())
+                    .sum();
+                (amount > 0).then_some((u.utxo.outpoint, amount))
+            })
+            .collect()
+    };
+
+    // issue assets A and B on the only colorable UTXO
+    let asset_a = party.issue_asset_nia(None);
+    let asset_b = party.issue_asset_nia(None);
+
+    // send some A, which moves B with the A change to a single UTXO C
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset_a.asset_id.clone(),
+        vec![blind_recipient(
+            &receive_data,
+            Assignment::Fungible(amount_a_sent),
+        )],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset_a.asset_id));
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset_a.asset_id));
+
+    // receive a little A on a different UTXO U
+    party.create_utxos(false, Some(2), None, FEE_RATE, None);
+    let receive_data = party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset_a.asset_id.clone(),
+        vec![blind_recipient(
+            &receive_data,
+            Assignment::Fungible(amount_a_received),
+        )],
+    )]);
+    let txid = rcv_party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+    party.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(&asset_a.asset_id));
+    mine(false);
+    party.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(&asset_a.asset_id));
+
+    // check the layout: C holds A and B, U holds a little A only
+    let amounts_a = utxo_amounts(&mut party, &asset_a.asset_id);
+    let amounts_b = utxo_amounts(&mut party, &asset_b.asset_id);
+    assert_eq!(amounts_a.len(), 2);
+    assert_eq!(amounts_b.len(), 1);
+    let (utxo_c, _) = amounts_b.iter().next().unwrap();
+    assert_eq!(amounts_a.get(utxo_c), Some(&amount_a_change));
+    assert!(amounts_a.values().any(|a| *a == amount_a_received));
+    assert_eq!(
+        party.get_asset_balance(&asset_a.asset_id).settled,
+        amount_a_change + amount_a_received
+    );
+
+    // send A and B together: A is selected from U, B from C
+    let receive_data_a = rcv_party.blind_receive();
+    let receive_data_b = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([
+        (
+            asset_a.asset_id.clone(),
+            vec![blind_recipient(
+                &receive_data_a,
+                Assignment::Fungible(amount_a_received),
+            )],
+        ),
+        (
+            asset_b.asset_id.clone(),
+            vec![blind_recipient(
+                &receive_data_b,
+                Assignment::Fungible(amount_b_sent),
+            )],
+        ),
+    ]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(None);
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(None);
+    let (transfers, _, _) = party.get_test_transfers_sender(&txid);
+    for transfer in transfers.values().flatten() {
+        let (transfer_data, _) = party.get_test_transfer_data(transfer);
+        assert_eq!(transfer_data.status, TransferStatus::Settled);
+    }
+
+    // the A consignment carries only the A transition, spending the A on U: the A on C is moved
+    // by an extra transition it doesn't carry, so the recipient doesn't learn about it
+    let consignment_path = party
+        .wallet
+        .get_send_consignment_path(&asset_a.asset_id, &txid);
+    let consignment = RgbTransfer::load_file(consignment_path).unwrap();
+    let witness_bundle = consignment
+        .bundled_witnesses()
+        .find(|bw| bw.witness_id().to_string() == txid)
+        .unwrap();
+    let known_transitions = &witness_bundle.bundle.known_transitions;
+    assert_eq!(known_transitions.len(), 1);
+    let main_opid = known_transitions[0].opid;
+    let opids: HashSet<_> = witness_bundle.bundle.input_map.values().copied().collect();
+    assert!(opids.len() > 1);
+    assert!(opids.contains(&main_opid));
+
+    // the A on C, spent as an input of the B transition only, must be moved to the change
+    assert_eq!(
+        party.get_asset_balance(&asset_a.asset_id).settled,
+        amount_a_change
+    );
+    assert_eq!(
+        party.get_asset_balance(&asset_b.asset_id).settled,
+        AMOUNT - amount_b_sent
+    );
 }
 
 #[cfg(feature = "electrum")]

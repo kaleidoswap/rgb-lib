@@ -1,7 +1,5 @@
 use super::*;
 
-use std::os::unix::fs::PermissionsExt;
-
 fn check_wallet(
     party: &impl OfflineSigParty<W = Wallet>,
     network: BitcoinNetwork,
@@ -270,10 +268,6 @@ fn fail() {
     // set the permissions to read and execute only (no write permissions)
     let permissions = fs::Permissions::from_mode(0o555);
     fs::set_permissions(non_writable_path, permissions).unwrap();
-    // try to load runtime, expecting it to receive a permission denied error
-    let result = load_rgb_runtime(PathBuf::from_str(non_writable_path).unwrap());
-    let err = result.err().unwrap();
-    assert!(matches!(err, Error::IO { details: m } if m.starts_with("Permission denied")));
     // try to setup logger, expecting it to receive a permission denied error
     let result = std::panic::catch_unwind(|| setup_logger(non_writable_path, Some("log")));
     assert!(result.is_ok());
@@ -309,6 +303,9 @@ fn re_instantiate_wallet() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -515,12 +512,10 @@ fn supported_schemas() {
     let asset_nia = party_nia.issue_asset_nia(Some(&[AMOUNT]));
 
     // issue a different schema asset, should fail
-    let result = party_nia.issue_asset_cfa_result(Some(&[AMOUNT]), None);
-    assert_matches!(result, Err(Error::UnsupportedSchema { asset_schema: _ }));
-    let result = party_nia.issue_asset_ifa_result(Some(&[AMOUNT]), None, None);
-    assert_matches!(result, Err(Error::UnsupportedSchema { asset_schema: _ }));
-    let result = party_nia.issue_asset_uda_result(None, None, vec![]);
-    assert_matches!(result, Err(Error::UnsupportedSchema { asset_schema: _ }));
+    for schema in AssetSchema::iter().filter(|s| *s != AssetSchema::Nia) {
+        let result = party_nia.issue_asset_of_schema_result(schema);
+        assert_matches!(result, Err(Error::UnsupportedSchema { asset_schema }) if asset_schema == schema);
+    }
 
     // recipient wallet (UDA schema supported)
     let keys_rcv = generate_keys(bitcoin_network, WitnessVersion::Taproot);
@@ -550,6 +545,9 @@ fn supported_schemas() {
         vec![Recipient {
             assignment: Assignment::Fungible(66),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -592,6 +590,9 @@ fn supported_schemas() {
         vec![Recipient {
             assignment: Assignment::Fungible(66),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -665,17 +666,14 @@ fn legacy_bdk_store_is_imported() {
     drop(store);
 
     let database = setup_db(dir.path()).unwrap();
-    let txn = database.begin_transaction().unwrap();
     let bdk_wallet = setup_bdk(
-        &txn,
+        &database,
         dir.path(),
         descriptors.colored.clone(),
         descriptors.vanilla.clone(),
-        false,
         BitcoinNetwork::Regtest,
     )
     .unwrap();
-    txn.commit().unwrap();
 
     // the revealed indices survived the upgrade
     assert_eq!(

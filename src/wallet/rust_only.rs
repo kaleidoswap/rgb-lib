@@ -11,16 +11,16 @@
 //! `consume_transfer_fascia` and the unchecked fetch/accept halves stay Rust-only.
 
 use super::*;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 use crate::wallet::online::proxy_get_consignment;
 use amplify::num::u5;
 use bdk_wallet::bitcoin::psbt::Output as PsbtOutput;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 use rgbstd::AssignmentType;
 use rgbstd::Operation as _;
 use rgbstd::TransitionBundle;
 use rgbstd::rgbcore::commit_verify::mpc::{self, MPC_MINIMAL_DEPTH};
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 use rgbstd::{containers::SealWitness, opret::OpretProof};
 
 /// Maximum depth of an MPC tree built from, or committed into, a PSBT.
@@ -39,35 +39,35 @@ const MAX_PSBT_MPC_TREE_DEPTH: u8 = 16;
 /// [`MAX_PSBT_MPC_TREE_DEPTH`], lets them fit within it.
 const MAX_PSBT_MPC_MESSAGES: usize = 1 << (MAX_PSBT_MPC_TREE_DEPTH / 2);
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 const PSBT_OPS_DIR: &str = "psbt_ops";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 const PSBT_OP_META_FILE: &str = "meta.json";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 const PSBT_OP_FOREIGN_INPUTS_FILE: &str = "foreign_inputs.json";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 const PSBT_OP_COLORED_PSBT_FILE: &str = "colored.psbt";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 const PSBT_OP_CONSIGNMENTS_DIR: &str = "consignments";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 const PSBT_OP_CONSIGNMENT_FILE: &str = CONSIGNMENT_FILE;
 /// Marker left in the transfer dir once a prepared fascia has been consumed into the RGB stash,
 /// until the related SQL update is committed.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const STASH_CONSUMED_FILE: &str = "stash_consumed";
 /// Marker left in the transfer dir by the color-prepare flow, allowing
 /// [`Wallet::consume_transfer_fascia`] on the related batch transfer.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 const COLOR_PREPARE_FILE: &str = "color_prepare";
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn persist_stash_consumed_marker(path: &Path) -> Result<(), Error> {
     let file = fs::File::create(path)?;
     file.sync_all()?;
     fsync_parent_dir(path)
 }
 
-#[cfg(all(unix, any(feature = "electrum", feature = "esplora")))]
+#[cfg(all(unix, feature = "_online"))]
 fn fsync_parent_dir(path: &Path) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         fs::File::open(parent)?.sync_all()?;
@@ -75,12 +75,12 @@ fn fsync_parent_dir(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(all(not(unix), any(feature = "electrum", feature = "esplora")))]
+#[cfg(all(not(unix), feature = "_online"))]
 fn fsync_parent_dir(_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn persist_durable_replace(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), Error> {
     let file_name = path.file_name().ok_or_else(|| Error::Internal {
         details: s!("invalid durable file path"),
@@ -95,7 +95,7 @@ fn persist_durable_replace(path: &Path, contents: impl AsRef<[u8]>) -> Result<()
     fsync_parent_dir(path)
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn persist_durable_create_dir(path: &Path) -> Result<(), Error> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
@@ -105,16 +105,16 @@ fn persist_durable_create_dir(path: &Path) -> Result<(), Error> {
     fsync_parent_dir(path)
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     <sha256::Hash as Sha256Hash>::hash(bytes.as_ref()).to_string()
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 const PSBT_OP_META_SCHEMA_VERSION: u32 = 1;
 
 /// Windows-safe path: `consignments/{sha256(asset_id)}/consignment_out` (`:` is invalid on Windows).
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn psbt_op_consignment_path(op_dir: &Path, asset_id: &str) -> PathBuf {
     let digest = <sha256::Hash as Sha256Hash>::hash(asset_id.as_bytes());
     op_dir
@@ -122,13 +122,13 @@ pub(crate) fn psbt_op_consignment_path(op_dir: &Path, asset_id: &str) -> PathBuf
         .join(digest.to_string())
         .join(PSBT_OP_CONSIGNMENT_FILE)
 }
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 const PSBT_OP_ID_LEN: usize = 32;
 /// Expiration applied by `psbt_op_prepare` when the caller gives none.
 pub const PSBT_OP_DEFAULT_EXPIRATION_SECS: u64 = 24 * 60 * 60;
 
 /// When a prepared PSBT operation may be failed by the expiry sweep.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PsbtOpExpiry {
     /// [`PSBT_OP_DEFAULT_EXPIRATION_SECS`] from now.
@@ -140,14 +140,14 @@ pub enum PsbtOpExpiry {
     Never,
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 impl From<Option<u64>> for PsbtOpExpiry {
     fn from(expiration_timestamp: Option<u64>) -> Self {
         expiration_timestamp.map_or(Self::Default, Self::At)
     }
 }
 
-#[cfg(all(test, any(feature = "electrum", feature = "esplora")))]
+#[cfg(all(test, feature = "_online"))]
 thread_local! {
     pub(crate) static MOCK_FAIL_AFTER_STASH_CONSUME: std::cell::RefCell<bool> =
         const { std::cell::RefCell::new(false) };
@@ -203,7 +203,7 @@ pub type AssetBeneficiariesMap = BTreeMap<ContractId, Vec<BuilderSeal<GraphSeal>
 /// [`Wallet::consume_transfer_fascia`] (after broadcast). While
 /// [`ColorPrepareResult::batch_transfer_idx`] is [`TransferStatus::Initiated`] and its TX has
 /// never been broadcast, `fail_transfers` can roll the DB reservation back.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug)]
 pub struct ColorPrepareResult {
     /// Per-asset consignments before stash consumption.
@@ -213,7 +213,7 @@ pub struct ColorPrepareResult {
 }
 
 /// Status of a file-backed HTLC coloring operation.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PsbtOperationStatus {
@@ -228,7 +228,7 @@ pub enum PsbtOperationStatus {
 }
 
 /// Caller-reported / indexer-observed broadcast lifecycle for an HTLC operation.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PsbtBroadcastState {
@@ -244,7 +244,7 @@ pub enum PsbtBroadcastState {
 }
 
 /// Result of [`Wallet::psbt_op_prepare`].
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone)]
 pub struct PsbtOpPrepareResult {
     /// Opaque operation ID (directory name under `psbt_ops/`).
@@ -259,7 +259,7 @@ pub struct PsbtOpPrepareResult {
 
 /// One assignment a PSBT operation's RGB transitions make, read back from its committed fascia
 /// (not from the [`ColoringInfo`] the operation was prepared with).
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PsbtOpAllocation {
     /// Contract the assignment belongs to, in its canonical spelling.
@@ -275,7 +275,7 @@ pub struct PsbtOpAllocation {
 ///
 /// **Unchecked:** `txid` and `vout` are what the proxy reported. Pass it to
 /// [`Wallet::accept_transfer_pinned`], which pins the witness output before accepting.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone)]
 pub struct FetchedConsignment {
     /// The consignment.
@@ -287,7 +287,7 @@ pub struct FetchedConsignment {
 }
 
 /// Result of [`Wallet::accept_transfer_pinned`].
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone)]
 pub struct AcceptedTransfer {
     /// The accepted consignment.
@@ -306,7 +306,7 @@ pub struct AcceptedTransfer {
 /// the result with [`Wallet::accept_transfer_pinned`], which pins the witness output first.
 ///
 /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub fn fetch_consignment_by_recipient_id_unchecked(
     recipient_id: String,
     consignment_endpoint: &str,
@@ -333,7 +333,7 @@ pub fn fetch_consignment_by_recipient_id_unchecked(
 
 /// What `fascia`'s transitions assign. Every owned-state type the wallet's schemas define is
 /// reported; any other is an error rather than left out.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn fascia_allocations(fascia: &Fascia) -> Result<Vec<PsbtOpAllocation>, Error> {
     fn witness_vout(seal: Option<GraphSeal>) -> Option<u32> {
         seal.filter(|seal| seal.txid == TxPtr::WitnessTx)
@@ -381,7 +381,7 @@ fn fascia_allocations(fascia: &Fascia) -> Result<Vec<PsbtOpAllocation>, Error> {
 }
 
 /// Recovered HTLC operation (lookup after a lost `psbt_op_prepare` response).
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone)]
 pub struct PsbtOperation {
     /// Opaque operation ID (directory name under `psbt_ops/`).
@@ -404,7 +404,7 @@ pub struct PsbtOperation {
 ///
 /// Acceptance rejects consignments that do not match these fields, including an empty
 /// assignment result for the witness seal.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedTransfer {
     /// Expected contract / asset ID
@@ -415,7 +415,7 @@ pub struct ExpectedTransfer {
     pub assignment: Assignment,
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PsbtOpPayloadHashes {
     fascia: String,
@@ -427,7 +427,7 @@ struct PsbtOpPayloadHashes {
     batch_transfer_idx: Option<String>,
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 impl PsbtOpPayloadHashes {
     fn new(
         fascia: &[u8],
@@ -448,12 +448,12 @@ impl PsbtOpPayloadHashes {
     }
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn psbt_op_batch_identity_hash(batch_transfer_idx: i32) -> String {
     sha256_hex(batch_transfer_idx.to_string().as_bytes())
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PsbtOpMeta {
     schema_version: u32,
@@ -467,7 +467,7 @@ struct PsbtOpMeta {
     hashes: PsbtOpPayloadHashes,
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ForeignInputEntry {
     asset_id: String,
@@ -475,10 +475,10 @@ struct ForeignInputEntry {
     assignments: Vec<Assignment>,
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 type SpentByContract = HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>>;
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ForeignInputsFile {
     entries: Vec<ForeignInputEntry>,
@@ -511,7 +511,7 @@ fn psbt_has_input_signatures(psbt: &Psbt) -> bool {
 ///   `tip_height - mined_height + 1` (same tip query as the indexer height API). Avoids a second
 ///   `get_tx_confirmations` round trip that can disagree with `resolve_witness` across a block
 ///   boundary.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn pin_witness_output_to_recipient_id(
     resolver: &AnyResolver,
     indexer: &Indexer,
@@ -623,7 +623,7 @@ fn rebuild_psbt_preserving_maps(
 
 /// Indexer protocol
 #[derive(Debug, Clone)]
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub enum IndexerProtocol {
     /// An indexer implementing the electrum protocol
     Electrum,
@@ -631,7 +631,7 @@ pub enum IndexerProtocol {
     Esplora,
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 impl fmt::Display for IndexerProtocol {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{self:?}")
@@ -644,7 +644,7 @@ impl fmt::Display for IndexerProtocol {
 ///
 /// <div class="warning">This method is meant for special usage and is normally not needed, use
 /// it only if you know what you're doing</div>
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub fn check_indexer_url(
     indexer_url: &str,
     bitcoin_network: BitcoinNetwork,
@@ -666,7 +666,7 @@ pub fn check_indexer_url(
 ///
 /// <div class="warning">This method is meant for special usage and is normally not needed, use
 /// it only if you know what you're doing</div>
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
     check_proxy(proxy_url)
 }
@@ -1114,7 +1114,7 @@ impl Wallet {
     /// Only one contract/transition, consuming all state on `locked_outpoint`
     /// and assigning exactly `amount` to `payment_vout`, is accepted.
     /// Bitcoin prevout identity, fee policy and signing authorization are the caller's job.
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn validate_htlc_spend(
         &self,
         psbt: &Psbt,
@@ -1285,7 +1285,7 @@ impl Wallet {
     }
 
     /// Fetch and accept a witness transfer through a proxy.
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn accept_transfer(
         &mut self,
         online: Online,
@@ -1384,7 +1384,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed,
     /// use it only if you know what you're doing</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn import_asset_contract(
         &self,
         contract: RgbContract,
@@ -1471,7 +1471,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn accept_transfer_consignment(
         &mut self,
         online: Online,
@@ -1562,7 +1562,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn get_tx_height(&self, online: Online, txid: String) -> Result<Option<u32>, Error> {
         info!(self.logger(), "Getting TX height...");
         self.check_online(online)?;
@@ -1575,7 +1575,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn update_witnesses(
         &self,
         online: Online,
@@ -1611,7 +1611,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn save_new_asset(
         &self,
         online: Online,
@@ -1680,7 +1680,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage, for most cases the method
     /// <code>list_unspents</code> is sufficient</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn list_unspents_vanilla(
         &mut self,
         online: Online,
@@ -1774,7 +1774,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn send_end_db_update_only(
         &mut self,
         online: Online,
@@ -1811,7 +1811,7 @@ impl Wallet {
     }
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 impl Wallet {
     /// Color a PSBT and persist recovery data before broadcast and stash consumption.
     ///
@@ -2491,7 +2491,7 @@ impl Wallet {
 }
 
 /// Submarine / HTLC APIs of the wallet.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 impl Wallet {
     /// Shared setup for [`Self::color_psbt_for_outpoints`] and
     /// [`Self::color_psbt_for_outpoints_and_prepare_consume`]: empty/subset checks, validate allocations,
@@ -2971,7 +2971,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn psbt_op_prepare_with_expiry(
         &self,
         psbt: &mut Psbt,
@@ -3572,7 +3572,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn psbt_ops_spending(&self, outpoint: Outpoint) -> Result<Vec<PsbtOperation>, Error> {
         let spent = OutPoint::from_str(&outpoint.to_string()).map_err(|_| Error::InvalidTxid)?;
         let mut metas = self.psbt_op_scan()?;
@@ -3614,7 +3614,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn psbt_op_provide_receive_consignment(
         &mut self,
         online: Online,
@@ -3765,7 +3765,7 @@ impl Wallet {
     /// a spend of the received allocation.
     ///
     /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub fn accept_transfer_pinned(
         &mut self,
         online: Online,
@@ -4132,7 +4132,7 @@ fn commit_staged_psbt(psbt: &mut Psbt, static_blinding: Option<u64>) -> Result<F
 }
 
 /// Rebuild the fascia of a PSBT whose RGB commitment was finalized, possibly by a counterparty.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn fascia_from_committed_psbt(psbt: &Psbt) -> Result<Fascia, Error> {
     let bundles = psbt.rgb_bundles().map_err(InternalError::from)?;
     // `rgb_commit` commits the MPC messages in the first OP_RETURN, which need not be vout 0.
@@ -4184,7 +4184,7 @@ fn fascia_from_committed_psbt(psbt: &Psbt) -> Result<Fascia, Error> {
 ///
 /// <div class="warning">This method is meant for special usage and is normally not needed, use
 /// it only if you know what you're doing</div>
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub fn get_resolver(
     indexer_url: &str,
     bitcoin_network: BitcoinNetwork,
@@ -4194,7 +4194,7 @@ pub fn get_resolver(
 }
 
 /// Result of consignment validation (offchain or indexer-based).
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone)]
 pub struct ValidateConsignmentResult {
     /// Whether the consignment is valid.
@@ -4213,7 +4213,7 @@ pub struct ValidateConsignmentResult {
 ///
 /// <div class="warning">This method is meant for special usage and is normally not needed, use
 /// it only if you know what you're doing</div>
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub fn validate_consignment(
     file_path: &str,
     indexer_url: &str,
@@ -4277,7 +4277,7 @@ pub fn validate_consignment(
 ///
 /// <div class="warning">This method is meant for special usage and is normally not needed, use
 /// it only if you know what you're doing</div>
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub fn validate_consignment_offchain(
     file_path: &str,
     txid: &str,
@@ -4341,12 +4341,12 @@ pub fn validate_consignment_offchain(
 }
 
 #[cfg(test)]
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 mod tests {
     use super::*;
     use psrgbt::RgbPropKeyExt;
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     #[test]
     fn display_indexer_protocol() {
         assert_eq!(IndexerProtocol::Electrum.to_string(), "Electrum");
