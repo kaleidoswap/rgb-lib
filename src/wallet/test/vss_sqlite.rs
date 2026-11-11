@@ -11,6 +11,24 @@ fn local_wallet(reuse: bool) -> (tempfile::TempDir, Wallet, crate::keys::Keys) {
     (dir, wallet, keys)
 }
 
+struct RuntimeLockFile(std::path::PathBuf);
+
+impl RuntimeLockFile {
+    fn create(wallet: &Wallet) -> Self {
+        let path = wallet
+            .get_wallet_dir()
+            .join(crate::utils::RGB_RUNTIME_LOCK_FILE);
+        std::fs::write(&path, b"").unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for RuntimeLockFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn config() -> VssBackupConfig {
     VssBackupConfig::new(
         "http://127.0.0.1:1/vss".into(),
@@ -33,7 +51,7 @@ fn sqlite_snapshot_preserves_committed_bdk_and_pinned_addresses() {
     let restored_dir = tempfile::tempdir().unwrap();
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
     let names: Vec<_> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
         .collect();
     assert!(names.iter().any(|n| n.ends_with("/rgb_lib_db")));
     assert!(
@@ -144,7 +162,7 @@ fn snapshots_wait_for_rgb_writers_and_capture_matching_files_and_database() {
     let (_dir, wallet, _keys) = local_wallet(false);
     let marker = wallet.get_wallet_dir().join("rgb/state-marker");
     std::fs::write(&marker, b"before").unwrap();
-    let runtime = crate::utils::load_rgb_runtime(wallet.get_wallet_dir()).unwrap();
+    let runtime = wallet.database().state_guard();
     std::thread::scope(|scope| {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -207,7 +225,7 @@ fn snapshots_wait_for_rgb_writers_and_capture_matching_files_and_database() {
 #[test]
 fn snapshots_reject_reentrant_capture_and_exclude_transient_runtime_locks() {
     let (_dir, wallet, keys) = local_wallet(false);
-    let runtime = crate::utils::load_rgb_runtime(wallet.get_wallet_dir()).unwrap();
+    let runtime = RuntimeLockFile::create(&wallet);
     assert!(
         matches!(wallet.create_vss_snapshot(), Err(Error::Internal { details }) if details == "cannot snapshot an active RGB runtime")
     );
@@ -221,6 +239,7 @@ fn snapshots_reject_reentrant_capture_and_exclude_transient_runtime_locks() {
                 .by_index(i)
                 .unwrap()
                 .name()
+                .unwrap()
                 .ends_with("rgb_runtime.lock")
         );
     }
@@ -249,7 +268,7 @@ fn queued_auto_backups_do_not_build_intermediate_snapshots() {
         .unwrap();
     let _in_flight = client.next_auto_backup(generation).unwrap();
     wallet.set_vss_client(Some(Arc::clone(&client)));
-    let runtime = crate::utils::load_rgb_runtime(wallet.get_wallet_dir()).unwrap();
+    let runtime = RuntimeLockFile::create(&wallet);
     // Capturing here would fail because this thread owns an active runtime.
     // A busy worker must receive only a lightweight request, with no copy/ZIP.
     wallet.trigger_auto_backup();

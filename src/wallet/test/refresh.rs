@@ -1101,6 +1101,7 @@ fn ack_failure_no_duplicate_colorings() {
             MIN_CONFIRMATIONS,
             default_send_expiration(),
             Some(failing_ack_endpoints[0].clone()),
+            None,
         )
         .unwrap()
         .txid;

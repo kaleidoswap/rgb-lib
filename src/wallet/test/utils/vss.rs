@@ -120,7 +120,8 @@ pub(crate) fn summarize_transfers(
     wallet: &Wallet,
     asset_id: &str,
 ) -> Result<Vec<TransferSummary>, Error> {
-    let mut transfers = wallet.list_transfers(AssetFilter::Id(asset_id.to_string()), None)?;
+    let mut transfers =
+        wallet.list_transfers(AssetFilter::Id(asset_id.to_string()), TransferScope::All)?;
     transfers.sort_by_key(|t| (kind_order(&t.kind), t.txid.clone().unwrap_or_default()));
     Ok(transfers
         .into_iter()

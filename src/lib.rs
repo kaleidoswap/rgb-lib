@@ -247,7 +247,9 @@ use bdk_esplora::{
 #[cfg(feature = "_online")]
 use bdk_wallet::Update;
 #[cfg(all(test, feature = "wallet"))]
-use bdk_wallet::bitcoin::{TxIn, absolute::LockTime, transaction::Version};
+use bdk_wallet::bitcoin::transaction::Version;
+#[cfg(all(test, feature = "wallet", not(feature = "_online")))]
+use bdk_wallet::bitcoin::{TxIn, absolute::LockTime};
 #[cfg(feature = "_online")]
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 #[cfg(feature = "bdk_file_store_migration")]
@@ -384,8 +386,6 @@ use rgbstd::{
 };
 #[cfg(feature = "wallet")]
 use schemata::IfaWrapper;
-#[cfg(test)]
-use schemata::OS_LINK;
 #[cfg(feature = "_online")]
 use schemata::{CfaWrapper, NiaWrapper, UdaWrapper};
 use schemata::{

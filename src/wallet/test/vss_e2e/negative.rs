@@ -135,11 +135,13 @@ fn scenario_4_1_wrong_signing_key_restore_fails_and_writes_no_wallet_data() {
     let send_amount = 10u64;
     let receive = wallet_b
         .witness_receive(
+            Some(online_b),
             None,
             Assignment::Fungible(send_amount),
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .expect("witness_receive");
     let recipient_map = HashMap::from([(
@@ -152,6 +154,9 @@ fn scenario_4_1_wrong_signing_key_restore_fails_and_writes_no_wallet_data() {
             }),
             assignment: Assignment::Fungible(send_amount),
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive.public_key.clone()),
+            expiration_timestamp: Some(receive.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let _ = wallet_a
@@ -162,6 +167,7 @@ fn scenario_4_1_wrong_signing_key_restore_fails_and_writes_no_wallet_data() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
             None,
         )
         .expect("send");

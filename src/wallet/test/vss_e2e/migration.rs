@@ -31,11 +31,13 @@ fn scenario_5_1_other_machine_restore_is_operational() {
     let send_amount1 = 10u64;
     let receive = wallet_recv
         .witness_receive(
+            Some(online_recv),
             None,
             Assignment::Fungible(send_amount1),
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .expect("witness_receive");
     let recipient_map = HashMap::from([(
@@ -48,6 +50,9 @@ fn scenario_5_1_other_machine_restore_is_operational() {
             }),
             assignment: Assignment::Fungible(send_amount1),
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive.public_key.clone()),
+            expiration_timestamp: Some(receive.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let _ = wallet_a
@@ -58,6 +63,7 @@ fn scenario_5_1_other_machine_restore_is_operational() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
             None,
         )
         .expect("send");
@@ -132,11 +138,13 @@ fn scenario_5_1_other_machine_restore_is_operational() {
     let send_amount2 = 5u64;
     let receive2 = wallet_b_recv
         .witness_receive(
+            Some(online_b_recv),
             None,
             Assignment::Fungible(send_amount2),
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .expect("witness_receive recv2");
     let recipient_map2 = HashMap::from([(
@@ -149,6 +157,9 @@ fn scenario_5_1_other_machine_restore_is_operational() {
             }),
             assignment: Assignment::Fungible(send_amount2),
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive2.public_key.clone()),
+            expiration_timestamp: Some(receive2.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let _ = wallet_b
@@ -159,6 +170,7 @@ fn scenario_5_1_other_machine_restore_is_operational() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
             None,
         )
         .expect("send asset2");

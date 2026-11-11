@@ -272,7 +272,7 @@ fn color_consume_and_psbt_ops_survive_vss_restore() {
         .expect("go_online restored");
 
     let transfers_after = wallet_r
-        .list_transfers(AssetFilter::Id(asset.asset_id.clone()), None)
+        .list_transfers(AssetFilter::Id(asset.asset_id.clone()), TransferScope::All)
         .expect("list_transfers");
     let restored_xfer = transfers_after
         .iter()

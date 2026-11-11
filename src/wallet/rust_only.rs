@@ -4716,7 +4716,7 @@ mod tests {
         set_mpc_min_depth(&mut psbt, 0, MAX_PSBT_MPC_TREE_DEPTH);
         let fascia = commit_staged_psbt(&mut psbt, Some(7)).unwrap();
         assert_eq!(
-            fascia.seal_witness().merkle_block.width_limit(),
+            fascia.seal_witness().mpc_merkle_block.width_limit(),
             1 << MAX_PSBT_MPC_TREE_DEPTH
         );
         let received = Psbt::from_str(&psbt.to_string()).unwrap();

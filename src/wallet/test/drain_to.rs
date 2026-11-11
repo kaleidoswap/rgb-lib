@@ -245,6 +245,7 @@ fn fail() {
             FEE_RATE,
             false,
             false,
+            None,
         )
         .unwrap();
     let signed_psbt = party.wallet.sign_psbt(unsigned_psbt, None).unwrap();

@@ -1355,6 +1355,22 @@ impl SinglesigParty {
             .unwrap()
     }
 
+    /// A witness receive with no transport endpoints, settled out-of-band
+    #[cfg(feature = "electrum")]
+    pub(crate) fn witness_receive_out_of_band(&mut self) -> ReceiveData {
+        self.wallet
+            .witness_receive(
+                Some(self.online),
+                None,
+                Assignment::Any,
+                default_rcv_expiration(),
+                vec![],
+                MIN_CONFIRMATIONS,
+                None,
+            )
+            .unwrap()
+    }
+
     #[cfg(feature = "electrum")]
     pub(crate) fn get_keys(&self) -> SinglesigKeys {
         self.wallet.get_keys()

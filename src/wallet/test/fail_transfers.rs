@@ -789,6 +789,7 @@ fn witness_receive_cleanup() {
                 MIN_CONFIRMATIONS,
                 default_send_expiration(),
                 Some(PROXY_ENDPOINT.clone()),
+                None,
             )
             .unwrap()
             .txid
@@ -928,6 +929,7 @@ fn witness_receive_cleanup() {
             MIN_CONFIRMATIONS,
             default_send_expiration(),
             Some(PROXY_ENDPOINT.clone()),
+            None,
         )
         .unwrap();
     rcv_party.sync(fast_sync);
@@ -1051,6 +1053,7 @@ fn ack_failure() {
             MIN_CONFIRMATIONS,
             expiration,
             Some(failing_ack_endpoint),
+            None,
         )
         .unwrap();
     assert!(!send_result.txid.is_empty());

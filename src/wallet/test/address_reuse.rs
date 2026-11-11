@@ -195,20 +195,24 @@ fn witness_receive_twice_reuses_pending_witness_script_row() {
     // must not panic on `pending_witness_script.script` UNIQUE constraint.
     wallet
         .witness_receive(
+            Some(online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     wallet
         .witness_receive(
+            Some(online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
 }
@@ -244,20 +248,24 @@ fn witness_receive_keeps_recipient_id_but_rotates_invoice_nonce() {
 
     let inv1 = wallet
         .witness_receive(
+            Some(online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let inv2 = wallet
         .witness_receive(
+            Some(online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
 
@@ -314,20 +322,24 @@ fn proxy_recipient_id_unique_per_invoice_under_reuse() {
 
     let inv1 = wallet
         .witness_receive(
+            Some(online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let inv2 = wallet
         .witness_receive(
+            Some(online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
 
@@ -349,7 +361,9 @@ fn proxy_recipient_id_unique_per_invoice_under_reuse() {
     }
 
     // Transfers expose the same per-invoice IDs.
-    let transfers = wallet.list_transfers(AssetFilter::None, None).unwrap();
+    let transfers = wallet
+        .list_transfers(AssetFilter::None, TransferScope::All)
+        .unwrap();
     for (inv, data) in [(&inv1, &data1), (&inv2, &data2)] {
         let transfer = transfers
             .iter()
@@ -375,21 +389,25 @@ fn proxy_recipient_id_matches_recipient_id_without_nonce() {
         party
             .wallet
             .witness_receive(
+                Some(party.online),
                 None,
                 Assignment::Any,
                 default_rcv_expiration(),
                 TRANSPORT_ENDPOINTS.clone(),
                 MIN_CONFIRMATIONS,
+                None,
             )
             .unwrap(),
         party
             .wallet
             .blind_receive(
+                Some(party.online),
                 None,
                 Assignment::Any,
                 default_rcv_expiration(),
                 TRANSPORT_ENDPOINTS.clone(),
                 MIN_CONFIRMATIONS,
+                None,
             )
             .unwrap(),
     ] {
@@ -400,7 +418,7 @@ fn proxy_recipient_id_matches_recipient_id_without_nonce() {
 
         let transfers = party
             .wallet
-            .list_transfers(AssetFilter::None, None)
+            .list_transfers(AssetFilter::None, TransferScope::All)
             .unwrap();
         let transfer = transfers
             .iter()
@@ -481,6 +499,9 @@ fn two_consecutive_witness_transfers_both_settle() {
                     blinding: None,
                 }),
                 transport_endpoints: invoice_endpoints,
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
             }],
         )]);
         let txid = party.send_retry(&recipient_map);

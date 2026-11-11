@@ -111,7 +111,7 @@ fn success() {
     assert!(party.refresh_asset(&parent.asset_id));
     assert_link_right_isolated(&mut party, &parent.asset_id, &link_right_outpoint);
 
-    party.burn(&parent.asset_id, 1);
+    party.burn(&parent.asset_id, 1, None);
     mine(false);
     assert!(party.refresh_asset(&parent.asset_id));
     assert_link_right_isolated(&mut party, &parent.asset_id, &link_right_outpoint);
@@ -131,12 +131,13 @@ fn success() {
     assert!(!result.txid.is_empty());
 
     {
-        let runtime = party.wallet.rgb_runtime().expect("rgb runtime should load");
+        let txn = party.wallet.database().begin_transaction().unwrap();
+        let stock = party.wallet.rgb_stock(&txn).expect("rgb stock should load");
         let parent_contract_id =
             ContractId::from_str(&parent.asset_id).expect("valid parent contract ID");
         let child_contract_id =
             ContractId::from_str(&child.asset_id).expect("valid child contract ID");
-        runtime
+        stock
             .validate_contracts_link::<InflatableFungibleAsset, InflatableFungibleAsset>(
                 parent_contract_id,
                 child_contract_id,
@@ -257,6 +258,9 @@ fn cross_wallet_link_requires_receiving_child_contract() {
             recipient_id: receive_data.recipient_id,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     child_issuer.send_retry(&recipient_map);

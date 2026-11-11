@@ -3817,6 +3817,7 @@ fn fail() {
         far_expiration(),
         Some(PROXY_ENDPOINT.clone()),
         false,
+        None,
     );
     assert_matches!(result, Err(Error::InvalidExpiration));
 
@@ -3830,6 +3831,7 @@ fn fail() {
         now().unix_timestamp() as u64 + PROXY_CLOCK_SKEW_MARGIN_SECS as u64 - 60,
         Some(PROXY_ENDPOINT.clone()),
         false,
+        None,
     );
     assert_matches!(result, Err(Error::InvalidExpiration));
 
@@ -3879,6 +3881,7 @@ fn fail() {
         default_send_expiration(),
         None,
         false,
+        None,
     );
     let msg = s!("missing sender transport endpoint");
     assert!(matches!(
@@ -3908,6 +3911,7 @@ fn fail() {
         default_send_expiration(),
         Some(s!("not a transport endpoint")),
         false,
+        None,
     );
     assert!(matches!(
         result,
@@ -5298,6 +5302,7 @@ fn send_end_after_fail_or_end() {
                 default_send_expiration(),
                 Some(PROXY_ENDPOINT.clone()),
                 false,
+                None,
             )
             .unwrap();
         party.wallet.sign_psbt(res.psbt, None).unwrap()
@@ -5377,6 +5382,7 @@ fn send_end_after_expiration() {
             expiration as u64,
             Some(PROXY_ENDPOINT.clone()),
             false,
+            None,
         )
         .unwrap();
     let signed_psbt = party.wallet.sign_psbt(begin.psbt, None).unwrap();
@@ -10422,6 +10428,7 @@ fn out_of_band_success() {
             MIN_CONFIRMATIONS,
             default_send_expiration(),
             None,
+            None,
         )
         .unwrap();
     let txid = operation_result.txid;
@@ -11509,6 +11516,7 @@ fn proxy_auth() {
         MIN_CONFIRMATIONS,
         default_send_expiration(),
         Some(PROXY_ENDPOINT_AUTH.clone()),
+        None,
     );
     assert!(matches!(result, Err(Error::Proxy { details }) if details == "Missing: signature"));
     // the failed send was rolled back entirely, only the issuance transfer is left
@@ -11529,6 +11537,7 @@ fn proxy_auth() {
         MIN_CONFIRMATIONS,
         default_send_expiration(),
         Some(PROXY_ENDPOINT_AUTH.clone()),
+        None,
     );
     assert!(matches!(result, Err(Error::InvalidProxyAuthSignature)));
     // the failed send was rolled back entirely, only the issuance transfer is left
@@ -11549,6 +11558,7 @@ fn proxy_auth() {
             MIN_CONFIRMATIONS,
             default_send_expiration(),
             Some(PROXY_ENDPOINT_AUTH.clone()),
+            None,
         )
         .unwrap()
         .txid;
@@ -11681,6 +11691,7 @@ fn recipient_waits_broadcast_deadline() {
             MIN_CONFIRMATIONS,
             expiration as u64,
             Some(failing_ack_endpoint),
+            None,
         )
         .unwrap();
     assert!(!send_result.txid.is_empty());
@@ -11858,6 +11869,7 @@ fn hostile_sender_proxy_expiration() {
             MIN_CONFIRMATIONS,
             default_send_expiration(),
             Some(sender_endpoint),
+            None,
         )
         .unwrap()
         .txid;
@@ -11946,6 +11958,7 @@ fn hostile_sender_proxy_expiration_can_be_failed() {
             MIN_CONFIRMATIONS,
             expiration as u64,
             Some(sender_endpoint),
+            None,
         )
         .unwrap();
     assert!(!send_result.txid.is_empty());
@@ -12048,6 +12061,7 @@ fn proxy_draining() {
         MIN_CONFIRMATIONS,
         default_send_expiration(),
         Some(draining_endpoint),
+        None,
     );
     assert_matches!(result, Err(Error::ProxyDraining));
 
@@ -12345,6 +12359,9 @@ fn offline_receiver_blind_restart_waiting_counterparty() {
             recipient_id: recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let txid = party.send_retry(&recipient_map);
@@ -12431,6 +12448,9 @@ fn offline_receiver_witness_restart_waiting_counterparty() {
                 blinding: None,
             }),
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let txid = party.send_retry(&recipient_map);
@@ -12548,6 +12568,9 @@ fn offline_receiver_witness_restart_donation_true() {
                 blinding: None,
             }),
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let OperationResult { txid, .. } = party
@@ -12559,6 +12582,7 @@ fn offline_receiver_witness_restart_donation_true() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
             None,
         )
         .unwrap();
@@ -12661,6 +12685,9 @@ fn offline_receiver_blind_restart_donation_true() {
             recipient_id: recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let OperationResult { txid, .. } = party
@@ -12672,6 +12699,7 @@ fn offline_receiver_blind_restart_donation_true() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
             None,
         )
         .unwrap();
@@ -12742,6 +12770,9 @@ fn offline_receiver_nack_sender_failed_no_asset_materialized_on_receiver() {
             recipient_id: recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let txid = party.send_retry(&recipient_map);
@@ -12757,9 +12788,11 @@ fn offline_receiver_nack_sender_failed_no_asset_materialized_on_receiver() {
     );
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
 
-    ProxyClient::new(PROXY_URL)
-        .unwrap()
-        .post_ack(&recipient_id, false)
+    let consignment_hash = party.consignment_hash_sender(&txid);
+    let transfer_id = party.transfer_id_sender(&txid);
+    let nack_sig = rcv_party.sign_proxy_ack(&recipient_id, &transfer_id, false, &consignment_hash);
+    get_proxy_client(None)
+        .post_ack(&transfer_id, false, &nack_sig)
         .unwrap();
 
     party.wait_for_refresh_raw(Some(&asset.asset_id), None);
@@ -12804,6 +12837,9 @@ fn offline_receiver_nack_receiver_fails_after_sender_failure() {
             recipient_id: recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let txid = party.send_retry(&recipient_map);
@@ -12817,9 +12853,11 @@ fn offline_receiver_nack_receiver_fails_after_sender_failure() {
     );
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));
 
-    ProxyClient::new(PROXY_URL)
-        .unwrap()
-        .post_ack(&recipient_id, false)
+    let consignment_hash = party.consignment_hash_sender(&txid);
+    let transfer_id = party.transfer_id_sender(&txid);
+    let nack_sig = rcv_party.sign_proxy_ack(&recipient_id, &transfer_id, false, &consignment_hash);
+    get_proxy_client(None)
+        .post_ack(&transfer_id, false, &nack_sig)
         .unwrap();
 
     party.wait_for_refresh_raw(Some(&asset.asset_id), None);
@@ -12879,14 +12917,19 @@ fn offline_receiver_nack_receiver_fails_before_broadcast() {
             recipient_id: recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let txid = party.send_retry(&recipient_map);
     assert!(!txid.is_empty());
 
-    ProxyClient::new(PROXY_URL)
-        .unwrap()
-        .post_ack(&recipient_id, false)
+    let consignment_hash = party.consignment_hash_sender(&txid);
+    let transfer_id = party.transfer_id_sender(&txid);
+    let nack_sig = rcv_party.sign_proxy_ack(&recipient_id, &transfer_id, false, &consignment_hash);
+    get_proxy_client(None)
+        .post_ack(&transfer_id, false, &nack_sig)
         .unwrap();
 
     party.wait_for_refresh_raw(Some(&asset.asset_id), None);
@@ -12930,6 +12973,9 @@ fn offline_receiver_nack_donation_true_receiver_fails_after_broadcast() {
             recipient_id: recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let OperationResult { txid, .. } = party
@@ -12941,6 +12987,7 @@ fn offline_receiver_nack_donation_true_receiver_fails_after_broadcast() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            None,
             None,
         )
         .unwrap();
@@ -12954,9 +13001,11 @@ fn offline_receiver_nack_donation_true_receiver_fails_after_broadcast() {
         )
     );
 
-    ProxyClient::new(PROXY_URL)
-        .unwrap()
-        .post_ack(&recipient_id, false)
+    let consignment_hash = party.consignment_hash_sender(&txid);
+    let transfer_id = party.transfer_id_sender(&txid);
+    let nack_sig = rcv_party.sign_proxy_ack(&recipient_id, &transfer_id, false, &consignment_hash);
+    get_proxy_client(None)
+        .post_ack(&transfer_id, false, &nack_sig)
         .unwrap();
 
     party.refresh_all();
@@ -13014,6 +13063,9 @@ fn offline_receiver_sequential_receives_slot_integrity_after_restart() {
                 recipient_id: receive_data.recipient_id.clone(),
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
             }],
         )]);
         let txid = party.send_retry(&recipient_map);
@@ -13101,6 +13153,9 @@ fn offline_receiver_mixed_blind_witness_batch_donation_false() {
                 recipient_id: blind_receive_data.recipient_id.clone(),
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+                public_key: Some(blind_receive_data.public_key.clone()),
+                expiration_timestamp: Some(blind_receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
             },
             Recipient {
                 assignment: Assignment::Fungible(witness_amount),
@@ -13110,6 +13165,9 @@ fn offline_receiver_mixed_blind_witness_batch_donation_false() {
                     blinding: None,
                 }),
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+                public_key: Some(witness_receive_data.public_key.clone()),
+                expiration_timestamp: Some(witness_receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
             },
         ],
     )]);
@@ -13211,11 +13269,13 @@ fn out_of_band_witness_reuse() {
     let receive_data = rcv_party
         .wallet
         .witness_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let rcv_transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
@@ -13235,6 +13295,9 @@ fn out_of_band_witness_reuse() {
                 blinding: None,
             }),
             transport_endpoints: vec![],
+            public_key: None,
+            expiration_timestamp: None,
+            encryption: Encryption::Optional,
         }],
     )]);
     let operation_result = party.send(recipient_map, FEE_RATE, None);
@@ -13332,21 +13395,25 @@ fn out_of_band_reuse_ambiguous() {
     let receive_1 = rcv_party
         .wallet
         .witness_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     let receive_2 = rcv_party
         .wallet
         .witness_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     assert_eq!(receive_1.recipient_id, receive_2.recipient_id);
@@ -13362,6 +13429,9 @@ fn out_of_band_reuse_ambiguous() {
                 blinding: None,
             }),
             transport_endpoints: vec![],
+            public_key: None,
+            expiration_timestamp: None,
+            encryption: Encryption::Optional,
         }],
     )]);
     let operation_result = party.send(recipient_map, FEE_RATE, None);
@@ -13405,6 +13475,9 @@ fn out_of_band_reuse_ambiguous() {
                 blinding: None,
             }),
             transport_endpoints: vec![],
+            public_key: None,
+            expiration_timestamp: None,
+            encryption: Encryption::Optional,
         }],
     )]);
     let txid_2 = party.send(recipient_map, FEE_RATE, None).txid;
@@ -13456,11 +13529,13 @@ fn out_of_band_reuse_sequential_replay() {
     let receive_1 = rcv_party
         .wallet
         .witness_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
 
@@ -13474,6 +13549,9 @@ fn out_of_band_reuse_sequential_replay() {
                 blinding: None,
             }),
             transport_endpoints: vec![],
+            public_key: None,
+            expiration_timestamp: None,
+            encryption: Encryption::Optional,
         }],
     )]);
     let txid = party.send(recipient_map, FEE_RATE, None).txid;
@@ -13511,11 +13589,13 @@ fn out_of_band_reuse_sequential_replay() {
     let receive_2 = rcv_party
         .wallet
         .witness_receive(
+            Some(rcv_party.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap();
     assert_eq!(receive_2.recipient_id, receive_1.recipient_id);
@@ -13595,6 +13675,9 @@ fn proxy_reuse_sequential_replay() {
                 blinding: None,
             }),
             transport_endpoints: transport_endpoints_1,
+            public_key: Some(receive_1.public_key.clone()),
+            expiration_timestamp: Some(receive_1.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let txid = party.send(recipient_map, FEE_RATE, None).txid;
@@ -13613,31 +13696,24 @@ fn proxy_reuse_sequential_replay() {
         .unwrap();
     assert_eq!(t1.status, TransferStatus::Settled);
     assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, amount);
-    let vout_1 = t1.receive_utxo.as_ref().unwrap().vout;
 
     // invoice 2 on the same reused script (new nonce, proxy transport)
     let receive_2 = rcv_party.witness_receive();
     assert_eq!(receive_2.recipient_id, receive_1.recipient_id);
     assert_ne!(receive_2.batch_transfer_idx, receive_1.batch_transfer_idx);
 
-    // attacker replay: upload invoice 1's already-settled consignment to the proxy under invoice 2's
-    // proxy_recipient_id (fresh nonce, so the proxy accepts the post) with its on-chain output
-    let proxy_recipient_id_2 = Invoice::new(receive_2.invoice.clone())
-        .unwrap()
-        .invoice_data()
-        .proxy_recipient_id;
+    // attacker replay: upload invoice 1's already-settled consignment to the proxy under invoice 2
     let consignment_path = party
         .wallet
         .get_send_consignment_path(&asset.asset_id, &txid);
     let proxy_client = get_proxy_client(None);
-    proxy_client
-        .post_consignment(
-            &proxy_recipient_id_2,
-            &consignment_path,
-            &txid,
-            Some(vout_1),
-        )
-        .unwrap();
+    post_test_consignment(
+        &proxy_client,
+        &receive_2.recipient_id,
+        &receive_2.public_key,
+        &consignment_path,
+        &party.consignment_hash_sender(&txid),
+    );
 
     // refreshing invoice 2 pulls the replayed consignment: the shared settlement chokepoint must
     // reject it with a hard error (no NACK), as its on-chain output already credited invoice 1

@@ -1019,7 +1019,12 @@ pub(crate) fn sanitize_zip_for_plaintext(data: &[u8]) -> Result<(Vec<u8>, String
             // ZIP APPNOTE mandates '/' separators; a Windows-produced archive may carry
             // backslashes ("fp\bdk_db"), which the separator-naive predicates below would miss
             // and leak unredacted. Normalize once so every predicate sees canonical names.
-            let original_name = file.name().replace('\\', "/");
+            let original_name = file
+                .name()
+                .map_err(|e| Error::Internal {
+                    details: format!("Failed to read zip entry name: {e}"),
+                })?
+                .replace('\\', "/");
 
             // Skip files carrying xpubs or the fingerprint in their contents
             if is_bdk_db_file(&original_name) || is_wallet_manifest_file(&original_name) {
@@ -1492,7 +1497,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(reader).unwrap();
 
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
 
         // Fingerprint should be replaced with "wallet"
@@ -1525,7 +1530,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(reader).unwrap();
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).unwrap();
-            let filename = file.name().rsplit('/').next().unwrap().to_string();
+            let filename = file.name().unwrap().rsplit('/').next().unwrap().to_string();
             assert_ne!(filename, WALLET_MANIFEST_FILE);
             assert_ne!(filename, format!("{WALLET_MANIFEST_FILE}.tmp"));
             let mut content = Vec::new();

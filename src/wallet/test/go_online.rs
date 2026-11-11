@@ -182,6 +182,7 @@ fn bitcoind() {
             MIN_CONFIRMATIONS,
             default_send_expiration(),
             Some(PROXY_ENDPOINT.clone()),
+            None,
         )
         .unwrap()
         .txid;

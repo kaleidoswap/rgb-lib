@@ -462,7 +462,7 @@ pub(crate) fn schema_supports_assignment(schema: AssetSchema, assignment: &Assig
         AssetSchema::Uda => matches!(assignment, Assignment::NonFungible),
         AssetSchema::Ifa => matches!(
             assignment,
-            Assignment::Fungible(_) | Assignment::InflationRight(_)
+            Assignment::Fungible(_) | Assignment::InflationRight(_) | Assignment::LinkRight
         ),
     }
 }
@@ -523,7 +523,7 @@ pub(crate) fn check_receive_schema_assignment_combinations(
         .map(|a| match a {
             Assignment::Fungible(_) => Assignment::Fungible(amount),
             Assignment::InflationRight(_) => Assignment::InflationRight(amount),
-            Assignment::NonFungible | Assignment::Any => a,
+            Assignment::NonFungible | Assignment::LinkRight | Assignment::Any => a,
         })
         .collect();
     for (schema, asset_id) in schemas {
