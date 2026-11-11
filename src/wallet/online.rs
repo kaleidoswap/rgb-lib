@@ -3128,6 +3128,25 @@ pub trait WalletOnline: WalletOffline {
             }
         }
 
+        // the receive consignment is cached under the recipient ID, which address reuse lets
+        // other transfers share: refuse rather than overwrite the cached consignment of any other
+        // transfer (in any status) with the same recipient ID
+        let matched_idxs: HashSet<i32> = matches.iter().map(|(_, _, t)| t.idx).collect();
+        if let Some(other) = txn.iter_transfers()?.into_iter().find(|t| {
+            !matched_idxs.contains(&t.idx)
+                && t.recipient_id.is_some()
+                && seen_recipient_ids.contains(t.recipient_id.as_ref().unwrap())
+        }) {
+            return Err(Error::CannotProvideOutOfBandConsignment {
+                details: format!(
+                    "recipient {} is shared with transfer {} (address reuse), refusing to \
+                     overwrite its consignment",
+                    other.recipient_id.unwrap_or_default(),
+                    other.idx
+                ),
+            });
+        }
+
         // the replayed-output guard lives in validate_received_consignment (the shared settlement
         // chokepoint), so it covers this OOB path and the proxy path alike.
 
