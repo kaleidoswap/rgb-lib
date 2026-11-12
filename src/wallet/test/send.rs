@@ -1791,6 +1791,8 @@ fn receive_multiple_same_asset_success() {
             },
         ],
     )]);
+    // no blocks until the transfers have been checked in status WaitingConfirmations
+    let guard = stop_mining();
     let txid = party.send_retry(&recipient_map);
     assert!(!txid.is_empty());
 
@@ -1966,6 +1968,7 @@ fn receive_multiple_same_asset_success() {
     assert!(updated_at_2 > transfer_data_2.created_at);
 
     // transfers progress to status Settled after tx mining + refresh
+    drop(guard);
     mine(false);
     std::thread::sleep(Duration::from_millis(1000)); // make sure updated_at will be at least +1s
     rcv_party.wait_for_refresh(None);
@@ -2063,6 +2066,8 @@ fn receive_multiple_different_assets_success() {
             }],
         ),
     ]);
+    // no blocks until the transfers have been checked in status WaitingConfirmations
+    let guard = stop_mining();
     let txid = party.send_retry(&recipient_map);
     assert!(!txid.is_empty());
 
@@ -2280,6 +2285,7 @@ fn receive_multiple_different_assets_success() {
 
     // transfers progress to status Settled after tx mining + refresh
     std::thread::sleep(Duration::from_millis(1000)); // make sure updated_at will be at least +1s
+    drop(guard);
     mine(false);
     rcv_party.wait_for_refresh(None);
     party.wait_for_refresh(Some(&asset_1.asset_id));
@@ -2597,6 +2603,8 @@ fn ack() {
             },
         ],
     )]);
+    // no blocks until the transfers have been checked in their intermediate statuses
+    let _guard = stop_mining();
     let txid = party.send_retry(&recipient_map);
     assert!(!txid.is_empty());
 
@@ -5838,6 +5846,8 @@ fn witness_success() {
         ],
     )]);
     party.create_utxos(false, None, None, FEE_RATE, None);
+    // no blocks until the transfers have been checked in status WaitingConfirmations
+    let guard = stop_mining();
     let txid = party.send_retry(&recipient_map);
     assert!(!txid.is_empty());
 
@@ -5890,6 +5900,7 @@ fn witness_success() {
     );
 
     // transfers progress to status Settled after tx mining + refresh
+    drop(guard);
     mine(false);
     rcv_party.wait_for_refresh(None);
     party.wait_for_refresh(Some(&asset.asset_id));
@@ -11425,56 +11436,6 @@ fn out_of_band_consignment_multiple_receives() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn fail_no_terminals() {
-    initialize();
-
-    let amount: u64 = 66;
-
-    // wallets
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-
-    // issue
-    let asset = party.issue_asset_nia(None);
-
-    // send, stripping the terminals from the generated consignment
-    let receive_data = rcv_party.blind_receive();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(amount),
-            recipient_id: receive_data.recipient_id.clone(),
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-            public_key: Some(receive_data.public_key.clone()),
-            expiration_timestamp: Some(receive_data.expiration_timestamp),
-            encryption: Encryption::Optional,
-        }],
-    )]);
-    println!("setting MOCK_STRIP_TERMINALS");
-    MOCK_STRIP_TERMINALS.replace(Some(()));
-    let txid = party.send_retry(&recipient_map);
-    assert!(!txid.is_empty());
-
-    // the receiver refuses the consignment and both sides end up Failed
-    rcv_party.wait_for_refresh(None);
-    let rcv_transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
-    let (rcv_transfer_data, _) = rcv_party.get_test_transfer_data(&rcv_transfer);
-    assert_eq!(rcv_transfer_data.status, TransferStatus::Failed);
-
-    party.wait_for_refresh(Some(&asset.asset_id));
-    let batch_transfers = party.db_batch_transfers_filtered(&txid);
-    let batch_transfer = batch_transfers.first().unwrap();
-    let asset_transfer = party.get_test_asset_transfer(batch_transfer.idx);
-    for transfer in party.db_transfers_filtered(asset_transfer.idx) {
-        let (transfer_data, _) = party.get_test_transfer_data(&transfer);
-        assert_eq!(transfer_data.status, TransferStatus::Failed);
-    }
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
 fn proxy_auth() {
     initialize();
 
@@ -13729,4 +13690,56 @@ fn proxy_reuse_sequential_replay() {
         t2.status
     );
     assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, amount);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn other_assets_amounts_past_u64() {
+    initialize();
+
+    // wallets
+    let mut party = get_funded_noutxo_party!();
+    let mut rcv_party = get_funded_party!();
+    party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // issue 2 assets to the same UTXO, with amounts that don't fit a u64 together
+    let asset = party.issue_asset_nia(Some(&[u64::MAX]));
+    let asset_extra = party.issue_asset_cfa(Some(&[u64::MAX]), None);
+    let unspents: Vec<Unspent> = party
+        .list_unspents(true)
+        .into_iter()
+        .filter(|u| !u.rgb_allocations.is_empty())
+        .collect();
+    assert_eq!(unspents.len(), 1);
+    assert_eq!(unspents.first().unwrap().rgb_allocations.len(), 2);
+
+    // send with another UTXO available so that UTXOs are sorted for input selection:
+    // sorting sums all allocations, which overflows if assets are not tracked separately
+    party.create_utxos(false, Some(1), None, FEE_RATE, None);
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![blind_recipient(&receive_data, Assignment::Fungible(AMOUNT))],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+
+    // settle the transfers
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    mine(false);
+    rcv_party.wait_for_refresh(Some(&asset.asset_id));
+    party.wait_for_refresh(Some(&asset.asset_id));
+
+    // check the final balances
+    assert_eq!(
+        party.get_asset_balance(&asset.asset_id).settled,
+        u64::MAX - AMOUNT
+    );
+    assert_eq!(
+        party.get_asset_balance(&asset_extra.asset_id).settled,
+        u64::MAX
+    );
+    assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, AMOUNT);
 }

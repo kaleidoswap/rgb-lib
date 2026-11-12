@@ -945,6 +945,7 @@ dictionary RgbInputInfo {
 dictionary RgbOutputInfo {
   string? txid;
   u32? vout;
+  u64? blinding;
   Assignment assignment;
   boolean is_concealed;
   string? recipient_id;
@@ -966,6 +967,8 @@ enum TypeOfTransition {
   "Transfer",
   "Burn",
   "Link",
+  "TransferInflation",
+  "TransferLink",
 };
 
 [Remote]
@@ -1116,6 +1119,12 @@ dictionary OnchainSwapReceiveResult {
 };
 
 [Remote]
+dictionary RgbMediaInfo {
+  string digest;
+  string mime;
+};
+
+[Remote]
 dictionary RgbGenesisInfo {
   string chain_net;
   i64 timestamp;
@@ -1124,6 +1133,7 @@ dictionary RgbGenesisInfo {
   string? ticker;
   string? details;
   u8 precision;
+  sequence<RgbMediaInfo> media;
   sequence<RgbOutputInfo> outputs;
 };
 

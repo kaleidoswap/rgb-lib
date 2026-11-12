@@ -299,6 +299,9 @@ impl TryFrom<&Outpoint> for OutPoint {
 ///
 /// This structure is used both for RGB assets and BTC balances (in sats). When used for a BTC
 /// balance it can be used both for the vanilla wallet and the colored wallet.
+///
+/// An RGB balance exceeding `u64::MAX` (e.g. a future balance including pending incoming transfers
+/// that double-spend each other) is capped to `u64::MAX`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct Balance {
@@ -2685,6 +2688,17 @@ pub enum ReceiveMatcher {
     /// the script paid and, when known (proxy exchange), the blinding of the seal
     /// (`v1.0-changes-spec.md` A.11)
     Witness(ScriptBuf, Option<u64>),
+}
+
+/// A destination at which a consignment pays this recipient, see `find_payments`.
+#[cfg(feature = "_online")]
+pub struct ConsignmentPayment<'c> {
+    /// the bundle paying the recipient
+    pub(crate) bundle: &'c WitnessBundle,
+    /// for witness receives, the vout of the bundle witness TX being paid
+    pub(crate) vout: Option<u32>,
+    /// the assignments received, unspent within the consignment
+    pub(crate) receiving: HashMap<Opout, Assignment>,
 }
 
 impl DbTransfer {
