@@ -657,7 +657,7 @@ pub(crate) fn test_indexer_config(indexer_url: &str) -> IndexerConfig {
         };
     }
     #[cfg(feature = "_online")]
-    if indexer_url == ESPLORA_URL {
+    if indexer_url == ESPLORA_URL || indexer_url.starts_with("https://") {
         return IndexerConfig::Esplora { url };
     }
     #[cfg(feature = "electrum")]
