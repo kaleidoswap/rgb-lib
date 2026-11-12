@@ -12394,7 +12394,7 @@ fn offline_receiver_blind_restart_waiting_counterparty() {
     party.wait_for_refresh_raw(Some(&asset.asset_id), None);
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
 
-    rcv_party.wait_for_refresh_raw(None, None);
+    // the recipient already broadcast the TX its ACK released: nothing left to refresh
     assert!(
         rcv_party.check_test_transfer_status_recipient(
             &recipient_id,
@@ -12490,7 +12490,7 @@ fn offline_receiver_witness_restart_waiting_counterparty() {
     party.wait_for_refresh_raw(Some(&asset.asset_id), None);
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
 
-    rcv_party.wait_for_refresh_raw(None, None);
+    // the recipient already broadcast the TX its ACK released: nothing left to refresh
     assert!(
         rcv_party.check_test_transfer_status_recipient(
             &recipient_id,
@@ -12947,15 +12947,10 @@ fn offline_receiver_nack_receiver_fails_before_broadcast() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn offline_receiver_nack_donation_true_receiver_fails_after_broadcast() {
+fn offline_receiver_nack_donation_true_receiver_still_settles() {
     initialize();
 
     let amount: u64 = 66;
-    let zero_balance = Balance {
-        settled: 0,
-        future: 0,
-        spendable: 0,
-    };
 
     let mut party = get_funded_party!();
     let mut rcv_party = get_funded_party!();
@@ -13011,13 +13006,15 @@ fn offline_receiver_nack_donation_true_receiver_fails_after_broadcast() {
     party.refresh_all();
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
 
+    // a donation is already broadcast, with no sender-proxy ACK machinery: a NACK cannot stop it,
+    // so the recipient (whose ACK is refused) accepts what was paid to it rather than losing it
     rcv_party.wait_for_refresh_raw(None, None);
-    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
-    match rcv_party.get_asset_balance_result(&asset.asset_id) {
-        Ok(balance) => assert_eq!(balance, zero_balance),
-        Err(Error::AssetNotFound { .. }) => {}
-        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
-    }
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &recipient_id,
+            TransferStatus::WaitingConfirmations
+        )
+    );
 
     drop(mining_guard);
     mine(false);
@@ -13025,12 +13022,15 @@ fn offline_receiver_nack_donation_true_receiver_fails_after_broadcast() {
     party.wait_for_refresh_raw(Some(&asset.asset_id), None);
 
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
-    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Failed));
-    match rcv_party.get_asset_balance_result(&asset.asset_id) {
-        Ok(balance) => assert_eq!(balance, zero_balance),
-        Err(Error::AssetNotFound { .. }) => {}
-        Err(e) => panic!("unexpected receiver balance result after NACK: {e:?}"),
-    }
+    assert!(rcv_party.check_test_transfer_status_recipient(&recipient_id, TransferStatus::Settled));
+    assert_eq!(
+        rcv_party.get_asset_balance(&asset.asset_id),
+        Balance {
+            settled: amount,
+            future: amount,
+            spendable: amount,
+        }
+    );
 }
 
 #[cfg(feature = "electrum")]
@@ -13184,10 +13184,11 @@ fn offline_receiver_mixed_blind_witness_batch_donation_false() {
         TransferStatus::WaitingCounterparty
     ));
 
+    // the TX of a batch is released once every recipient ACKed: the first one waits for it
     blind_party.wait_for_refresh_raw(None, None);
     assert!(blind_party.check_test_transfer_status_recipient(
         &blind_receive_data.recipient_id,
-        TransferStatus::WaitingConfirmations
+        TransferStatus::WaitingBroadcast
     ));
     blind_party.wait_for_asset_balance(&asset.asset_id, &blind_waiting_balance);
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty));

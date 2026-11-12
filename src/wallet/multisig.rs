@@ -2363,6 +2363,7 @@ impl MultisigWallet {
 
     fn post_operation(
         &self,
+        txn: &DbTxn,
         operation_type: OperationType,
         post_data: PostData,
     ) -> Result<InitOperationResult, Error> {
@@ -2390,9 +2391,7 @@ impl MultisigWallet {
                 if matches!(operation_type, OperationType::SendRgb) {
                     let (_, transfer_dir, info_contents, fascia) =
                         self.get_transfer_end_data(&begin_operation_data.psbt)?;
-                    let txn = self.database().begin_transaction()?;
-                    self.gen_consignments(&txn, &fascia, &info_contents.transfers, &transfer_dir)?;
-                    txn.commit()?;
+                    self.gen_consignments(txn, &fascia, &info_contents.transfers, &transfer_dir)?;
                     for asset_id in info_contents.transfers.keys() {
                         let consignment_path = self
                             .get_asset_transfer_dir(&transfer_dir, asset_id)
@@ -2455,7 +2454,7 @@ impl MultisigWallet {
         let txn = self.database().begin_transaction()?;
         let psbt =
             self.create_utxos_begin_impl(&txn, up_to, num, size, fee_rate, skip_sync, true, &[])?;
-        let res = self.post_operation(OperationType::CreateUtxos, PostData::Psbt(psbt))?;
+        let res = self.post_operation(&txn, OperationType::CreateUtxos, PostData::Psbt(psbt))?;
         self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Initiate creating UTXOs completed");
@@ -2488,7 +2487,7 @@ impl MultisigWallet {
             None,
             &[],
         )?;
-        let res = self.post_operation(OperationType::SendBtc, PostData::Psbt(psbt))?;
+        let res = self.post_operation(&txn, OperationType::SendBtc, PostData::Psbt(psbt))?;
         self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Initiate sending BTC completed");
@@ -2551,6 +2550,7 @@ impl MultisigWallet {
             None,
         )?;
         let res = self.post_operation(
+            &txn,
             OperationType::SendRgb,
             PostData::BeginOperationData(Box::new(data)),
         )?;
@@ -2593,6 +2593,7 @@ impl MultisigWallet {
             true,
         )?;
         let res = self.post_operation(
+            &txn,
             OperationType::Inflation,
             PostData::BeginOperationData(Box::new(data)),
         )?;
@@ -2636,6 +2637,7 @@ impl MultisigWallet {
             true,
         )?;
         let res = self.post_operation(
+            &txn,
             OperationType::Burn,
             PostData::BeginOperationData(Box::new(data)),
         )?;

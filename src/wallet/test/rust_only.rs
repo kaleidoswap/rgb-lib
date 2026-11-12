@@ -3165,7 +3165,6 @@ fn psbt_op_prepare_writes_op_dir_for_wallet_owned_input() {
 }
 
 // A deterministic Electrum fixture: startup/network checks succeed, but history lookup fails.
-// Two clients are opened by get_resolver (protocol detection and consensus resolution).
 #[cfg(feature = "electrum")]
 fn failing_history_indexer() -> (String, std::thread::JoinHandle<usize>) {
     use std::io::{BufRead, BufReader, Write};
@@ -3179,10 +3178,23 @@ fn failing_history_indexer() -> (String, std::thread::JoinHandle<usize>) {
         )
         .header,
     ));
+    // indexer detection and resolution open several clients, some left idle: serve every client
+    // that connects until none has for a while, ending a client on read timeout or EOF
+    listener.set_nonblocking(true).unwrap();
     let server = std::thread::spawn(move || {
         let mut clients = vec![];
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
+        let mut last_accept = std::time::Instant::now();
+        while last_accept.elapsed() < std::time::Duration::from_secs(10) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(conn) => conn,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            };
+            last_accept = std::time::Instant::now();
+            stream.set_nonblocking(false).unwrap();
             let header = header.clone();
             clients.push(std::thread::spawn(move || {
                 stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
@@ -3190,7 +3202,10 @@ fn failing_history_indexer() -> (String, std::thread::JoinHandle<usize>) {
                 let mut failures = 0;
                 loop {
                     let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap() == 0 { break; }
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
                     let request: Value = serde_json::from_str(&line).unwrap();
                     let mut response = serde_json::json!({"jsonrpc":"2.0", "id":request["id"]});
                     match request["method"].as_str().unwrap() {
@@ -3206,9 +3221,15 @@ fn failing_history_indexer() -> (String, std::thread::JoinHandle<usize>) {
                                 "code": -1, "message": "temporary indexer outage",
                             });
                         }
-                        method => panic!("unexpected Electrum request: {method}"),
+                        method => {
+                            response["error"] = serde_json::json!({
+                                "code": -1, "message": format!("unsupported method {method}"),
+                            });
+                        }
                     }
-                    writeln!(stream, "{response}").unwrap();
+                    if writeln!(stream, "{response}").is_err() {
+                        break;
+                    }
                 }
                 failures
             }));
