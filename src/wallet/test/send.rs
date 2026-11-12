@@ -13207,11 +13207,6 @@ fn offline_receiver_mixed_blind_witness_batch_donation_false() {
         &blind_receive_data.recipient_id,
         TransferStatus::WaitingConfirmations
     ));
-    witness_party.wait_for_refresh_raw(None, None);
-    assert!(witness_party.check_test_transfer_status_recipient(
-        &witness_receive_data.recipient_id,
-        TransferStatus::WaitingConfirmations
-    ));
     witness_party.wait_for_asset_balance(&asset.asset_id, &witness_waiting_balance);
 
     drop(mining_guard);

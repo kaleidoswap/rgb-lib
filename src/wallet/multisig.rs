@@ -2136,28 +2136,39 @@ impl MultisigWallet {
                 let mut combined_psbt = Self::combine_psbts_from_files(files)?;
                 // Idempotency: if this operation's transaction is already broadcast
                 // (another cosigner finalized and broadcast it, or we did but lost
-                // our local commit), complete it without requiring this party to
-                // re-finalize the PSBT — otherwise a party that has not yet
-                // collected all signatures loops on `CannotFinalizePsbt` forever
-                // even though the transaction is already on-chain. The txid commits
-                // to all inputs and outputs, so it is stable regardless of
-                // finalization. The BDK graph is a fast offline check; the indexer
-                // probe is the authoritative fallback so recovery does not depend
-                // on a prior chain sync.
+                // our local commit) and this party cannot finalize the PSBT (it has
+                // not collected all signatures), complete it from the broadcast
+                // transaction instead of looping on `CannotFinalizePsbt`. The final
+                // witnesses are taken from that transaction, so the signed TX (and
+                // its hash, registered on the sender proxy) matches the one of the
+                // cosigner that broadcast it.
                 let tx = combined_psbt.unsigned_tx.compute_txid();
-                let already_broadcast = self.tx_known_to_wallet(&tx)
-                    || self
-                        .indexer()
-                        .get_tx_confirmations(&tx.to_string())?
-                        .is_some();
-                if already_broadcast {
+                if let Err(e) = self.finalize_psbt_impl(&mut combined_psbt, None) {
+                    let broadcast_tx = match self.bdk_wallet().get_tx(tx) {
+                        Some(wallet_tx) => Some((*wallet_tx.tx_node.tx).clone()),
+                        None => self.indexer().get_tx(&tx.to_string())?,
+                    };
+                    let Some(broadcast_tx) = broadcast_tx else {
+                        return Err(e);
+                    };
+                    if broadcast_tx.compute_txid() != tx
+                        || broadcast_tx.input.len() != combined_psbt.inputs.len()
+                    {
+                        return Err(e);
+                    }
                     info!(
                         self.logger(),
-                        "operation {} tx {tx} already broadcast; completing without re-finalizing",
+                        "operation {} tx {tx} already broadcast; completing from the broadcast tx",
                         op.operation_idx
                     );
-                } else {
-                    self.finalize_psbt_impl(&mut combined_psbt, None)?;
+                    for (psbt_input, tx_input) in
+                        combined_psbt.inputs.iter_mut().zip(broadcast_tx.input)
+                    {
+                        psbt_input.final_script_sig = (!tx_input.script_sig.is_empty())
+                            .then_some(tx_input.script_sig);
+                        psbt_input.final_script_witness =
+                            (!tx_input.witness.is_empty()).then_some(tx_input.witness);
+                    }
                 }
                 let txid = tx.to_string();
                 H::reconstruct_transfer_directory(self, &txid, files)?;
