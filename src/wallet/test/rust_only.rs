@@ -7343,6 +7343,55 @@ fn psbt_op_swap_settle(
     }
 }
 
+/// A stage whose input reservation fails leaves the caller's PSBT as it was and no operation
+/// directory behind.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn psbt_op_stage_failed_reservation_leaves_psbt_and_journal_untouched() {
+    initialize();
+
+    let a = PsbtOpSwapSide::new(AMOUNT);
+    let b = PsbtOpSwapSide::new(AMOUNT_SMALL);
+    let base = psbt_op_swap_psbt(&a, &b);
+    let txid = base.unsigned_tx.compute_txid().to_string();
+    let a_staged = a.stage(&mut base.clone(), A_VOUT);
+
+    let ops_root = a.party.wallet.get_wallet_dir().join("psbt_ops");
+    let op_dirs = || {
+        let mut dirs: Vec<_> = std::fs::read_dir(&ops_root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        dirs.sort();
+        dirs
+    };
+    let dirs_before = op_dirs();
+    assert_eq!(dirs_before, vec![a_staged.operation_id.clone()]);
+
+    let mut psbt = base.clone();
+    let restaged = a.party.wallet.psbt_op_stage(
+        &mut psbt,
+        coloring_info_for(
+            &a.asset_id,
+            HashMap::from([(A_VOUT, a.amount)]),
+            PSBT_OP_SWAP_BLINDING,
+        ),
+        vec![a.input],
+        MIN_CONFIRMATIONS,
+        PsbtOpExpiry::Default,
+    );
+    assert_matches!(
+        restaged,
+        Err(Error::BatchTransferAlreadyExists { txid: ref t, .. }) if *t == txid
+    );
+    assert_eq!(psbt.serialize(), base.serialize());
+    assert_eq!(op_dirs(), dirs_before);
+    let op = a.party.wallet.psbt_op_by_txid(&txid).unwrap();
+    assert_eq!(op.operation_id, a_staged.operation_id);
+    assert_eq!(op.status, PsbtOperationStatus::Staged);
+}
+
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]

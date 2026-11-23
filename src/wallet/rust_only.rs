@@ -512,6 +512,26 @@ impl PsbtOpPayloadHashes {
     }
 }
 
+/// Removes a half-written operation directory unless disarmed.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+struct RemoveDirOnDrop(Option<PathBuf>);
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl RemoveDirOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 fn psbt_op_batch_identity_hash(batch_transfer_idx: i32) -> String {
     sha256_hex(batch_transfer_idx.to_string().as_bytes())
@@ -2848,18 +2868,24 @@ impl Wallet {
                 ),
             });
         }
-        let (runtime, override_set) =
-            self.prepare_color_psbt_for_outpoints(psbt, &coloring_info, input_outpoints, true)?;
+        // the caller's PSBT only changes once the operation is journaled and its inputs reserved
+        let mut work = psbt.clone();
+        let (runtime, override_set) = self.prepare_color_psbt_for_outpoints(
+            &mut work,
+            &coloring_info,
+            input_outpoints,
+            true,
+        )?;
         self.color_psbt_stage_runtime(
             &runtime,
-            psbt,
+            &mut work,
             coloring_info.clone(),
             override_set.clone(),
             true,
             false,
         )?;
 
-        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let txid = work.unsigned_tx.compute_txid().to_string();
         let spent =
             Self::psbt_op_spent_by_contract(&runtime, contracts.iter().copied(), &override_set)?;
         let foreign_inputs = self.collect_foreign_input_entries(&spent)?;
@@ -2869,12 +2895,13 @@ impl Wallet {
             min_confirmations,
             expiration_timestamp,
         );
-        let allocations = Self::psbt_op_staged_allocations(psbt, &manifest)?;
+        let allocations = Self::psbt_op_staged_allocations(&work, &manifest)?;
 
         let operation_id = Self::new_psbt_op_id();
         let op_dir = self.psbt_op_dir(&operation_id)?;
         persist_durable_create_dir(&op_dir)?;
-        let staged_psbt = psbt.to_string();
+        let op_dir_guard = RemoveDirOnDrop(Some(op_dir.clone()));
+        let staged_psbt = work.to_string();
         let manifest_raw = serde_json::to_string_pretty(&manifest).map_err(InternalError::from)?;
         let foreign_inputs_raw = serde_json::to_string_pretty(&ForeignInputsFile {
             entries: foreign_inputs,
@@ -2911,7 +2938,7 @@ impl Wallet {
             let txn = self.database().begin_transaction()?;
             let batch_transfer_idx = self.persist_color_prepare_batch_txn(
                 &txn,
-                psbt,
+                &work,
                 &txid,
                 &spent,
                 &coloring_info,
@@ -2924,17 +2951,13 @@ impl Wallet {
             txn.commit()?;
             Ok(batch_transfer_idx)
         };
-        let batch_transfer_idx = match reserve() {
-            Ok(idx) => idx,
-            Err(e) => {
-                let _ = fs::remove_dir_all(&op_dir);
-                return Err(e);
-            }
-        };
+        let batch_transfer_idx = reserve()?;
+        op_dir_guard.disarm();
         drop(runtime);
 
         self.psbt_op_bind_batch_identity(&operation_id, &mut meta, batch_transfer_idx)?;
         self.trigger_auto_backup();
+        *psbt = work;
 
         info!(
             self.logger(),
