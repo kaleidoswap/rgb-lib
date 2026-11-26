@@ -198,6 +198,11 @@ impl MultisigKeys {
 /// An RGB multisig wallet.
 ///
 /// Can be obtained with the [`MultisigWallet::new`] method.
+///
+/// For now, a multisig wallet refuses the mints of bridged assets paying it (it can still receive
+/// regular transfers of bridged assets): its cosigners would check a received mint each on its
+/// own, so one not checking it could make the others fail it while the lock may have been made.
+/// This is temporary, it will be addressed along with other open issues of multisig wallets.
 pub struct MultisigWallet {
     pub(crate) internals: WalletInternals,
     pub(crate) keys: MultisigKeys,
@@ -251,22 +256,6 @@ impl WalletOffline for MultisigWallet {
         keychain: KeychainKind,
         count: u32,
     ) -> Result<BdkAddress, Error> {
-        if self.wallet_data().reuse_addresses {
-            let index = self
-                .internals()
-                .reuse_address_index
-                .get(&keychain)
-                .copied()
-                .unwrap_or(0);
-            let address = self.bdk_wallet().peek_address(keychain, index).address;
-            let revealed = self.bdk_wallet().derivation_index(keychain).unwrap_or(0);
-            if revealed <= index {
-                self.bdk_wallet_mut()
-                    .reveal_addresses_to(keychain, index)
-                    .for_each(drop);
-            }
-            return Ok(address);
-        }
         let is_internal = keychain == KeychainKind::Internal;
         let start_index = self.hub_client().bump_address_indices(count, is_internal)?;
         let local_index = self.bdk_wallet().derivation_index(keychain).unwrap_or(0);
@@ -294,6 +283,15 @@ impl WalletOnline for MultisigWallet {
 
     // every cosigner downloads the consignment from the recipient proxy
     fn releases_received_transfer_data(&self) -> bool {
+        false
+    }
+
+    // TODO: temporary, until the receive of a mint is coordinated among cosigners (along with
+    // other open issues of multisig wallets). Each cosigner checks a received mint on its own,
+    // while a cosigner that doesn't check it may fail it on the hub (e.g. at its invoice
+    // expiration), making the others fail it too: as the lock may have been made already, the
+    // mint would then complete on an output no cosigner tracks
+    fn accepts_received_mints(&self) -> bool {
         false
     }
 
@@ -913,7 +911,7 @@ impl OperationHandler for BurnHandler {
                 .transfers
                 .values()
                 .next()
-                .and_then(|transfer| transfer.burn_reason)
+                .and_then(|transfer| transfer.main_transition.burn_reason())
                 .map(|burn_reason| burn_reason.to_string()),
         })
     }
@@ -1091,9 +1089,14 @@ impl MultisigWallet {
         migrate_rgb_fs_to_db(&wallet_dir, &database)?;
 
         // setup RGB
-        setup_rgb(&database, wdata.supported_schemas, wdata.bitcoin_network)?;
+        setup_rgb(
+            &database,
+            wdata.supported_schemas,
+            wdata.bitcoin_network,
+            wdata.allow_reckless_schemas,
+            &logger,
+        )?;
 
-        let reuse_address_index = database.begin_transaction()?.get_reuse_address_index()?;
         info!(logger, "New multisig wallet completed");
         Ok(Self {
             internals: WalletInternals {
@@ -1104,7 +1107,6 @@ impl MultisigWallet {
                 wallet_dir,
                 bdk_wallet,
                 bdk_pending: Arc::new(Mutex::new(ChangeSet::default())),
-                reuse_address_index,
                 #[cfg(feature = "_online")]
                 online_data: None,
                 #[cfg(feature = "vss")]
@@ -1252,35 +1254,6 @@ impl MultisigWallet {
         self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Get address completed");
-        Ok(address.to_string())
-    }
-
-    /// Rotate the pinned address for the given keychain.
-    ///
-    /// Only meaningful when `reuse_addresses` is `true`. Increments the pinned derivation
-    /// index so subsequent address generation returns a fresh address.
-    pub fn rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
-        if !self.wallet_data().reuse_addresses {
-            return Err(Error::AddressReuseDisabled);
-        }
-        let index = self
-            .internals()
-            .reuse_address_index
-            .get(&keychain)
-            .copied()
-            .unwrap_or(0);
-        let new_index = index.checked_add(1).ok_or_else(|| Error::Internal {
-            details: "address derivation index exhausted".to_string(),
-        })?;
-        let txn = self.database().begin_transaction()?;
-        txn.set_reuse_address_index(keychain, new_index)?;
-        self.update_backup_info(&txn, false)?;
-        self.persist_and_commit(txn)?;
-        self.internals_mut()
-            .reuse_address_index
-            .insert(keychain, new_index);
-        self.trigger_auto_backup();
-        let address = self.bdk_wallet().peek_address(keychain, new_index).address;
         Ok(address.to_string())
     }
 
@@ -1528,13 +1501,10 @@ impl MultisigWallet {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
-        issuance_type: Option<IfaIssuanceType>,
     ) -> Result<AssetIFA, Error> {
         info!(self.logger(), "Issuing IFA...");
         self.check_online(online)?;
         self.check_is_cosigner()?;
-        let (create_link_right, linked_from_contract_id) =
-            issuance_type.unwrap_or_default().into_ifa_link_data()?;
         let txn = self.database().begin_transaction()?;
         let issue_data = self.create_ifa_contract(
             &txn,
@@ -1544,8 +1514,9 @@ impl MultisigWallet {
             amounts,
             inflation_amounts,
             reject_list_url,
-            linked_from_contract_id,
-            create_link_right,
+            false,
+            None,
+            false,
         )?;
         let res = self.upload_and_process_issuance(&txn, &issue_data, vec![])?;
         txn.commit()?;
@@ -1582,6 +1553,8 @@ impl MultisigWallet {
             transport_endpoints,
             recipient_type,
             encryption,
+            // invoices cannot be reused by multisig wallets
+            1,
         )?;
 
         // post operation and metadata to hub
@@ -1630,6 +1603,11 @@ impl MultisigWallet {
     ///
     /// An optional amount can be specified, which will be embedded in the invoice. It will not be
     /// checked when accepting the transfer.
+    ///
+    /// A UTXO holds at most one mint right of an asset: an invoice requesting one
+    /// ([`Assignment::MintRight`]) blinds a UTXO that doesn't hold one and isn't due to receive
+    /// one, and a transfer paying a mint right to a UTXO holding one (e.g. through an invoice
+    /// requesting [`Assignment::Any`]) is refused.
     ///
     /// An expiration UTC timestamp must be specified, which will set the expiration of the
     /// invoice and the transfer. An expiration more than [`MAX_EXPIRATION_SECS`] in the future is
@@ -1839,7 +1817,6 @@ impl MultisigWallet {
             valid_contract,
             contract_path,
             issue_utxos,
-            link_right_outpoint: None,
         };
 
         self.import_and_save_contract(txn, &issue_data, &mut stock)?;
@@ -1872,26 +1849,7 @@ impl MultisigWallet {
         let invoice_data = invoice.invoice_data();
         let recipient_id = invoice_data.recipient_id.clone();
 
-        // Strip the per-invoice `rid_nonce` query parameter from each transport
-        // endpoint URL before storing, so stored endpoints stay as bare URLs.
-        // Capture the nonce so the cosigner can derive the proxy routing key
-        // during refresh. All endpoints on a given invoice carry the same
-        // nonce; take the first non-empty one.
-        let mut recipient_nonce: Vec<u8> = vec![];
-        let bare_endpoints: Vec<String> = invoice_data
-            .transport_endpoints
-            .iter()
-            .map(|ep| {
-                let (bare, nonce) = crate::utils::extract_recipient_nonce(ep);
-                if let Some(n) = nonce
-                    && recipient_nonce.is_empty()
-                {
-                    recipient_nonce = n;
-                }
-                bare
-            })
-            .collect();
-        let endpoints = self.convert_transport_endpoints(&bare_endpoints)?;
+        let endpoints = self.convert_transport_endpoints(&invoice_data.transport_endpoints)?;
 
         // parse data based on operation type
         let (blind_seal, recipient_type_full, script_pubkey) = match operation_type {
@@ -1914,10 +1872,7 @@ impl MultisigWallet {
             }
             OperationType::WitnessReceive => (
                 None,
-                RecipientTypeFull::Witness {
-                    vout: None,
-                    recipient_nonce,
-                },
+                RecipientTypeFull::Witness { vout: None },
                 Some(script_buf_from_recipient_id(invoice_data.recipient_id.clone())?.unwrap()),
             ),
             _ => unreachable!("only receive operations"),
@@ -1947,6 +1902,9 @@ impl MultisigWallet {
                 .unwrap_or_default(),
             encryption: invoice_data.encryption,
             retention_deadline: receive_metadata.retention_deadline,
+            quota: 1,
+            invoice_deadline: None,
+            receive_dir: None,
         };
         let batch_transfer_idx =
             self.store_receive_transfer(txn, &receive_data_internal, min_confirmations)?;
@@ -2164,8 +2122,8 @@ impl MultisigWallet {
                     for (psbt_input, tx_input) in
                         combined_psbt.inputs.iter_mut().zip(broadcast_tx.input)
                     {
-                        psbt_input.final_script_sig = (!tx_input.script_sig.is_empty())
-                            .then_some(tx_input.script_sig);
+                        psbt_input.final_script_sig =
+                            (!tx_input.script_sig.is_empty()).then_some(tx_input.script_sig);
                         psbt_input.final_script_witness =
                             (!tx_input.witness.is_empty()).then_some(tx_input.witness);
                     }
@@ -2406,7 +2364,7 @@ impl MultisigWallet {
                     for asset_id in info_contents.transfers.keys() {
                         let consignment_path = self
                             .get_asset_transfer_dir(&transfer_dir, asset_id)
-                            .join(CONSIGNMENT_FILE);
+                            .join(CONSIGNMENT_FILE.as_str());
                         files.push((FileType::Consignment, FileSource::Path(consignment_path)));
                     }
                 }

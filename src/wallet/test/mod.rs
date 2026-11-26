@@ -29,6 +29,8 @@ use once_cell::sync::Lazy;
 use regex::RegexSet;
 #[cfg(feature = "electrum")]
 use rgbstd::stl::{EmbeddedMedia as RgbEmbeddedMedia, ProofOfReserves as RgbProofOfReserves};
+#[cfg(feature = "_online")]
+use rgbstd::{Assign, RevealedValue, TypedAssigns};
 use serde_json::Value;
 use serial_test::parallel;
 #[cfg(feature = "_online")]
@@ -44,24 +46,29 @@ use crate::encryption::ENC_VERSION;
 use crate::keys::Keys;
 #[cfg(all(feature = "electrum", feature = "rgb_fs_store_migration"))]
 use crate::keys::restore_keys;
-#[cfg(all(feature = "electrum", feature = "rgb_fs_store_migration"))]
-use crate::utils::{RGB_RUNTIME_DELETING_DIR, RGB_RUNTIME_DIR};
 #[cfg(feature = "_online")]
 use crate::wallet::online::*;
 #[cfg(feature = "electrum")]
 use crate::wallet::rust_only::check_proxy_url;
-#[cfg(feature = "_online")]
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 use crate::wallet::utils::build_indexer;
+#[cfg(all(feature = "electrum", feature = "rgb_fs_store_migration"))]
+use crate::wallet::utils::{RGB_RUNTIME_DELETING_DIR, RGB_RUNTIME_DIR};
 #[cfg(feature = "electrum")]
 use crate::{
     database::enums::{SCHEMA_ID_CFA, SCHEMA_ID_IFA, SCHEMA_ID_NIA, SCHEMA_ID_UDA},
-    no_wallet::{BundleFilter, RgbMediaInfo, inspect_consignment},
-    utils::{get_account_data, recipient_id_from_script_buf, script_buf_from_recipient_id},
+    no_wallet::{
+        BundleFilter, ResolveRejectList, RgbBridgeLocationInfo, RgbEvmContractInfo, RgbMediaInfo,
+        RgbRejectListInfo, fill_spv_proofs, inspect_consignment, inspect_fascia,
+        validate_consignment, validate_consignment_with_resolver,
+        validation::RemoteRejectListResolver,
+    },
+    wallet::utils::{get_account_data, recipient_id_from_script_buf, script_buf_from_recipient_id},
     wallet::{multisig::*, rust_only::*},
 };
 use crate::{
     keys::generate_keys,
-    utils::{
+    wallet::utils::{
         KEYCHAIN_BTC, KEYCHAIN_RGB, get_account_derivation_children, get_coin_type,
         get_extended_derivation_path,
     },
@@ -71,12 +78,45 @@ use crate::{
 const PROXY_HOST: &str = "127.0.0.1:3000/json-rpc";
 static PROXY_ENDPOINT: Lazy<String> = Lazy::new(|| format!("rpc://{PROXY_HOST}"));
 #[cfg(feature = "_online")]
+const EVM_RPC_URL: &str = "http://127.0.0.1:8545";
+/// EIP-155 chain ID of the anvil node (its default one, see tests/compose.yaml)
+#[cfg(feature = "_online")]
+const ANVIL_CHAIN_ID: u64 = 31337;
+/// Blocks to mine on anvil for the latest block to become finalized: two epochs of its default
+/// 32 slots
+#[cfg(feature = "electrum")]
+const EVM_FINALITY_DEPTH: u64 = 64;
+/// Blocks a mint leaves for its lock by default, after the latest one when it begins: more than any
+/// test mines
+#[cfg(feature = "electrum")]
+const MINT_LOCK_BLOCKS: u64 = 100_000;
+/// Blocks a mint the test lets expire leaves for its lock, counted from the latest block when the
+/// mint begins. It has to be high enough to pass the MIN_MINT_LOCK_BLOCKS check of mint_begin,
+/// with some margin because anvil mines a block every 2 seconds, and low enough for the test to
+/// mine past it quickly
+#[cfg(feature = "electrum")]
+const SHORT_MINT_LOCK_BLOCKS: u64 = 20;
+/// Maximum number of blocks a mint can leave for its lock (see EvmChain::max_mint_lock_blocks) in
+/// test wallets: well above MINT_LOCK_BLOCKS
+#[cfg(feature = "_online")]
+const MAX_MINT_LOCK_BLOCKS: u64 = 1_000_000;
+/// Minimum number of blocks a mint has to leave for its lock (see EvmChain::min_mint_lock_blocks)
+/// in test wallets: the least possible, as tests let mints expire
+#[cfg(feature = "_online")]
+const MIN_MINT_LOCK_BLOCKS: u64 = 2;
+#[cfg(feature = "_online")]
 const TEST_DATA_DIR_PARTS: [&str; 2] = ["tests", "tmp_srv"];
 const NOSRV_DATA_DIR_PARTS: [&str; 2] = ["tests", "tmp_nosrv"];
 const PASSWORD: &str = "password";
 #[cfg(feature = "electrum")]
 const RESTORE_DIR_PARTS: [&str; 3] = ["tests", "tmp_srv", "restored"];
 const MAX_ALLOCATIONS_PER_UTXO: u32 = 5;
+/// Maximum number of bundles of the inspected fascias, more than any test operation commits
+#[cfg(feature = "electrum")]
+const MAX_FASCIA_BUNDLES: u32 = 10;
+/// Maximum size of the inspected fascia files, larger than any test operation saves
+#[cfg(feature = "electrum")]
+const MAX_FASCIA_SIZE: u64 = 1024 * 1024;
 
 #[cfg(feature = "electrum")]
 const PROXY_HOST_MOD_API: &str = "127.0.0.1:3002/json-rpc";
@@ -118,7 +158,7 @@ const ELECTRUM_2_URL: &str = "127.0.0.1:50002";
 const ELECTRUM_BLOCKSTREAM_URL: &str = "127.0.0.1:50003";
 #[cfg(feature = "electrum")]
 const ELECTRUM_SIGNET_CUSTOM_URL: &str = "127.0.0.1:50005";
-#[cfg(feature = "_online")]
+#[cfg(any(feature = "electrum", feature = "esplora"))]
 const ESPLORA_URL: &str = "http://127.0.0.1:8094/regtest/api";
 #[cfg(feature = "electrum")]
 const MULTISIG_HUB_URL: &str = "http://127.0.0.1:8141";
@@ -128,6 +168,8 @@ const LISTS_DIR_PARTS: [&str; 2] = ["tests", "lists"];
 const HUB_DIR_PARTS: [&str; 2] = ["tests", "hub"];
 #[cfg(feature = "_online")]
 const TICKER: &str = "TICKER";
+#[cfg(feature = "electrum")]
+const UNICODE_TICKER: &str = "₿TC";
 #[cfg(feature = "_online")]
 const NAME: &str = "asset name";
 #[cfg(feature = "electrum")]
@@ -165,6 +207,10 @@ const FAKE_TXID: &str = "e5a3e577309df31bd606f48049049d2e1e02b048206ba232944fcc0
 #[cfg(feature = "electrum")]
 const FAKE_OUTPOINT: &str = "e5a3e577309df31bd606f48049049d2e1e02b048206ba232944fcc053a176ccb:0";
 #[cfg(feature = "electrum")]
+const FAKE_EVM_ADDRESS: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+#[cfg(feature = "electrum")]
+const FAKE_PUBKEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+#[cfg(feature = "electrum")]
 const FAKE_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const UNKNOWN_IDX: i32 = 9999;
 #[cfg(feature = "electrum")]
@@ -184,7 +230,7 @@ pub(crate) const FAILED_WITNESS_RECEIVE_GRACE_SECS: u32 = 604800;
 const DEFAULT_INDEXER_URL: &str = ESPLORA_URL;
 #[cfg(all(
     feature = "bitcoind",
-    not(feature = "_online")
+    not(any(feature = "electrum", feature = "esplora"))
 ))]
 const DEFAULT_INDEXER_URL: &str = BITCOIND_URL;
 #[cfg(feature = "electrum")]
@@ -196,7 +242,7 @@ const INVALID_INDEXER_MSG: &str = "not a valid electrum server";
 const INVALID_INDEXER_MSG: &str = "not a valid esplora server";
 #[cfg(all(
     feature = "bitcoind",
-    not(feature = "_online")
+    not(any(feature = "electrum", feature = "esplora"))
 ))]
 const INVALID_INDEXER_MSG: &str = "cannot connect to bitcoind";
 
@@ -207,6 +253,7 @@ thread_local! {
     pub(crate) static MOCK_CHAIN_NET: RefCell<Option<ChainNet>> = const { RefCell::new(None) };
     pub(crate) static MOCK_CONTRACT_DATA: RefCell<Vec<Attachment>> = const { RefCell::new(vec![]) };
     pub(crate) static MOCK_CONTRACT_DETAILS: RefCell<Option<String>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_IFA_LINK_RIGHT: RefCell<Option<BuilderSeal<BlindSeal<RgbTxid>>>> = const { RefCell::new(None) };
     pub(crate) static MOCK_TOKEN_DATA: RefCell<Vec<TokenData>> = const { RefCell::new(vec![]) };
 }
 
@@ -219,10 +266,19 @@ thread_local! {
     pub(crate) static MOCK_CHAIN_TXS: RefCell<HashMap<String, (BdkTransaction, u32)>> = RefCell::new(HashMap::new());
     pub(crate) static MOCK_LOCAL_VERSION: RefCell<Option<String>> = const { RefCell::new(None) };
     pub(crate) static MOCK_SEND_END_CRASH: RefCell<Option<()>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_SPAM_RECIPIENT_ASSIGNMENTS: RefCell<Option<(u16, u64)>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_SPAM_HIDDEN_SPENDS: RefCell<Option<()>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_HUB_ACCEPT_PENDING: RefCell<Option<()>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_ACCEPT_MULTIPLE_ALLOCATIONS: RefCell<bool> = const { RefCell::new(false) };
+    pub(crate) static MOCK_MAX_UTXO_ASSET_ALLOCATIONS: RefCell<Option<usize>> = const { RefCell::new(None) };
     pub(crate) static MOCK_CLOCK_SKEW_MARGIN: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_RETENTION_GRACE: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_MIN_RETENTION_GRACE: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_CONFIRMATION_MARGIN: RefCell<Option<u32>> = const { RefCell::new(None) };
+    pub(crate) static RECEIVED_CONSIGNMENT_VALIDATIONS: RefCell<usize> = const { RefCell::new(0) };
+    pub(crate) static MOCK_MINT_KEPT_AMOUNT: RefCell<Option<u64>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_GET_CONSIGNMENT_FAILURES: RefCell<u32> = const { RefCell::new(0) };
+    pub(crate) static MOCK_TRANSFER_DELETE_FAILURES: RefCell<u32> = const { RefCell::new(0) };
 }
 
 #[cfg(feature = "_online")]
@@ -368,6 +424,11 @@ macro_rules! get_funded_party {
     };
 }
 
+/// Seal the genesis of the next IFA asset issued assigns a link right to, if set.
+pub fn mock_ifa_link_right() -> Option<BuilderSeal<BlindSeal<RgbTxid>>> {
+    MOCK_IFA_LINK_RIGHT.take()
+}
+
 pub fn mock_asset_terms<W: WalletOffline + ?Sized>(
     wallet: &W,
     text: RicardianContract,
@@ -503,6 +564,131 @@ pub fn mock_confirmation_margin() -> Option<u32> {
     MOCK_CONFIRMATION_MARGIN.with_borrow(|m| *m)
 }
 
+// simulate a sender spamming the recipient with allocations: add the requested number of
+// assignments of the given amount to the (blinded) recipient seal of a transition, taking their
+// total from the recipient assignment, so the recipient receives that many allocations plus one
+// (the transition is changed once complete, as its builder refuses to assign twice to a seal)
+#[cfg(feature = "_online")]
+pub fn mock_spam_recipient_assignments(mut transition: Transition) -> Transition {
+    let Some((num, amount)) = MOCK_SPAM_RECIPIENT_ASSIGNMENTS.take() else {
+        return transition;
+    };
+    println!("mocking {num} additional recipient assignments of amount {amount}");
+    let Some(TypedAssigns::Fungible(assignments)) = transition.assignments.get_mut(&OS_ASSET)
+    else {
+        panic!("transition has no fungible assignments");
+    };
+    let (idx, seal, recipient_amount) = assignments
+        .iter()
+        .enumerate()
+        .find_map(|(i, a)| match a.seal {
+            BuilderSeal::Concealed(seal) => Some((i, seal, a.state.as_u64())),
+            BuilderSeal::Revealed(_) => None,
+        })
+        .unwrap();
+    let spam_total = (num as u64)
+        .checked_mul(amount)
+        .expect("spam total overflows u64");
+    assert!(recipient_amount > spam_total);
+    assignments.get_mut(idx).unwrap().state = RevealedValue::new(recipient_amount - spam_total);
+    for _ in 0..num {
+        assignments
+            .push(Assign {
+                seal: BuilderSeal::Concealed(seal),
+                state: RevealedValue::new(amount),
+            })
+            .unwrap();
+    }
+    transition
+}
+
+// simulate a sender hiding the allocations it spams the recipient with (see
+// `mock_spam_recipient_assignments`) by listing them as spent in the bundle input map, by a
+// transition the consignment doesn't carry: add an input map entry to the PSBT for each recipient
+// assignment of the transition but the first one
+#[cfg(feature = "_online")]
+pub fn mock_spam_hidden_spends(psbt: &mut Psbt, transition: &Transition) {
+    if MOCK_SPAM_HIDDEN_SPENDS.take().is_none() {
+        return;
+    }
+    let Some(TypedAssigns::Fungible(assignments)) = transition.assignments.get(&OS_ASSET) else {
+        panic!("transition has no fungible assignments");
+    };
+    let opid = transition.id();
+    let hidden: Vec<u16> = assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| matches!(a.seal, BuilderSeal::Concealed(_)))
+        .skip(1)
+        .map(|(no, _)| no as u16)
+        .collect();
+    println!("mocking {} hidden recipient assignments", hidden.len());
+    for no in hidden {
+        psbt.set_rgb_contract_consumer(
+            transition.contract_id,
+            Opout::new(opid, OS_ASSET, no),
+            OpId::from([0xaa; 32]),
+        )
+        .unwrap();
+    }
+}
+
+// whether to accept consignments paying an invoice more than one allocation, as the tests filling
+// UTXOs with allocations (see `mock_spam_recipient_assignments`) need; unlike the mocks taken by
+// their first use, it stays set for the whole test, as filling UTXOs takes several receives
+#[cfg(feature = "_online")]
+pub fn accept_multiple_allocations() -> bool {
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.with_borrow(|a| *a)
+}
+
+/// Maximum number of allocations of an asset a UTXO can hold to use instead of
+/// `MAX_UTXO_ASSET_ALLOCATIONS`, if set.
+#[cfg(feature = "_online")]
+pub fn mock_max_utxo_asset_allocations() -> Option<usize> {
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.with_borrow(|m| *m)
+}
+
+// simulate a multisig hub where the cosigners haven't decided on a received transfer yet, as a
+// watch-only wallet sees it: the transfer isn't ACKed and keeps waiting for the counterparty
+#[cfg(feature = "_online")]
+pub fn mock_hub_accept_pending() -> bool {
+    MOCK_HUB_ACCEPT_PENDING.take().is_some()
+}
+
+// simulate a minter keeping part of a mint: the amount to also mint to an output of the mint TX,
+// besides what the recipient receives
+#[cfg(feature = "_online")]
+pub fn mock_mint_kept_amount() -> Option<u64> {
+    MOCK_MINT_KEPT_AMOUNT.take()
+}
+
+// count the received consignments validated, for tests checking a retry doesn't validate again
+#[cfg(feature = "_online")]
+pub fn count_received_consignment_validation() {
+    RECEIVED_CONSIGNMENT_VALIDATIONS.with_borrow_mut(|n| *n += 1);
+}
+
+// simulate a recipient proxy failing to serve the consignment of a discovered transfer, for the
+// number of times set
+#[cfg(feature = "_online")]
+pub fn mock_get_consignment_fail() -> bool {
+    MOCK_GET_CONSIGNMENT_FAILURES.with_borrow_mut(|n| {
+        let fail = *n > 0;
+        *n = n.saturating_sub(1);
+        fail
+    })
+}
+
+// simulate a recipient proxy failing to delete a transfer, for the number of times set
+#[cfg(feature = "_online")]
+pub fn mock_transfer_delete_fail() -> bool {
+    MOCK_TRANSFER_DELETE_FAILURES.with_borrow_mut(|n| {
+        let fail = *n > 0;
+        *n = n.saturating_sub(1);
+        fail
+    })
+}
+
 #[cfg(feature = "_online")]
 pub fn mock_send_end_crash() -> bool {
     if MOCK_SEND_END_CRASH.take().is_none() {
@@ -516,6 +702,8 @@ pub fn mock_send_end_crash() -> bool {
 // test utilities
 #[macro_use]
 mod utils;
+#[cfg(feature = "electrum")]
+pub(crate) use utils::anvil::*;
 #[cfg(feature = "_online")]
 pub(crate) use utils::chain::*;
 pub(crate) use utils::{api::*, helpers::*};
@@ -524,7 +712,6 @@ pub(crate) use utils::{api::*, helpers::*};
 #[cfg(feature = "electrum")]
 mod abort_pending_vanilla_tx;
 #[cfg(feature = "electrum")]
-mod address_reuse;
 mod backup;
 mod blind_receive;
 #[cfg(feature = "electrum")]
@@ -538,7 +725,11 @@ mod delete_transfers;
 #[cfg(feature = "electrum")]
 mod drain_to;
 #[cfg(feature = "electrum")]
+mod export_contract;
+#[cfg(feature = "electrum")]
 mod fail_transfers;
+#[cfg(feature = "electrum")]
+mod fill_spv_proofs;
 #[cfg(feature = "electrum")]
 mod finalize_psbt;
 mod get_address;
@@ -556,11 +747,17 @@ mod go_online;
 #[cfg(feature = "electrum")]
 mod htlc_swap_tree;
 #[cfg(feature = "electrum")]
+mod import_contract;
+#[cfg(feature = "electrum")]
 mod inflate;
 #[cfg(feature = "electrum")]
 mod inspect_consignment;
 #[cfg(feature = "electrum")]
-mod inspect_rgb_transfer;
+mod inspect_fascia;
+#[cfg(feature = "electrum")]
+mod invoice_reuse;
+#[cfg(feature = "electrum")]
+mod issue_asset_bfa;
 #[cfg(feature = "electrum")]
 mod issue_asset_cfa;
 #[cfg(feature = "electrum")]
@@ -570,7 +767,7 @@ mod issue_asset_nia;
 #[cfg(feature = "electrum")]
 mod issue_asset_uda;
 #[cfg(feature = "electrum")]
-mod link_ifa;
+mod link;
 #[cfg(feature = "electrum")]
 mod list_assets;
 #[cfg(feature = "electrum")]
@@ -583,6 +780,7 @@ mod list_unspents;
 mod load;
 #[cfg(all(feature = "electrum", feature = "rgb_fs_store_migration"))]
 mod migrate;
+mod mint;
 #[cfg(feature = "electrum")]
 mod multisig;
 mod new;
@@ -599,6 +797,8 @@ mod send_btc;
 mod sign_psbt;
 #[cfg(feature = "electrum")]
 mod sync;
+#[cfg(feature = "electrum")]
+mod validate_consignment;
 mod witness_receive;
 
 #[cfg(feature = "electrum")]

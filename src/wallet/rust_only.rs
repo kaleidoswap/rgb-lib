@@ -11,12 +11,10 @@
 //! `consume_transfer_fascia` and the unchecked fetch/accept halves stay Rust-only.
 
 use super::*;
-#[cfg(feature = "_online")]
 use amplify::num::u5;
 use bdk_wallet::bitcoin::psbt::Output as PsbtOutput;
 #[cfg(feature = "_online")]
 use rgbstd::AssignmentType;
-use rgbstd::Operation as _;
 use rgbstd::TransitionBundle;
 use rgbstd::rgbcore::commit_verify::mpc::{self, MPC_MINIMAL_DEPTH};
 #[cfg(feature = "_online")]
@@ -49,7 +47,9 @@ const PSBT_OP_COLORED_PSBT_FILE: &str = "colored.psbt";
 #[cfg(feature = "_online")]
 const PSBT_OP_CONSIGNMENTS_DIR: &str = "consignments";
 #[cfg(feature = "_online")]
-const PSBT_OP_CONSIGNMENT_FILE: &str = CONSIGNMENT_FILE;
+// the legacy name, kept so the payload dirs of operations prepared before the consignment files
+// got the `.rgb` extension stay readable
+const PSBT_OP_CONSIGNMENT_FILE: &str = "consignment_out";
 /// Marker left in the transfer dir once a prepared fascia has been consumed into the RGB stash,
 /// until the related SQL update is committed.
 #[cfg(feature = "_online")]
@@ -312,7 +312,6 @@ pub struct AcceptedTransfer {
     /// The pinned witness output.
     pub outpoint: Outpoint,
 }
-
 
 /// What `fascia`'s transitions assign. Every owned-state type the wallet's schemas define is
 /// reported; any other is an error rather than left out.
@@ -878,9 +877,13 @@ impl Wallet {
                         });
                     }
                     if let AllocatedState::Amount(amt) = &state {
+                        // a transition can't spend more than u64::MAX of an asset, which BFA
+                        // assets (with no supply limit) can exceed
                         asset_available_amt = asset_available_amt
                             .checked_add(amt.as_u64())
-                            .expect("total available asset amount cannot exceed u64::MAX");
+                            .ok_or_else(|| Error::InvalidColoringInfo {
+                                details: s!("total asset amount in inputs exceeds u64::MAX"),
+                            })?;
                     } else if let AllocatedState::Data(_) = &state {
                         asset_available_amt = 1;
                         // there can be only a single state when contract is UDA
@@ -932,7 +935,7 @@ impl Wallet {
 
             for (seal, amount) in output_seals {
                 match schema {
-                    AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa => {
+                    AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa | AssetSchema::Bfa => {
                         asset_transition_builder = asset_transition_builder.add_fungible_state(
                             assignment_name.clone(),
                             seal,
@@ -963,11 +966,8 @@ impl Wallet {
             asset_beneficiaries.insert(contract_id, beneficiaries);
         }
 
-        for (contract_id, transition) in all_transitions {
-            for opout in transition.inputs() {
-                psbt.set_rgb_contract_consumer(contract_id, opout, transition.id())
-                    .map_err(InternalError::from)?;
-            }
+        // pushing a transition also sets it as the consumer of all of its inputs
+        for transition in all_transitions.into_values() {
             psbt.push_rgb_transition(transition)
                 .map_err(InternalError::from)?;
         }
@@ -1155,20 +1155,25 @@ impl Wallet {
             ));
         }
         let witness_id = fascia.witness_id();
-        let consignment = runtime.transfer_from_fascia(
-            contract_id,
-            vec![ExplicitSeal::with(witness_id, payment_vout)],
-            Vec::new(),
-            [],
-            &fascia,
-            None,
-        )?
-        .0;
-        let (_, fallback) = get_indexer_and_resolver(&indexer_config_from_url(indexer_url)?, self.bitcoin_network())?;
-        let resolver = crate::utils::OffchainResolver {
-            witness_id,
+        let consignment = runtime
+            .transfer_from_fascia(
+                contract_id,
+                vec![ExplicitSeal::with(witness_id, payment_vout)],
+                Vec::new(),
+                [],
+                &fascia,
+                None,
+            )?
+            .0;
+        let (_, fallback) = get_indexer_and_resolver(
+            &indexer_config_from_url(indexer_url)?,
+            self.bitcoin_network(),
+        )?;
+        let chain_resolver = ChainResolver { inner: &fallback };
+        let resolver = OffchainResolver {
+            witness_id: Some(witness_id),
             consignment: &consignment,
-            fallback: ChainResolver { inner: &fallback },
+            fallback: &chain_resolver,
         };
         let schema: AssetSchema = consignment.schema_id().try_into()?;
         let config = ValidationConfig {
@@ -1247,14 +1252,18 @@ impl Wallet {
         Ok(transfers)
     }
 
-    /// Create consignments for a PSBT created with the [`send_begin`](Wallet::send_begin) method.
+    /// Create consignments for a PSBT created with the
+    #[cfg_attr(
+        feature = "_online",
+        doc = "[`send_begin`](Wallet::send_begin) method."
+    )]
+    #[cfg_attr(not(feature = "_online"), doc = "`send_begin` method.")]
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     pub fn create_consignments(&self, psbt: String) -> Result<(), Error> {
         self.create_consignments_impl(psbt).map(|_| ())
     }
-
 
     fn create_consignments_impl(&self, psbt: String) -> Result<Vec<String>, Error> {
         info!(self.logger(), "Creating consignments...");
@@ -1346,7 +1355,11 @@ impl Wallet {
             ..Default::default()
         };
         let valid_contract = contract
-            .validate(&asset_schema.schema_rules(), &DumbResolver, &validation_config)
+            .validate(
+                &asset_schema.schema_rules(),
+                &DumbResolver,
+                &validation_config,
+            )
             .map_err(|_| Error::InvalidConsignment)?;
 
         // the stock and the wallet tables share one transaction: they commit together
@@ -1381,14 +1394,7 @@ impl Wallet {
         }
 
         if !asset_in_database {
-            self.save_new_asset_internal(
-                &txn,
-                &runtime,
-                contract_id,
-                asset_schema,
-                valid_contract,
-                None,
-            )?;
+            self.save_new_asset_internal(&txn, &mut runtime, asset_schema, valid_contract, None)?;
         }
         self.update_backup_info(&txn, false)?;
         drop(runtime);
@@ -1403,6 +1409,11 @@ impl Wallet {
     }
 
     /// Accept an RGB transfer using a consignment received out-of-band.
+    ///
+    /// The consignment is validated as a received one is when refreshing, its claims (mint locks)
+    /// required to be confirmed already, and the assignments it pays to the given vout of the TX
+    /// with the given ID are checked against the reject list of the asset (if any): an
+    /// [`Error::ConsignmentRejected`] is returned if any of them is rejected.
     ///
     /// Returns the consignment, the received assignments and the hex-encoded digests of the media
     /// attachments defined in the consignment.
@@ -1561,7 +1572,7 @@ impl Wallet {
         Ok(())
     }
 
-    /// Extract the metadata of a new RGB asset and save the asset into the DB.
+    /// Import a new RGB contract into the RGB stock, extract its metadata and save it into the DB.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
@@ -1576,41 +1587,22 @@ impl Wallet {
         self.check_online(online)?;
         let contract_id = consignment.contract_id();
         let witness_id = RgbTxid::from_str(&offchain_txid).map_err(|_| Error::InvalidTxid)?;
-        let resolver = OffchainResolver {
-            witness_id,
-            consignment: &consignment,
-            fallback: self.blockchain_resolver(),
-        };
         let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
             ..Default::default()
         };
-        let valid_transfer = match consignment.clone().validate(
-            &asset_schema.schema_rules(),
-            &resolver,
+        let valid_transfer = validate_consignment_internal(
+            &consignment,
+            Some(witness_id),
+            &self.blockchain_resolver(),
+            ClaimResolution::Evm(self.evm_rpc_urls()),
             &validation_config,
-        ) {
-            Ok(consignment) => consignment,
-            Err(ValidationError::InvalidConsignment(error)) => {
-                error!(self.logger(), "Consignment is invalid: {}", error);
-                return Err(Error::InvalidConsignment);
-            }
-            Err(ValidationError::ResolverError(error)) => {
-                return Err(Error::Network {
-                    details: error.to_string(),
-                });
-            }
-            Err(e) => {
-                return Err(Error::Internal {
-                    details: format!("unexpected consignment validation error: {e}"),
-                });
-            }
-        };
+        )?;
         let valid_contract = valid_transfer.clone().into_valid_contract();
 
         let txn = self.database().begin_transaction()?;
-        let runtime = self.rgb_stock(&txn)?;
+        let mut runtime = self.rgb_stock(&txn)?;
         if txn.get_asset(contract_id.to_string())?.is_some() {
             // Metadata registration is idempotent only when the RGB stock agrees with the database.
             // A missing stock entry means the caller has not completed transfer acceptance.
@@ -1622,8 +1614,7 @@ impl Wallet {
         }
         self.save_new_asset_internal(
             &txn,
-            &runtime,
-            contract_id,
+            &mut runtime,
             asset_schema,
             valid_contract,
             Some(valid_transfer),
@@ -1715,7 +1706,7 @@ impl Wallet {
                 &txn.iter_tokens()?,
                 &txn.iter_token_medias()?,
             ),
-            AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa => None,
+            AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa | AssetSchema::Bfa => None,
         };
         let medias = self.get_asset_medias(&txn, asset.media_idx, token)?;
         txn.commit()?;
@@ -2161,15 +2152,18 @@ impl Wallet {
                     }
                 };
             }
-            transfers.push(runtime.transfer_from_fascia(
-                *contract_id,
-                beneficiaries_witness,
-                beneficiaries_blinded,
-                [],
-                &fascia,
-                None,
-            )?
-            .0);
+            transfers.push(
+                runtime
+                    .transfer_from_fascia(
+                        *contract_id,
+                        beneficiaries_witness,
+                        beneficiaries_blinded,
+                        [],
+                        &fascia,
+                        None,
+                    )?
+                    .0,
+            );
         }
 
         let txid = psbt.unsigned_tx.compute_txid().to_string();
@@ -2405,7 +2399,6 @@ impl Wallet {
                     recipient_id: ActiveValue::Set(Some(format!("color:{txid}"))),
                     recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness {
                         vout: None,
-                        recipient_nonce: vec![],
                     })),
                     ..Default::default()
                 })?;
@@ -2418,7 +2411,6 @@ impl Wallet {
                         recipient_id: ActiveValue::Set(Some(recipient_id)),
                         recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness {
                             vout: Some(vout),
-                            recipient_nonce: vec![],
                         })),
                         ..Default::default()
                     })?;
@@ -2437,7 +2429,9 @@ impl Wallet {
     fn assignment_for_coloring_output(asset_schema: AssetSchema, amount: u64) -> Assignment {
         match asset_schema {
             AssetSchema::Uda => Assignment::NonFungible,
-            AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa => Assignment::Fungible(amount),
+            AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa | AssetSchema::Bfa => {
+                Assignment::Fungible(amount)
+            }
         }
     }
 
@@ -3030,15 +3024,18 @@ impl Wallet {
                     }
                 };
             }
-            transfers.push(runtime.transfer_from_fascia(
-                *contract_id,
-                beneficiaries_witness,
-                beneficiaries_blinded,
-                [],
-                &fascia,
-                None,
-            )?
-            .0);
+            transfers.push(
+                runtime
+                    .transfer_from_fascia(
+                        *contract_id,
+                        beneficiaries_witness,
+                        beneficiaries_blinded,
+                        [],
+                        &fascia,
+                        None,
+                    )?
+                    .0,
+            );
         }
 
         let txid = psbt.unsigned_tx.compute_txid().to_string();
@@ -3704,7 +3701,6 @@ impl Wallet {
         Ok(meta.status)
     }
 
-
     /// Accept an HTLC consignment received from the counterparty, pinning its witness output.
     ///
     /// `consignment` is the base64-encoded transfer consignment, exchanged out of band (proxy
@@ -3855,41 +3851,36 @@ impl Wallet {
         let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
         runtime.store_secret_seal(graph_seal)?;
 
-        let resolver = OffchainResolver {
-            witness_id,
-            consignment: &consignment,
-            fallback: self.blockchain_resolver(),
-        };
-
+        // validated as a refresh validates a received consignment, its claims (mint locks)
+        // confirmed right away as there's no transfer to keep waiting for them
         debug!(self.logger(), "Validating consignment...");
-        let validation_config = ValidationConfig {
-            chain_net: self.chain_net(),
-            ..Default::default()
-        };
-        let valid_consignment = match consignment.clone().validate(&asset_schema.schema_rules(), &resolver, &validation_config) {
-            Ok(consignment) => consignment,
-            Err(ValidationError::InvalidConsignment(e)) => {
-                error!(self.logger(), "Consignment is invalid: {}", e);
-                return Err(Error::InvalidConsignment);
-            }
-            Err(ValidationError::ResolverError(e)) => {
-                warn!(self.logger(), "Network error during consignment validation");
-                return Err(Error::Network {
-                    details: e.to_string(),
-                });
-            }
-            Err(e) => {
-                return Err(Error::Internal {
-                    details: format!("unexpected consignment validation error: {e}"),
-                });
-            }
-        };
-        let validation_status = valid_consignment.validation_status();
-        debug!(
-            self.logger(),
-            "Consignment validity: {:?}",
-            validation_status.validity()
+        let validation_config = self.received_validation_config(asset_schema, None);
+        let pending = validate_with_claims(
+            &consignment,
+            ClaimResolution::Evm(self.evm_rpc_urls()),
+            &validation_config,
+        )
+        .map_err(|e| self.received_validation_error(e))?;
+        let received_rgb_assignments = self.extract_received_assignments(
+            &consignment,
+            witness_id,
+            PaymentSeal::WitnessVout(vout),
         );
+        // the paying witness TX may not have been broadcast yet, the others must be on-chain
+        let blockchain_resolver = self.blockchain_resolver();
+        let resolver = OffchainResolver {
+            witness_id: Some(witness_id),
+            consignment: &consignment,
+            fallback: &blockchain_resolver,
+        };
+        let valid_consignment = self.check_received_consignment(
+            pending,
+            &resolver,
+            asset_schema,
+            &received_rgb_assignments,
+            true,
+        )?;
+        let validation_status = valid_consignment.validation_status();
 
         // The send path parks such transfers in WaitingSafeHeight; this API accepts straight into
         // the stash and has no batch to park, so refuse instead of accepting a reorgable history.
@@ -3911,8 +3902,6 @@ impl Wallet {
             }
         }
 
-        let received_rgb_assignments =
-            self.extract_received_assignments(&consignment, witness_id, Some(vout), None);
         let mut received: Vec<Assignment> = received_rgb_assignments.into_values().collect();
         received.sort();
 
@@ -4193,7 +4182,8 @@ pub fn get_resolver(
     indexer_url: &str,
     bitcoin_network: BitcoinNetwork,
 ) -> Result<AnyResolver, Error> {
-    let (_, resolver) = get_indexer_and_resolver(&indexer_config_from_url(indexer_url)?, bitcoin_network)?;
+    let (_, resolver) =
+        get_indexer_and_resolver(&indexer_config_from_url(indexer_url)?, bitcoin_network)?;
     Ok(resolver)
 }
 
@@ -4239,7 +4229,10 @@ pub fn validate_consignment(
         ..Default::default()
     };
 
-    match consignment.clone().validate(&asset_schema.schema_rules(), &resolver, &validation_config) {
+    match consignment
+        .clone()
+        .validate(&asset_schema.schema_rules(), &resolver, &validation_config)
+    {
         Ok(valid_consignment) => {
             let status = valid_consignment.validation_status();
             Ok(ValidateConsignmentResult {
@@ -4304,12 +4297,13 @@ pub fn validate_consignment_offchain(
 
     let fallback_resolver = get_resolver(indexer_url, bitcoin_network)?;
 
-    let resolver = crate::utils::OffchainResolver {
-        witness_id,
+    let chain_resolver = ChainResolver {
+        inner: &fallback_resolver,
+    };
+    let resolver = OffchainResolver {
+        witness_id: Some(witness_id),
         consignment: &consignment,
-        fallback: ChainResolver {
-            inner: &fallback_resolver,
-        },
+        fallback: &chain_resolver,
     };
 
     let validation_config = ValidationConfig {
@@ -4317,7 +4311,10 @@ pub fn validate_consignment_offchain(
         ..Default::default()
     };
 
-    match consignment.clone().validate(&asset_schema.schema_rules(), &resolver, &validation_config) {
+    match consignment
+        .clone()
+        .validate(&asset_schema.schema_rules(), &resolver, &validation_config)
+    {
         Ok(valid_consignment) => {
             let status = valid_consignment.validation_status();
             Ok(ValidateConsignmentResult {

@@ -17,14 +17,20 @@ use super::offline::{
 use super::online::{
     SwapRgbSend, swap_accept_transfer_from_file, swap_color_rgb_leg, swap_emit_asset_history,
     swap_ensure_inputs_confirmed, swap_ensure_inputs_foreign, swap_ensure_inputs_unspent,
-    swap_write_consignment_to_file, swap_finalize_psbt, swap_finalize_psbt_required,
-    swap_import_asset_history, swap_input_rgb_amounts, swap_prepare_rgb_leg, swap_select_inputs,
-    swap_sign_psbt, swap_stage_rgb_leg, swap_validate_fascia_received_leg,
-    swap_validate_received_swap_leg, swap_validate_received_transfer,
+    swap_finalize_psbt, swap_finalize_psbt_required, swap_import_asset_history,
+    swap_input_rgb_amounts, swap_prepare_rgb_leg, swap_select_inputs, swap_sign_psbt,
+    swap_stage_rgb_leg, swap_validate_fascia_received_leg, swap_validate_received_swap_leg,
+    swap_validate_received_transfer, swap_write_consignment_to_file,
 };
 use super::*;
 #[cfg(feature = "_online")]
 use bdk_wallet::bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
+
+/// Max size, in bytes, of a contract consignment file accepted by
+/// [`import_contract`](Wallet::import_contract), so that a hostile one, which could be arbitrarily
+/// big, is refused before being loaded into memory and validated. The current schemas allow a
+/// genesis of about 8MB (IFA), so this covers them with room for bigger future ones.
+pub(crate) const MAX_CONTRACT_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Keys for the singlesig wallet.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -283,11 +289,16 @@ impl Wallet {
         };
 
         // setup RGB
-        setup_rgb(&database, wdata.supported_schemas, wdata.bitcoin_network)?;
+        setup_rgb(
+            &database,
+            wdata.supported_schemas,
+            wdata.bitcoin_network,
+            wdata.allow_reckless_schemas,
+            &logger,
+        )?;
 
         // persist the settings needed to load the wallet back
         WalletManifest::new(&wallet_data, &keys).write(&wallet_dir)?;
-        let reuse_address_index = database.begin_transaction()?.get_reuse_address_index()?;
 
         info!(logger, "New wallet completed");
         Ok(Self {
@@ -299,7 +310,6 @@ impl Wallet {
                 wallet_dir,
                 bdk_wallet,
                 bdk_pending: Arc::new(Mutex::new(ChangeSet::default())),
-                reuse_address_index,
                 #[cfg(feature = "_online")]
                 online_data: None,
                 #[cfg(feature = "vss")]
@@ -393,7 +403,12 @@ impl Wallet {
     /// List the pending vanilla transactions that have reserved TXOs in the wallet.
     ///
     /// A vanilla transaction becomes "pending" when the caller invokes a vanilla `_begin` method
-    /// (e.g. [`send_btc_begin`](Wallet::send_btc_begin)) with `dry_run = false`. The reserved
+    #[cfg_attr(
+        feature = "_online",
+        doc = "(e.g. [`send_btc_begin`](Wallet::send_btc_begin))"
+    )]
+    #[cfg_attr(not(feature = "_online"), doc = "(e.g. `send_btc_begin`)")]
+    /// with `dry_run = false`. The reserved
     /// TXOs are freed when the matching `_end` method is called or via
     /// [`abort_pending_vanilla_tx`](Wallet::abort_pending_vanilla_tx).
     pub fn list_pending_vanilla_txs(&self) -> Result<Vec<PendingVanillaTx>, Error> {
@@ -444,33 +459,95 @@ impl Wallet {
         Ok(())
     }
 
-    /// Rotate the pinned address for the given keychain.
+    /// Import the RGB contract (no bundles, as exported by
+    /// [`export_contract`](Wallet::export_contract)) at the provided `contract_path`, making it
+    /// known to the wallet, with no allocations.
     ///
-    /// Only meaningful when `reuse_addresses` is `true`. Increments the pinned derivation
-    /// index so subsequent address generation returns a fresh address.
-    pub fn rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
-        if !self.wallet_data().reuse_addresses {
-            return Err(Error::AddressReuseDisabled);
+    /// The consignment is validated and its contract must not be already known to the wallet. A
+    /// file that isn't a contract consignment is refused with [`Error::InvalidContract`], one
+    /// larger than 16MB with [`Error::FileTooLarge`].
+    ///
+    /// Media of the contract is taken from the files already present in the wallet media directory,
+    /// falling back to the provided `media_file_paths` (matched by content hash). A contract
+    /// defining media that is neither already present nor provided cannot be imported.
+    pub fn import_contract(
+        &self,
+        contract_path: String,
+        media_file_paths: Vec<String>,
+    ) -> Result<(), Error> {
+        info!(self.logger(), "Importing contract...");
+        let invalid_file_path = || Error::InvalidFilePath {
+            file_path: contract_path.clone(),
+        };
+        // the size is checked on the opened file, which is then read only up to the max size
+        let contract_file = fs::File::open(&contract_path).map_err(|_| invalid_file_path())?;
+        let contract_file_metadata = contract_file.metadata()?;
+        if !contract_file_metadata.is_file() {
+            return Err(invalid_file_path());
         }
-        let index = self
-            .internals()
-            .reuse_address_index
-            .get(&keychain)
-            .copied()
-            .unwrap_or(0);
-        let new_index = index.checked_add(1).ok_or_else(|| Error::Internal {
-            details: "address derivation index exhausted".to_string(),
+        if contract_file_metadata.len() > MAX_CONTRACT_SIZE {
+            return Err(Error::FileTooLarge {
+                file_path: contract_path,
+                max_size: MAX_CONTRACT_SIZE,
+            });
+        }
+        let contract = Contract::load(contract_file.take(MAX_CONTRACT_SIZE)).map_err(|_| {
+            Error::InvalidContract {
+                file_path: contract_path.clone(),
+            }
         })?;
+        let asset_id = contract.contract_id().to_string();
+        let asset_schema: AssetSchema = contract.schema_id().try_into()?;
+        self.check_schema_support(&asset_schema)?;
+
+        let check_unknown = |txn: &DbTxn| match txn.get_asset(asset_id.clone())? {
+            Some(_) => Err(Error::AssetAlreadyKnown {
+                asset_id: asset_id.clone(),
+            }),
+            None => Ok(()),
+        };
+        // checked before validating, which can be slow, in its own transaction so that the DB isn't
+        // blocked while validating
         let txn = self.database().begin_transaction()?;
-        txn.set_reuse_address_index(keychain, new_index)?;
-        self.update_backup_info(&txn, false)?;
-        self.persist_and_commit(txn)?;
-        self.internals_mut()
-            .reuse_address_index
-            .insert(keychain, new_index);
-        self.trigger_auto_backup();
-        let address = self.bdk_wallet().peek_address(keychain, new_index).address;
-        Ok(address.to_string())
+        check_unknown(&txn)?;
+        txn.commit()?;
+
+        // a contract has no witnesses nor claims
+        let validation_config = ValidationConfig {
+            chain_net: self.chain_net(),
+            ..Default::default()
+        };
+        let valid_contract = validate_consignment_internal(
+            &contract,
+            None,
+            &DumbResolver,
+            ClaimResolution::Resolver(None),
+            &validation_config,
+        )?;
+
+        let txn = self.database().begin_transaction()?;
+        // checked again, as the contract might have been imported while validating
+        check_unknown(&txn)?;
+        let mut stock = self.rgb_stock(&txn)?;
+        let attachments = self.extract_attachments(&stock, &valid_contract, asset_schema)?;
+        let Some(saved_media_paths) =
+            self.save_provided_attachments(attachments, &media_file_paths)?
+        else {
+            return Err(Error::InvalidAttachments {
+                details: s!("media defined by the contract was not provided"),
+            });
+        };
+        // the media saved above is removed if the contract then cannot be saved
+        let saved = self
+            .save_new_asset_internal(&txn, &mut stock, asset_schema, valid_contract, None)
+            .and_then(|_| self.update_backup_info(&txn, false))
+            .and_then(|_| txn.commit());
+        if let Err(e) = saved {
+            self.discard_media_files(&saved_media_paths);
+            return Err(e);
+        }
+        info!(self.logger(), "Import contract '{}' completed", asset_id);
+        Ok(())
     }
 
     fn finalize_offline_issuance<T: IssuedAssetDetails>(
@@ -588,8 +665,16 @@ impl Wallet {
     /// The `inflation_amounts` can be empty. If provided the sum of its elements plus the sum of
     /// `amounts` cannot exceed the maximum `u64` value.
     ///
-    /// `issuance_type` controls whether a link-right UTXO is created and whether the genesis
-    /// contract declares a parent contract.
+    /// If `link_right` is true, a link right is issued, on a separate UTXO, which can be spent
+    /// once to link to another contract (see
+    #[cfg_attr(feature = "_online", doc = "[`link`](Wallet::link)).")]
+    #[cfg_attr(not(feature = "_online"), doc = "`link`).")]
+    ///
+    /// The optional `linked_from_contract` is the ID of the contract this is linked from. The
+    /// wallet needs to know it, to check it can link to the contract being issued: its schema
+    /// needs to support links and it needs to be unlinked. Set `skip_contract_checks` to skip
+    /// these checks and link from a contract the wallet cannot check, e.g. one it doesn't know.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
         &self,
         ticker: String,
@@ -598,11 +683,11 @@ impl Wallet {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
-        issuance_type: Option<IfaIssuanceType>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
     ) -> Result<AssetIFA, Error> {
         info!(self.logger(), "Issuing IFA...");
-        let (create_link_right, linked_from_contract_id) =
-            issuance_type.unwrap_or_default().into_ifa_link_data()?;
         let txn = self.database().begin_transaction()?;
         let issue_data = self.create_ifa_contract(
             &txn,
@@ -612,14 +697,84 @@ impl Wallet {
             amounts,
             inflation_amounts,
             reject_list_url,
-            linked_from_contract_id,
-            create_link_right,
+            link_right,
+            linked_from_contract,
+            skip_contract_checks,
         )?;
         let res = self.finalize_offline_issuance(&txn, &issue_data)?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
         self.trigger_auto_backup();
         info!(self.logger(), "Issue asset IFA completed");
+        Ok(res)
+    }
+
+    /// Issue a new RGB BFA asset with the provided `ticker`, `name` and `precision`, bridging the
+    /// asset from the bridge contract at the provided `contract_address` on the EVM chain with
+    /// the provided EIP-155 `chain_id`, then return it.
+    ///
+    /// The initial supply is zero: assets enter circulation via mint operations (see
+    #[cfg_attr(feature = "_online", doc = "[`mint_begin`](Wallet::mint_begin)),")]
+    #[cfg_attr(not(feature = "_online"), doc = "`mint_begin`),")]
+    /// backed by tokens locked on the bridge contract.
+    ///
+    /// The bridge location (chain ID and contract address) is committed in the asset's genesis
+    /// and cannot be changed afterwards: mint operations and their validation use the EVM RPC
+    /// endpoint configured for that chain (see
+    #[cfg_attr(feature = "_online", doc = "[`OnlineOptions::evm_chains`]),")]
+    #[cfg_attr(not(feature = "_online"), doc = "`OnlineOptions::evm_chains`),")]
+    /// checking it is
+    /// actually on it.
+    ///
+    /// If a `reject_list_address` is provided, the asset commits to the reject list kept by the
+    /// `IRgbRejectList` contract at that address, on the same chain as the bridge. Transfers
+    /// are then checked against it, which needs the same EVM RPC endpoint.
+    ///
+    /// At least 1 mint right needs to be requested via `mint_rights`. Each one will be issued
+    /// as a separate allocation (on a separate UTXO that needs to be already available).
+    ///
+    /// If `link_right` is true, a link right is issued, on a separate UTXO, which can be spent
+    /// once to link to another contract (see
+    #[cfg_attr(feature = "_online", doc = "[`link`](Wallet::link)).")]
+    #[cfg_attr(not(feature = "_online"), doc = "`link`).")]
+    ///
+    /// The optional `linked_from_contract` is the ID of the contract this is linked from. The
+    /// wallet needs to know it, to check it can link to the contract being issued: its schema
+    /// needs to support links and it needs to be unlinked. Set `skip_contract_checks` to skip
+    /// these checks and link from a contract the wallet cannot check, e.g. one it doesn't know.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_asset_bfa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        mint_rights: u8,
+        chain_id: u64,
+        contract_address: String,
+        reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
+    ) -> Result<AssetBFA, Error> {
+        info!(self.logger(), "Issuing BFA...");
+        let txn = self.database().begin_transaction()?;
+        let issue_data = self.create_bfa_contract(
+            &txn,
+            ticker,
+            name,
+            precision,
+            mint_rights,
+            chain_id,
+            contract_address,
+            reject_list_address,
+            link_right,
+            linked_from_contract,
+            skip_contract_checks,
+        )?;
+        let res = self.finalize_offline_issuance(&txn, &issue_data)?;
+        self.update_backup_info(&txn, false)?;
+        txn.commit()?;
+        info!(self.logger(), "Issue asset BFA completed");
         Ok(res)
     }
 
@@ -630,6 +785,11 @@ impl Wallet {
     ///
     /// An optional amount can be specified, which will be embedded in the invoice. It will not be
     /// checked when accepting the transfer.
+    ///
+    /// A UTXO holds at most one mint right of an asset: an invoice requesting one
+    /// ([`Assignment::MintRight`]) blinds a UTXO that doesn't hold one and isn't due to receive
+    /// one, and a transfer paying a mint right to a UTXO holding one (e.g. through an invoice
+    /// requesting [`Assignment::Any`]) is refused.
     ///
     /// An expiration UTC timestamp must be specified, which will set the expiration of the
     /// invoice and the transfer. An expiration more than [`MAX_EXPIRATION_SECS`] in the future is
@@ -646,13 +806,32 @@ impl Wallet {
     /// `rpcs://example.com`).
     /// Providing an empty list selects the out-of-band exchange: the invoice carries no transport
     /// endpoints and the consignment and ACK are exchanged out-of-band (see
-    /// [`provide_out_of_band_consignment`](Wallet::provide_out_of_band_consignment) and
-    /// [`provide_out_of_band_ack`](Wallet::provide_out_of_band_ack)), without using automated
+    #[cfg_attr(
+        feature = "_online",
+        doc = "[`provide_out_of_band_consignment`](Wallet::provide_out_of_band_consignment) and"
+    )]
+    #[cfg_attr(
+        not(feature = "_online"),
+        doc = "`provide_out_of_band_consignment` and"
+    )]
+    #[cfg_attr(
+        feature = "_online",
+        doc = "[`provide_out_of_band_ack`](Wallet::provide_out_of_band_ack)),"
+    )]
+    #[cfg_attr(not(feature = "_online"), doc = "`provide_out_of_band_ack`),")]
+    /// without using automated
     /// transport endpoints.
     ///
     /// The `min_confirmations` number determines the minimum number of confirmations needed for
     /// the transaction anchoring the transfer for it to be considered final and move (while
     /// refreshing) to the [`TransferStatus::Settled`] status.
+    ///
+    /// An optional `quota` (default 1) sets the number of transfers the invoice can receive. A
+    /// reusable invoice (quota greater than 1) requires transport endpoints. Each transfer received
+    /// after the first one gets a transfer of its own, which is created when refreshing. The
+    /// blinded UTXO keeps room for the transfers the invoice can still receive and cannot be spent
+    /// until a transfer posted before the invoice expiration can no longer be downloaded (the
+    /// expiration plus the longest retention grace among the proxies the invoice is reserved on).
     pub fn blind_receive(
         &mut self,
         online: Option<Online>,
@@ -662,6 +841,7 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
+        quota: Option<u32>,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger(),
@@ -679,6 +859,7 @@ impl Wallet {
             transport_endpoints,
             RecipientType::Blind,
             encryption,
+            quota.unwrap_or(1),
         )?;
         let batch_transfer_idx =
             self.store_receive_transfer(&txn, &receive_data_internal, min_confirmations)?;
@@ -718,13 +899,32 @@ impl Wallet {
     /// `rpcs://example.com`).
     /// Providing an empty list selects the out-of-band exchange: the invoice carries no transport
     /// endpoints and the consignment and ACK are exchanged out-of-band (see
-    /// [`provide_out_of_band_consignment`](Wallet::provide_out_of_band_consignment) and
-    /// [`provide_out_of_band_ack`](Wallet::provide_out_of_band_ack)), without using automated
+    #[cfg_attr(
+        feature = "_online",
+        doc = "[`provide_out_of_band_consignment`](Wallet::provide_out_of_band_consignment) and"
+    )]
+    #[cfg_attr(
+        not(feature = "_online"),
+        doc = "`provide_out_of_band_consignment` and"
+    )]
+    #[cfg_attr(
+        feature = "_online",
+        doc = "[`provide_out_of_band_ack`](Wallet::provide_out_of_band_ack)),"
+    )]
+    #[cfg_attr(not(feature = "_online"), doc = "`provide_out_of_band_ack`),")]
+    /// without using automated
     /// transport endpoints.
     ///
     /// The `min_confirmations` number determines the minimum number of confirmations needed for
     /// the transaction anchoring the transfer for it to be considered final and move (while
     /// refreshing) to the [`TransferStatus::Settled`] status.
+    ///
+    /// An optional `quota` (default 1) sets the number of transfers the invoice can receive. A
+    /// reusable invoice (quota greater than 1) requires transport endpoints. Each transfer received
+    /// after the first one gets a transfer of its own, which is created when refreshing. Every
+    /// transfer to a reusable invoice uses a different seal blinding, derived from the keys of the
+    /// parties, which identifies the output paying it. The outputs paying a reusable invoice cannot
+    /// be spent until the transfer each pays has been accepted.
     pub fn witness_receive(
         &mut self,
         online: Option<Online>,
@@ -734,6 +934,7 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
+        quota: Option<u32>,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger(),
@@ -751,6 +952,7 @@ impl Wallet {
             transport_endpoints,
             RecipientType::Witness,
             encryption,
+            quota.unwrap_or(1),
         )?;
         let batch_transfer_idx =
             self.store_receive_transfer(&txn, &receive_data_internal, min_confirmations)?;
@@ -1065,6 +1267,14 @@ impl Wallet {
     /// exchange: its consignment is not posted anywhere and it doesn't need a public key, see
     /// [`provide_out_of_band_ack`](Wallet::provide_out_of_band_ack).
     ///
+    /// Mint rights ([`Assignment::MintRight`] recipients) can be duplicated: a single mint right
+    /// of the wallet is spent, however many of them are sent.
+    ///
+    /// The mint rights moved along by spending the UTXOs holding them go each to a UTXO without
+    /// one, as a UTXO holds at most one mint right of an asset: the RGB change, if it can take it,
+    /// otherwise another UTXO, erroring with [`Error::InsufficientAllocationSlots`] if none is
+    /// available.
+    ///
     /// If `donation` is true, the resulting transaction will be broadcast (by
     /// [`send_end`](Wallet::send_end)) as soon as it's ready, without the need for recipients to
     /// ACK the transfer.
@@ -1203,7 +1413,9 @@ impl Wallet {
     /// On success, if a signed witness transaction is found it is broadcast and the transfer moves
     /// to [`TransferStatus::WaitingConfirmations`], otherwise it moves to
     /// [`TransferStatus::WaitingBroadcast`], leaving the ACK to be communicated to the sender
-    /// out-of-band. An invalid consignment fails the transfer locally, without any proxy NACK.
+    /// out-of-band. An invalid consignment fails the transfer locally, without any proxy NACK, and
+    /// so does a mint, as mints are only received through proxies (see
+    /// [`get_received_mint`](Wallet::get_received_mint)).
     pub fn provide_out_of_band_consignment(
         &mut self,
         online: Online,
@@ -1628,7 +1840,7 @@ impl Wallet {
                     .transfers
                     .values()
                     .next()
-                    .and_then(|transfer| transfer.burn_reason)
+                    .and_then(|transfer| transfer.main_transition.burn_reason())
                     .map(|burn_reason| burn_reason.to_string()),
             },
         })
@@ -1660,44 +1872,6 @@ impl Wallet {
         self.persist_and_commit(txn)?;
         self.trigger_auto_backup();
         info!(self.logger(), "Burn (end) completed");
-        Ok(res)
-    }
-
-    /// Link parent contract to child contract by consuming the parent's link-right single-use seal.
-    pub fn link_ifa(
-        &mut self,
-        online: Online,
-        parent_contract_id: String,
-        child_contract_id: String,
-        link_right_outpoint: Outpoint,
-        fee_rate: u64,
-        min_confirmations: u8,
-    ) -> Result<OperationResult, Error> {
-        info!(
-            self.logger(),
-            "Linking parent IFA contract ID '{}' to child contract ID '{}' using the link-right outpoint {}...",
-            parent_contract_id,
-            child_contract_id,
-            link_right_outpoint,
-        );
-        self.check_xprv()?;
-        self.check_online(online)?;
-        let txn = self.database().begin_transaction()?;
-        let mut begin_op_data = self.link_ifa_begin_impl(
-            &txn,
-            parent_contract_id,
-            child_contract_id,
-            link_right_outpoint,
-            fee_rate,
-            min_confirmations,
-            true,
-        )?;
-        self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
-        let res = self.link_ifa_end_impl(&txn, &begin_op_data.psbt)?;
-        self.update_backup_info(&txn, false)?;
-        txn.commit()?;
-        self.trigger_auto_backup();
-        info!(self.logger(), "Contract link completed");
         Ok(res)
     }
 
@@ -3265,6 +3439,290 @@ impl Wallet {
         self.trigger_auto_backup();
         info!(self.logger(), "Accept swap transfers completed");
         Ok(result)
+    }
+
+    /// Link an RGB contract to the contract with ID `linked_to_contract`, spending its link right.
+    ///
+    /// The contract to link to is checked as in [`link_begin`](Wallet::link_begin), unless
+    /// `skip_contract_checks` is true.
+    ///
+    /// This calls [`link_begin`](Wallet::link_begin), signs the resulting PSBT and finally
+    /// calls [`link_end`](Wallet::link_end).
+    ///
+    /// A wallet with private keys is required.
+    pub fn link(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        skip_contract_checks: bool,
+    ) -> Result<OperationResult, Error> {
+        info!(
+            self.logger(),
+            "Linking to contract: {}...", linked_to_contract
+        );
+        self.check_xprv()?;
+        self.check_online(online)?;
+        let txn = self.database().begin_transaction()?;
+        let mut begin_op_data = self.link_begin_impl(
+            &txn,
+            asset_id,
+            linked_to_contract,
+            fee_rate,
+            min_confirmations,
+            skip_contract_checks,
+            true,
+        )?;
+        self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
+        let res = self.link_end_impl(&txn, &begin_op_data.psbt)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Link completed");
+        Ok(res)
+    }
+
+    /// Prepare the PSBT to link to the contract with ID `linked_to_contract`, with the provided
+    /// `fee_rate` (in sat/vB).
+    ///
+    /// The link spends the link right, which the wallet needs to hold, and commits the contract it
+    /// links to (`linkedToContract`), which can't be the same (linking) one. As there can only be
+    /// at most one link right, a contract can be linked only once.
+    ///
+    /// The contract to link to needs to be known to the wallet, which checks it has been issued
+    /// linked from the linking one (`linkedFromContract`). Set `skip_contract_checks` to skip
+    /// these checks and link to a contract the wallet cannot check, e.g. one it doesn't know.
+    ///
+    /// If `dry_run` is true, the wallet does not persist the operation as
+    /// [`TransferStatus::Initiated`]. The returned [`LinkBeginResult::batch_transfer_idx`] is None
+    /// in that case. The PSBT and on-disk operation data under the wallet directory are still
+    /// produced. [`link_end`](Wallet::link_end) can still complete the operation and will persist
+    /// it.
+    ///
+    /// Signing of the returned PSBT needs to be carried out separately. The signed PSBT then needs
+    /// to be fed to the [`link_end`](Wallet::link_end) function for broadcasting.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    ///
+    /// Returns a PSBT ready to be signed and operation details.
+    pub fn link_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        skip_contract_checks: bool,
+        dry_run: bool,
+    ) -> Result<LinkBeginResult, Error> {
+        info!(
+            self.logger(),
+            "Linking (begin) to contract: {}...", linked_to_contract
+        );
+        self.check_online(online)?;
+        let txn = self.database().begin_transaction()?;
+        let begin_operation_data = self.link_begin_impl(
+            &txn,
+            asset_id,
+            linked_to_contract,
+            fee_rate,
+            min_confirmations,
+            skip_contract_checks,
+            dry_run,
+        )?;
+        if !dry_run {
+            self.update_backup_info(&txn, false)?;
+        }
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Link (begin) completed");
+        Ok(LinkBeginResult {
+            psbt: begin_operation_data.psbt.to_string(),
+            batch_transfer_idx: begin_operation_data.batch_transfer_idx,
+            details: LinkDetails {
+                fascia_path: begin_operation_data
+                    .transfer_dir
+                    .join(FASCIA_FILE)
+                    .to_string_lossy()
+                    .to_string(),
+                min_confirmations,
+                entropy: begin_operation_data.info_batch_transfer.entropy,
+            },
+        })
+    }
+
+    /// Complete the link operation by broadcasting the provided PSBT and saving the operation to
+    /// DB.
+    ///
+    /// The provided PSBT, prepared with the [`link_begin`](Wallet::link_begin) function, needs to
+    /// have already been signed.
+    ///
+    /// A consignment proving the link (with its full history) is also written to disk, at the
+    /// `consignment_path` reported by [`list_transfers`](Wallet::list_transfers) for the link
+    /// operation, so that it can be handed to third parties that need to verify it.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    ///
+    /// Returns a [`OperationResult`].
+    pub fn link_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger(), "Linking (end)...");
+        self.check_online(online)?;
+        let psbt = Psbt::from_str(&signed_psbt)?;
+        let txn = self.database().begin_transaction()?;
+        let res = self.link_end_impl(&txn, &psbt)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Link (end) completed");
+        Ok(res)
+    }
+
+    /// Prepare the PSBT to mint RGB assets, backed by tokens locked on the asset's bridge
+    /// contract on the external chain, to the provided `recipient`, with the provided `fee_rate`
+    /// (in sat/vB).
+    ///
+    /// The `recipient` assignment needs to be an [`Assignment::Fungible`], specifying the amount
+    /// of assets to mint. The operation spends a mint right without allocating a new one, so
+    /// each mint consumes a mint right. To avoid running out of them, the last settled mint right
+    /// of the wallet cannot be spent, erroring with [`Error::LastMintRight`].
+    ///
+    /// The returned [`MintDetails::opid`] identifies the mint operation: the lock of the
+    /// corresponding tokens on the external chain contract needs to commit to it. The consignment
+    /// is posted right away, so the recipient can check the mint before the lock is made (see
+    /// [`get_received_mint`](crate::wallet::RgbWalletOpsOffline::get_received_mint)), while it
+    /// will be able to accept the transfer only once the lock exists on the external chain. As the
+    /// consignment is posted before the operation is saved, should this fail after posting it
+    /// (e.g. on a DB error), the recipient may check a mint this wallet doesn't know: no lock
+    /// should be made for a mint before it's known that this call succeeded.
+    ///
+    /// The `min_confirmations` number determines the minimum number of confirmations needed for
+    /// the transaction anchoring the transfer for it to be considered final and move (while
+    /// refreshing) to the [`TransferStatus::Settled`] status.
+    ///
+    /// The lock has to be included on the external chain before the provided `before_block`, a
+    /// block of the external chain chosen by the caller (e.g. the bridge operator), which the mint
+    /// commits to: a lock included at or after it never confirms the mint, for anyone. It needs to
+    /// leave at least a block for the lock after the latest one and to be at least
+    /// [`EvmChain::min_mint_lock_blocks`] (leaving the lock time to be made and included) and at
+    /// most [`EvmChain::max_mint_lock_blocks`] blocks after it (as recipients refuse mints
+    /// committing to a further block), erroring with [`Error::InvalidBeforeBlock`] otherwise.
+    ///
+    /// The provided `before_block` is the mint's only expiration, no timestamp is involved: the
+    /// `recipient` must have no expiration, erroring with [`Error::InvalidRecipientData`]
+    /// otherwise. Its invoice expiration only bounds how long its proxy keeps the invoice and the
+    /// consignment, so the consignment can't be posted once it has passed. The mint expires once
+    /// its lock can no longer be included before `before_block`, as of the latest finalized block
+    /// of the external chain: then the recipient fails it (at refresh) and the sender at
+    /// [`mint_end`](Wallet::mint_end) or [`fail_transfers`](RgbWalletOpsOnline::fail_transfers).
+    /// The lock should be made well before `before_block`, paying
+    /// enough fees for it to be included in time, since a lock included after it doesn't mint
+    /// anything.
+    ///
+    /// Signing of the returned PSBT needs to be carried out separately. The signed PSBT then needs
+    /// to be fed to the [`mint_end`](Wallet::mint_end) function for broadcasting.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    ///
+    /// Returns a PSBT ready to be signed and operation details.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        recipient: Recipient,
+        before_block: u64,
+        fee_rate: u64,
+        min_confirmations: u8,
+        sender_transport_endpoint: String,
+    ) -> Result<MintBeginResult, Error> {
+        info!(self.logger(), "Minting (begin)...");
+        self.check_online(online)?;
+        let txn = self.database().begin_transaction()?;
+        let begin_op_data = self.mint_begin_impl(
+            &txn,
+            asset_id,
+            recipient,
+            before_block,
+            fee_rate,
+            min_confirmations,
+            sender_transport_endpoint,
+        )?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Minting (begin) completed");
+        Ok(MintBeginResult {
+            psbt: begin_op_data.psbt.to_string(),
+            batch_transfer_idx: begin_op_data
+                .batch_transfer_idx
+                .expect("a mint is always saved, having no dry run"),
+            details: MintDetails {
+                fascia_path: begin_op_data
+                    .transfer_dir
+                    .join(FASCIA_FILE)
+                    .to_string_lossy()
+                    .to_string(),
+                min_confirmations,
+                entropy: begin_op_data.info_batch_transfer.entropy,
+                opid: begin_op_data.opid.expect("always set for mint"),
+            },
+        })
+    }
+
+    /// Complete the mint operation by broadcasting the provided PSBT and saving the transfer to
+    /// DB.
+    ///
+    /// The provided PSBT, prepared with the [`mint_begin`](Wallet::mint_begin) function, needs
+    /// to have already been signed.
+    ///
+    /// Before broadcasting, the wallet checks via the EVM RPC endpoint configured for the chain of
+    /// the asset's bridge contract (erroring with [`Error::NoEvmRpcUrl`] if there's none) that a
+    /// lock of the minted amount committing to the mint operation (see
+    /// [`MintDetails::opid`]) is already recorded by the bridge contract as of a finalized block,
+    /// included before the block the mint commits to (see [`mint_begin`](Wallet::mint_begin)),
+    /// erroring with [`Error::MintLockNotFound`] otherwise, or with [`Error::MintLockExpired`]
+    /// if it never will be. This enforces the safe operation order: begin,
+    /// lock on the external chain, wait for the lock to be final, then end.
+    ///
+    /// A mint whose lock has expired (see [`mint_begin`](Wallet::mint_begin)) is failed, releasing
+    /// its inputs, before erroring with [`Error::MintLockExpired`]. A mint whose lock is not
+    /// confirmed yet is left as is, so this can be called again later, failing it once its lock
+    /// has expired.
+    ///
+    /// A mint that has already failed or been ended errors with [`Error::CannotEndTransfer`].
+    ///
+    /// Once the lock is confirmed, the known circulating supply of the asset (see
+    /// [`AssetBFA::known_circulating_supply`]) is updated to the one accounted by the bridge
+    /// contract, if it can be read.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    ///
+    /// Returns a [`OperationResult`].
+    pub fn mint_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger(), "Minting (end)...");
+        self.check_online(online)?;
+        let psbt = Psbt::from_str(&signed_psbt)?;
+        let txn = self.database().begin_transaction()?;
+        let res = match self.mint_end_impl(&txn, &psbt) {
+            Ok(res) => res,
+            // the mint has been failed, which needs to be committed
+            Err(e @ Error::MintLockExpired { .. }) => {
+                self.update_backup_info(&txn, false)?;
+                self.persist_and_commit(txn)?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Minting (end) completed");
+        Ok(res)
     }
 }
 

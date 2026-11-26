@@ -99,6 +99,7 @@ fn scenario_3_1_enable_auto_backup_bumps_version_after_each_operation() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .expect("witness_receive");
     let v3 = rt
@@ -121,6 +122,7 @@ fn scenario_3_1_enable_auto_backup_bumps_version_after_each_operation() {
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .expect("witness_receive receiver");
@@ -233,6 +235,7 @@ fn scenario_3_2_disable_auto_backup_prevents_version_bumps() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .expect("witness_receive");
     assert_version_unchanged_for(
@@ -252,6 +255,7 @@ fn scenario_3_2_disable_auto_backup_prevents_version_bumps() {
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .expect("witness_receive receiver");

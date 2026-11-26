@@ -387,7 +387,7 @@ pub trait WalletBackup: WalletCore {
         if client.backup_mode() == super::vss::VssBackupMode::Blocking
             && self
                 .wallet_dir()
-                .join(crate::utils::RGB_RUNTIME_LOCK_FILE)
+                .join(crate::wallet::utils::RGB_RUNTIME_LOCK_FILE)
                 .exists()
         {
             client.record_auto_backup_result(Some(
@@ -889,7 +889,7 @@ pub(crate) fn snapshot_wallet_dir(
     // A reentrant caller must finish persisting its runtime before capture.
     // Other threads cannot hold the runtime while we own the state gate.
     if wallet_dir
-        .join(crate::utils::RGB_RUNTIME_LOCK_FILE)
+        .join(crate::wallet::utils::RGB_RUNTIME_LOCK_FILE)
         .exists()
     {
         return Err(Error::Internal {

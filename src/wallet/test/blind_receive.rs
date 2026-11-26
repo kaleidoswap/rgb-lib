@@ -23,6 +23,7 @@ fn success() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
     let bak_info_after = party.db_backup_info();
@@ -52,6 +53,7 @@ fn success() {
             TRANSPORT_ENDPOINTS.clone(),
             min_confirmations,
             None,
+            None,
         )
         .unwrap();
     assert_eq!(receive_data.expiration_timestamp, expiration_timestamp);
@@ -75,6 +77,7 @@ fn success() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
     let invoice = Invoice::new(receive_data.invoice).unwrap();
@@ -93,6 +96,7 @@ fn success() {
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .unwrap();
@@ -114,6 +118,7 @@ fn success() {
             expiration_timestamp,
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .unwrap();
@@ -146,6 +151,7 @@ fn success() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
     let invoice = Invoice::new(receive_data.invoice).unwrap();
@@ -171,6 +177,7 @@ fn success() {
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .unwrap();
@@ -198,6 +205,7 @@ fn success() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
     let invoice = Invoice::new(receive_data.invoice).unwrap();
@@ -220,6 +228,7 @@ fn success() {
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .unwrap();
@@ -244,6 +253,7 @@ fn success() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
     let invoice = Invoice::new(receive_data.invoice).unwrap();
@@ -267,6 +277,7 @@ fn success() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
     let invoice = Invoice::new(receive_data.invoice).unwrap();
@@ -282,6 +293,38 @@ fn success() {
         Some(Assignment::InflationRight(amount))
     );
 
+    // detect assignment: amount, BFA
+    party.create_utxos_default(); // more UTXOs to have free allocation slots
+    let asset_bfa = party.issue_asset_bfa(1, FAKE_EVM_ADDRESS.to_string(), None);
+    let asset_bfa_id = asset_bfa.asset_id;
+    let receive_data = party
+        .wallet
+        .blind_receive(
+            Some(party.online),
+            Some(asset_bfa_id.clone()),
+            Assignment::Fungible(amount),
+            default_rcv_expiration(),
+            TRANSPORT_ENDPOINTS.clone(),
+            MIN_CONFIRMATIONS,
+            None,
+            None,
+        )
+        .unwrap();
+    let invoice = Invoice::new(receive_data.invoice).unwrap();
+    let invoice_data = invoice.invoice_data();
+    assert_eq!(invoice_data.asset_schema, Some(AssetSchema::Bfa));
+    assert_eq!(invoice_data.asset_id, Some(asset_bfa_id.clone()));
+    assert_eq!(invoice_data.assignment, Assignment::Fungible(amount));
+    assert_eq!(
+        invoice_data.assignment_name,
+        Some(RGB_STATE_ASSET_OWNER.to_string())
+    );
+    let transfer = party.get_test_transfer_recipient(&receive_data.recipient_id);
+    assert_eq!(
+        transfer.requested_assignment,
+        Some(Assignment::Fungible(amount))
+    );
+
     // detect assignment: any, no schema
     let receive_data = party
         .wallet
@@ -292,6 +335,7 @@ fn success() {
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .unwrap();
@@ -310,6 +354,7 @@ fn success() {
         default_rcv_expiration(),
         TRANSPORT_ENDPOINTS.clone(),
         MIN_CONFIRMATIONS,
+        None,
         None,
     );
     assert_matches!(result, Err(Error::InvalidAssignment));
@@ -332,6 +377,7 @@ fn success() {
         transport_endpoints.clone(),
         MIN_CONFIRMATIONS,
         None,
+        None,
     );
     assert!(result.is_ok());
     let transfer = party.get_test_transfer_recipient(&result.unwrap().recipient_id);
@@ -349,7 +395,21 @@ fn schema_assignment_combinations() {
     // more UTXOs to have free allocation slots for the issuances and the blind receives
     party.create_utxos(false, Some(UTXO_NUM * 3), None, FEE_RATE, None);
 
-    check_receive_schema_assignment_combinations(&mut party, Wallet::blind_receive);
+    check_receive_schema_assignment_combinations(
+        &mut party,
+        |w, online, asset_id, assignment, expiration, endpoints, min_confirmations, encryption| {
+            w.blind_receive(
+                online,
+                asset_id,
+                assignment,
+                expiration,
+                endpoints,
+                min_confirmations,
+                encryption,
+                None,
+            )
+        },
+    );
 }
 
 #[cfg(feature = "electrum")]
@@ -468,6 +528,7 @@ fn fail() {
             transport_endpoints,
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
     }
 
@@ -498,6 +559,7 @@ fn fail() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap_err();
     assert!(matches!(result, Error::InvalidExpiration));
@@ -512,6 +574,7 @@ fn fail() {
             (now().unix_timestamp() + i64::from(MAX_EXPIRATION_SECS) + 1) as u64,
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .unwrap_err();
@@ -528,6 +591,7 @@ fn fail() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap_err();
     assert!(matches!(result, Error::ExpirationInvalid));
@@ -540,6 +604,7 @@ fn fail() {
         default_rcv_expiration(),
         TRANSPORT_ENDPOINTS.clone(),
         MIN_CONFIRMATIONS,
+        None,
         None,
     );
     assert!(matches!(result, Err(Error::AssetNotFound { asset_id: _ })));
@@ -650,6 +715,7 @@ fn wrong_asset_fail() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
 
@@ -741,6 +807,7 @@ fn proxy_auth() {
         transport_endpoints.clone(),
         MIN_CONFIRMATIONS,
         None,
+        None,
     );
     assert!(matches!(result, Err(Error::Proxy { details }) if details == "Missing: signature"));
 
@@ -758,6 +825,7 @@ fn proxy_auth() {
         default_rcv_expiration(),
         transport_endpoints.clone(),
         MIN_CONFIRMATIONS,
+        None,
         None,
     );
     assert!(matches!(result, Err(Error::InvalidProxyAuthSignature)));
@@ -1081,6 +1149,19 @@ fn invoice_new() {
     let invoice_data = invoice.invoice_data;
     assert_eq!(invoice_data.assignment, Assignment::InflationRight(0));
 
+    // no state, linkRight
+    let invoice_str = format!("rgb:~/{ifa_sid}/~/{blinded}?assignment_name=linkRight");
+    let invoice = Invoice::new(invoice_str.to_owned()).unwrap();
+    let invoice_data = invoice.invoice_data;
+    assert_eq!(invoice_data.assignment, Assignment::LinkRight);
+
+    // invalid invoice (IFA amount, linkRight)
+    let invoice_str = format!("rgb:~/{ifa_sid}/{amount_str}/{blinded}?assignment_name=linkRight");
+    let result = Invoice::new(invoice_str.to_owned());
+    assert!(
+        matches!(result, Err(Error::InvalidInvoice { details: d }) if d == "invalid assignment")
+    );
+
     // amount, no name
     let invoice_str = format!("rgb:~/{ifa_sid}/~/{blinded}");
     let invoice = Invoice::new(invoice_str.to_owned()).unwrap();
@@ -1206,6 +1287,7 @@ fn proxy_draining() {
         default_rcv_expiration(),
         vec![draining_endpoint.clone()],
         MIN_CONFIRMATIONS,
+        None,
         None,
     );
     assert_matches!(result, Err(Error::ProxyDraining));

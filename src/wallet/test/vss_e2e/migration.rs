@@ -38,6 +38,7 @@ fn scenario_5_1_other_machine_restore_is_operational() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .expect("witness_receive");
     let recipient_map = HashMap::from([(
@@ -144,6 +145,7 @@ fn scenario_5_1_other_machine_restore_is_operational() {
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .expect("witness_receive recv2");

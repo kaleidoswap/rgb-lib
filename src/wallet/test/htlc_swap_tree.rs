@@ -1147,6 +1147,7 @@ fn pinned_accept_then_claim_settles_through_the_operation() {
             vec![],
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
     let prepared =
@@ -1306,7 +1307,7 @@ mod sdk_golden_vectors {
     use secp256k1_musig::{PublicKey as MusigPublicKey, musig::KeyAggCache};
 
     use super::*;
-    use crate::utils::{
+    use crate::no_wallet::{
         BitcoinNetwork, recipient_id_from_script_buf, script_buf_from_recipient_id,
     };
 

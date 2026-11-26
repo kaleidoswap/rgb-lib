@@ -10,12 +10,12 @@ fn success() {
 
     let keys = generate_keys(BitcoinNetwork::Signet, WitnessVersion::Taproot);
     let wallet_data = WalletData {
-        reuse_addresses: false,
         data_dir: test_data_dir_str.clone(),
         bitcoin_network: BitcoinNetwork::Signet,
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 1,
         supported_schemas: vec![AssetSchema::Nia, AssetSchema::Cfa],
+        allow_reckless_schemas: false,
     };
     let wallet_keys = SinglesigKeys::from_keys(&keys, Some(2));
     let wallet = Wallet::new(wallet_data.clone(), wallet_keys.clone()).unwrap();
@@ -43,6 +43,10 @@ fn success() {
         wallet_data.max_allocations_per_utxo
     );
     assert_eq!(loaded_data.supported_schemas, wallet_data.supported_schemas);
+    assert_eq!(
+        loaded_data.allow_reckless_schemas,
+        wallet_data.allow_reckless_schemas
+    );
 
     let loaded_keys = loaded.get_keys();
     assert_eq!(loaded_keys.account_xpub_vanilla, keys.account_xpub_vanilla);
@@ -86,12 +90,12 @@ fn new_updates_manifest_success() {
 
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wallet_data = WalletData {
-        reuse_addresses: false,
         data_dir: test_data_dir_str.clone(),
         bitcoin_network: BitcoinNetwork::Regtest,
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 1,
         supported_schemas: vec![AssetSchema::Nia],
+        allow_reckless_schemas: false,
     };
     let wallet = Wallet::new(wallet_data.clone(), SinglesigKeys::from_keys(&keys, None)).unwrap();
     drop(wallet);
@@ -108,7 +112,6 @@ fn new_updates_manifest_success() {
     // new is the way to change the settings that aren't fixed at creation, so it rewrites the
     // manifest and later loads pick the new values up
     let updated_wallet_data = WalletData {
-        reuse_addresses: false,
         max_allocations_per_utxo: 3,
         supported_schemas: vec![AssetSchema::Nia, AssetSchema::Cfa],
         ..wallet_data
@@ -214,7 +217,6 @@ fn new_immutable_settings_fail() {
     // else would stop the same directory being reused for a different chain. the network keeps
     // the error BDK's genesis check has always raised for this
     let other_network_wallet_data = WalletData {
-        reuse_addresses: false,
         bitcoin_network: BitcoinNetwork::Testnet,
         ..wallet_data.clone()
     };
@@ -483,23 +485,6 @@ fn manifest_fingerprint_mismatch_fail() {
 
 #[test]
 #[parallel]
-fn reuse_addresses_roundtrip_success() {
-    let test_data_dir = PrivateDataDir::new();
-    let test_data_dir_str = test_data_dir.string();
-
-    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
-    let mut wallet_data = get_test_wallet_data(&test_data_dir_str);
-    wallet_data.reuse_addresses = true;
-    let wallet = Wallet::new(wallet_data, SinglesigKeys::from_keys(&keys, None)).unwrap();
-    drop(wallet);
-
-    // the manifest records reuse_addresses, so load doesn't silently fall back to false
-    let loaded = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None).unwrap();
-    assert!(loaded.get_wallet_data().reuse_addresses);
-}
-
-#[test]
-#[parallel]
 fn corrupt_manifest_fail() {
     let test_data_dir = PrivateDataDir::new();
     let test_data_dir_str = test_data_dir.string();
@@ -585,4 +570,36 @@ fn legacy_wallet_with_retired_signer_migration_loads() {
         loaded.get_keys().master_fingerprint,
         keys.master_fingerprint
     );
+}
+
+// Manifests written before a setting existed don't carry it, so loading one has to fall back to
+// the behavior the wallet was created with instead of failing to read the manifest.
+#[test]
+#[parallel]
+fn manifest_without_optional_settings_success() {
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
+
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet = Wallet::new(
+        get_test_wallet_data(&test_data_dir_str),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+    let manifest_path = wallet.get_wallet_dir().join(WALLET_MANIFEST_FILE);
+    drop(wallet);
+
+    let mut manifest: Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert!(
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("allow_reckless_schemas")
+            .is_some()
+    );
+    fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+    let loaded = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None).unwrap();
+    assert!(!loaded.get_wallet_data().allow_reckless_schemas);
 }

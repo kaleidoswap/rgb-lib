@@ -1,5 +1,9 @@
 use super::*;
 
+// a refresh that keeps changing transfers forever would be a bug: stop and report it
+#[cfg(feature = "electrum")]
+const MAX_REFRESH_PASSES: u8 = 20;
+
 // singlesig party without an online handle (for offline-only test APIs)
 pub(crate) struct OfflineSinglesigParty {
     pub(crate) wallet: Wallet,
@@ -30,6 +34,14 @@ macro_rules! party {
     };
 }
 
+/// A transfer to wait on, identified by the recipient ID of a receive or the TXID of a send.
+#[cfg(feature = "electrum")]
+#[derive(Debug)]
+pub(crate) enum TransferRef<'a> {
+    Recipient(&'a str),
+    Sender(&'a str),
+}
+
 // convenience trait to allow uniform access to offline functionality from all parties
 pub(crate) trait OfflineSigParty {
     type W: RgbWalletOpsOffline;
@@ -38,12 +50,9 @@ pub(crate) trait OfflineSigParty {
 
     fn wlt_mut(&mut self) -> &mut Self::W;
 
+    /// Status of the receive transfer with the given recipient ID.
     #[cfg(feature = "electrum")]
-    fn check_test_transfer_status_recipient(
-        &self,
-        recipient_id: &str,
-        expected_status: TransferStatus,
-    ) -> bool {
+    fn transfer_status_recipient(&self, recipient_id: &str) -> TransferStatus {
         let transfers = self.db_transfers();
         let mut recipient_transfers = transfers
             .iter()
@@ -51,11 +60,39 @@ pub(crate) trait OfflineSigParty {
         let transfer = recipient_transfers.next().unwrap();
         assert!(recipient_transfers.next().is_none());
         let (transfer_data, _) = self.get_test_transfer_data(transfer);
-        println!(
-            "receive with recipient_id {} is in status {:?}",
-            recipient_id, transfer_data.status
-        );
-        transfer_data.status == expected_status
+        transfer_data.status
+    }
+
+    /// Status of the send transfer with the given TXID.
+    #[cfg(feature = "electrum")]
+    fn transfer_status_sender(&self, txid: &str) -> TransferStatus {
+        let batch_transfers: Vec<_> = self
+            .db_batch_transfers()
+            .into_iter()
+            .filter(|b| b.txid == Some(txid.to_string()))
+            .collect();
+        assert_eq!(batch_transfers.len(), 1);
+        batch_transfers.first().unwrap().status
+    }
+
+    /// Status of the transfer `transfer_ref` refers to.
+    #[cfg(feature = "electrum")]
+    fn transfer_status(&self, transfer_ref: &TransferRef) -> TransferStatus {
+        match transfer_ref {
+            TransferRef::Recipient(recipient_id) => self.transfer_status_recipient(recipient_id),
+            TransferRef::Sender(txid) => self.transfer_status_sender(txid),
+        }
+    }
+
+    #[cfg(feature = "electrum")]
+    fn check_test_transfer_status_recipient(
+        &self,
+        recipient_id: &str,
+        expected_status: TransferStatus,
+    ) -> bool {
+        let status = self.transfer_status_recipient(recipient_id);
+        println!("receive with recipient_id {recipient_id} is in status {status:?}");
+        status == expected_status
     }
 
     #[cfg(feature = "electrum")]
@@ -64,18 +101,9 @@ pub(crate) trait OfflineSigParty {
         txid: &str,
         expected_status: TransferStatus,
     ) -> bool {
-        let batch_transfers: Vec<_> = self
-            .db_batch_transfers()
-            .into_iter()
-            .filter(|b| b.txid == Some(txid.to_string()))
-            .collect();
-        assert_eq!(batch_transfers.len(), 1);
-        let batch_transfer = batch_transfers.first().unwrap();
-        println!(
-            "send with txid {} is in status {:?}",
-            txid, batch_transfer.status
-        );
-        batch_transfer.status == expected_status
+        let status = self.transfer_status_sender(txid);
+        println!("send with txid {txid} is in status {status:?}");
+        status == expected_status
     }
 
     #[cfg(feature = "electrum")]
@@ -478,6 +506,31 @@ pub(crate) trait OfflineSigParty {
         opouts
     }
 
+    /// opouts of the asset on each unspent UTXO hosting any, in the order inputs are selected from
+    #[cfg(feature = "electrum")]
+    fn extract_opouts_by_utxo(&self, asset_id: &str) -> Vec<(OutPoint, Vec<Opout>)> {
+        let contract_id = ContractId::from_str(asset_id).unwrap();
+        let txn = self.wlt().database().begin_transaction().unwrap();
+        let unspent_txos = txn.get_unspent_txos(vec![]).unwrap();
+        let stock = self.wlt().rgb_stock(&txn).unwrap();
+        let mut opouts_by_utxo = Vec::new();
+        for txo in unspent_txos {
+            let outpoint = OutPoint::from(txo);
+            let mut opouts = Vec::new();
+            for (_explicit_seal, opout_state_map) in stock
+                .contract_assignments_for(contract_id, [outpoint])
+                .unwrap()
+            {
+                opouts.extend(opout_state_map.into_keys());
+            }
+            if !opouts.is_empty() {
+                opouts_by_utxo.push((outpoint, opouts));
+            }
+        }
+        txn.commit().unwrap();
+        opouts_by_utxo
+    }
+
     #[cfg(feature = "electrum")]
     fn get_asset_balance(&self, asset_id: &str) -> Balance {
         self.get_asset_balance_result(asset_id).unwrap()
@@ -801,10 +854,7 @@ pub(crate) trait OfflineSigParty {
         let mut current_balance = Balance::default();
         let check = || {
             current_balance = self.get_asset_balance(asset_id);
-            if &current_balance == expected_balance {
-                return true;
-            }
-            false
+            &current_balance == expected_balance
         };
         if !wait_for_function(check, 10, 500) {
             println!("current balance: {current_balance:?}");
@@ -911,10 +961,7 @@ pub(crate) trait SigParty: OfflineSigParty<W: RgbWalletOpsOnline> {
         let mut current_balance = BtcBalance::default();
         let check = || {
             current_balance = self.get_btc_balance_with_sync();
-            if &current_balance == expected_balance {
-                return true;
-            }
-            false
+            &current_balance == expected_balance
         };
         if !wait_for_function(check, 10, 500) {
             println!("current balance: {current_balance:?}");
@@ -923,6 +970,140 @@ pub(crate) trait SigParty: OfflineSigParty<W: RgbWalletOpsOnline> {
         }
     }
 
+    /// A single refresh, with the error handling shared by the waiting helpers: `None` means it
+    /// hit an error the caller is expected to retry, while a fatal one panics.
+    fn refresh_pass(&mut self, asset_id: Option<&str>) -> Option<RefreshResult> {
+        let result = self.refresh_result(asset_id, &[]);
+        let Ok(refresh_res) = result else {
+            eprintln!("refresh error: {result:?}");
+            return None;
+        };
+        let mut non_fatal_error = false;
+        refresh_res.iter().for_each(|(i, rt)| {
+            if let Some(ref e) = rt.failure {
+                eprintln!("refresh of {i} failure: {e} ({e:?})");
+                match e {
+                    Error::InvalidTxid => {
+                        println!("refresh of {i} invalid TXID: {e}");
+                        non_fatal_error = true;
+                    }
+                    Error::Network { details } => {
+                        println!("refresh of {i} network error: {e}, details: {details}");
+                        non_fatal_error = true;
+                    }
+                    _ => panic!("refresh of {i} fatal error: {e}"),
+                }
+            }
+        });
+        if non_fatal_error {
+            return None;
+        }
+        Some(refresh_res)
+    }
+
+    /// Refresh until a pass changes nothing, so that all the progress that is possible at this
+    /// point has been applied.
+    ///
+    /// Each pass applies the progress that is possible when it runs, which can enable more (e.g. a
+    /// batch recipient that ACKs before the last one moves to WaitingBroadcast, then picks up the
+    /// released TX and reaches WaitingConfirmations), so a single pass can leave the wallet in a
+    /// state that depends on which transfer happened to change first.
+    ///
+    /// Returns whether anything changed or there is nothing left to refresh (refresh only
+    /// considers transfers in a waiting status, so an empty result means no change can ever
+    /// happen: this is normal, as a transfer may have already been updated by an earlier refresh,
+    /// e.g. settled on a block mined by another test, since mining is shared between tests running
+    /// in parallel).
+    #[cfg(feature = "electrum")]
+    fn drain_refresh(&mut self, asset_id: Option<&str>) -> bool {
+        let mut progressed = false;
+        for _ in 0..MAX_REFRESH_PASSES {
+            let Some(refresh_res) = self.refresh_pass(asset_id) else {
+                return progressed;
+            };
+            if refresh_res.is_empty() {
+                println!("no transfer left to refresh");
+                return true;
+            }
+            if !refresh_res.transfers_changed() {
+                return progressed;
+            }
+            progressed = true;
+        }
+        panic!("refresh is not reaching a stable state");
+    }
+
+    /// Refresh until the transfer `transfer_ref` refers to is in `expected_status`.
+    ///
+    /// This is for statuses a transfer cannot move past (Settled and Failed): waiting for an
+    /// intermediate one can hang, as the transfer may have already left it by the time it's
+    /// checked.
+    #[cfg(feature = "electrum")]
+    fn wait_for_transfer_status(
+        &mut self,
+        asset_id: Option<&str>,
+        transfer_ref: TransferRef<'_>,
+        expected_status: TransferStatus,
+    ) {
+        assert!(
+            matches!(
+                expected_status,
+                TransferStatus::Settled | TransferStatus::Failed
+            ),
+            "only a final status can be waited for, got {expected_status:?}"
+        );
+        println!("waiting for {transfer_ref:?} to be {expected_status:?}");
+        let check = || {
+            // refresh even if the status already matches: the caller may be relying on the side
+            // effects of the refresh this replaces (e.g. progress on another transfer)
+            self.drain_refresh(asset_id);
+            self.transfer_status(&transfer_ref) == expected_status
+        };
+        if !wait_for_function(check, 30, 500) {
+            panic!(
+                "{transfer_ref:?} is in status {:?}, it's not becoming {expected_status:?}",
+                self.transfer_status(&transfer_ref)
+            );
+        }
+    }
+
+    /// Refresh until the receive transfer with the given recipient ID is in `expected_status`
+    /// (see `wait_for_transfer_status`).
+    #[cfg(feature = "electrum")]
+    fn wait_for_transfer_status_recipient(
+        &mut self,
+        asset_id: Option<&str>,
+        recipient_id: &str,
+        expected_status: TransferStatus,
+    ) {
+        self.wait_for_transfer_status(
+            asset_id,
+            TransferRef::Recipient(recipient_id),
+            expected_status,
+        );
+    }
+
+    /// Refresh until the send transfer with the given TXID is in `expected_status` (see
+    /// `wait_for_transfer_status`).
+    #[cfg(feature = "electrum")]
+    fn wait_for_transfer_status_sender(
+        &mut self,
+        asset_id: Option<&str>,
+        txid: &str,
+        expected_status: TransferStatus,
+    ) {
+        self.wait_for_transfer_status(asset_id, TransferRef::Sender(txid), expected_status);
+    }
+
+    /// Refresh until a transfer changes status, panicking if none does.
+    ///
+    /// When `transfer_ids` is given, it waits for each of those transfers to change instead.
+    ///
+    /// This waits for *some* progress, which is not necessarily the progress the caller is after,
+    /// and it leaves the progress that the refresh enables pending (which is what tests checking
+    /// the status a transfer goes through at each refresh expect). When waiting for a transfer to
+    /// reach a final status, `wait_for_transfer_status` is both more precise and immune to another
+    /// transfer changing first.
     fn wait_for_refresh_raw(&mut self, asset_id: Option<&str>, transfer_ids: Option<&[i32]>) {
         println!(
             "waiting for refresh ({})",
@@ -935,61 +1116,45 @@ pub(crate) trait SigParty: OfflineSigParty<W: RgbWalletOpsOnline> {
             target_set = t_ids.iter().copied().collect();
         }
         let check = || {
-            let result = self.refresh_result(asset_id, &[]);
-            if let Ok(refresh_res) = result {
-                let mut non_fatal_error = false;
-                refresh_res.iter().for_each(|(i, rt)| {
-                    if let Some(ref e) = rt.failure {
-                        eprintln!("refresh of {i} failure: {e} ({e:?})");
-                        match e {
-                            Error::InvalidTxid => {
-                                println!("refresh of {i} invalid TXID: {e}");
-                                non_fatal_error = true;
-                            }
-                            Error::Network { details } => {
-                                println!("refresh of {i} network error: {e}, details: {details}");
-                                non_fatal_error = true;
-                            }
-                            _ => panic!("refresh of {i} fatal error: {e}"),
-                        }
+            let Some(refresh_res) = self.refresh_pass(asset_id) else {
+                return false;
+            };
+            // refresh only considers transfers in a waiting status, so an empty result means there
+            // is nothing left to refresh and no change can ever happen: this is normal, as a
+            // transfer may have already been updated by an earlier refresh; the caller's status
+            // checks tell if the outcome is the expected one
+            if refresh_res.is_empty() {
+                println!("no transfer left to refresh");
+                return true;
+            }
+            // a batch recipient that ACKs before the last one moves to WaitingBroadcast; one more
+            // pass lets it pick up the released TX and reach WaitingConfirmations
+            let has_waiting_broadcast = refresh_res
+                .values()
+                .any(|rt| rt.updated_status == Some(TransferStatus::WaitingBroadcast));
+            if transfer_ids.is_some() {
+                for (id, rt) in &refresh_res {
+                    if rt.updated_status.is_some() && target_set.contains(id) {
+                        seen.insert(*id);
                     }
-                });
-                if non_fatal_error {
-                    return false;
                 }
-                if transfer_ids.is_some() {
-                    let has_waiting_broadcast = refresh_res
-                        .iter()
-                        .any(|(_, rt)| rt.updated_status == Some(TransferStatus::WaitingBroadcast));
-                    for (id, rt) in refresh_res {
-                        if rt.updated_status.is_some() && target_set.contains(&id) {
-                            seen.insert(id);
-                        }
-                    }
-                    if seen == target_set {
-                        // a batch recipient that ACKs before the last one moves to WaitingBroadcast;
-                        // one more pass lets it pick up the released TX and reach WaitingConfirmations
-                        if has_waiting_broadcast {
-                            self.refresh_result(asset_id, &[]).unwrap();
-                        }
-                        return true;
-                    }
-                } else if refresh_res.transfers_changed() {
-                    // a batch recipient that ACKs before the last one moves to WaitingBroadcast; if
-                    // that happened, do one more refresh pass so it can pick up the released TX and
-                    // reach WaitingConfirmations
-                    let has_waiting_broadcast = refresh_res
-                        .iter()
-                        .any(|(_, rt)| rt.updated_status == Some(TransferStatus::WaitingBroadcast));
+                // a target that is no longer waiting cannot be updated anymore, so it doesn't need
+                // to have been seen changing
+                let done = target_set
+                    .iter()
+                    .all(|id| seen.contains(id) || !refresh_res.contains_key(id));
+                if done {
                     if has_waiting_broadcast {
-                        self.refresh_result(asset_id, &[]).unwrap();
+                        self.refresh_pass(asset_id);
                     }
                     return true;
                 }
-            } else {
-                eprintln!("refresh error: {result:?}");
-                return false;
-            };
+            } else if refresh_res.transfers_changed() {
+                if has_waiting_broadcast {
+                    self.refresh_pass(asset_id);
+                }
+                return true;
+            }
             false
         };
         if !wait_for_function(check, 10, 500) {
@@ -1024,6 +1189,14 @@ pub(crate) trait SinglesigWalletParty {
     #[cfg(feature = "electrum")]
     fn abort_pending_vanilla_tx_result(&self, txid: &str) -> Result<(), Error>;
 
+    /// Return the digests of the media of the given asset.
+    #[cfg(feature = "electrum")]
+    fn asset_media_digests(&self, asset_id: &str) -> HashSet<String>;
+
+    /// Export the contract of the given asset into a new temporary directory, returning both.
+    #[cfg(feature = "electrum")]
+    fn export_contract_to_tempdir(&self, asset_id: &str) -> (TempDir, String);
+
     fn get_address(&mut self) -> String;
 
     fn go_online(&mut self, skip_consistency_check: bool, indexer_url: Option<&str>) -> Online;
@@ -1033,6 +1206,22 @@ pub(crate) trait SinglesigWalletParty {
         skip_consistency_check: bool,
         indexer_url: Option<&str>,
     ) -> Result<Online, Error>;
+
+    #[cfg(feature = "electrum")]
+    fn issue_asset_bfa(
+        &mut self,
+        mint_rights: u8,
+        contract_address: String,
+        reject_list_address: Option<String>,
+    ) -> AssetBFA;
+
+    #[cfg(feature = "electrum")]
+    fn issue_asset_bfa_result(
+        &mut self,
+        mint_rights: u8,
+        contract_address: String,
+        reject_list_address: Option<String>,
+    ) -> Result<AssetBFA, Error>;
 
     #[cfg(feature = "electrum")]
     fn issue_asset_cfa(&mut self, amounts: Option<&[u64]>, file_path: Option<String>) -> AssetCFA;
@@ -1132,6 +1321,29 @@ impl<T: OfflineSigParty<W = Wallet>> SinglesigWalletParty for T {
         self.wlt().abort_pending_vanilla_tx(txid.to_string())
     }
 
+    #[cfg(feature = "electrum")]
+    fn asset_media_digests(&self, asset_id: &str) -> HashSet<String> {
+        self.wlt()
+            .list_asset_media(asset_id.to_string())
+            .unwrap()
+            .into_iter()
+            .map(|m| m.digest)
+            .collect()
+    }
+
+    #[cfg(feature = "electrum")]
+    fn export_contract_to_tempdir(&self, asset_id: &str) -> (TempDir, String) {
+        let destination_dir = TempDir::new().unwrap();
+        let contract_path = self
+            .wlt()
+            .export_contract(
+                asset_id.to_string(),
+                destination_dir.path().to_string_lossy().to_string(),
+            )
+            .unwrap();
+        (destination_dir, contract_path)
+    }
+
     fn get_address(&mut self) -> String {
         self.wlt_mut().get_address().unwrap()
     }
@@ -1149,6 +1361,38 @@ impl<T: OfflineSigParty<W = Wallet>> SinglesigWalletParty for T {
         let mut online_options = test_go_online_options(indexer_url);
         online_options.skip_consistency_check = skip_consistency_check;
         self.wlt_mut().go_online(online_options)
+    }
+
+    #[cfg(feature = "electrum")]
+    fn issue_asset_bfa(
+        &mut self,
+        mint_rights: u8,
+        contract_address: String,
+        reject_list_address: Option<String>,
+    ) -> AssetBFA {
+        self.issue_asset_bfa_result(mint_rights, contract_address, reject_list_address)
+            .unwrap()
+    }
+
+    #[cfg(feature = "electrum")]
+    fn issue_asset_bfa_result(
+        &mut self,
+        mint_rights: u8,
+        contract_address: String,
+        reject_list_address: Option<String>,
+    ) -> Result<AssetBFA, Error> {
+        self.wlt_mut().issue_asset_bfa(
+            TICKER.to_string(),
+            NAME.to_string(),
+            PRECISION,
+            mint_rights,
+            ANVIL_CHAIN_ID,
+            contract_address,
+            reject_list_address,
+            false,
+            None,
+            false,
+        )
     }
 
     #[cfg(feature = "electrum")]
@@ -1211,7 +1455,9 @@ impl<T: OfflineSigParty<W = Wallet>> SinglesigWalletParty for T {
             amounts,
             inflation_amounts,
             reject_list_url,
+            false,
             None,
+            false,
         )
     }
 
@@ -1227,6 +1473,10 @@ impl<T: OfflineSigParty<W = Wallet>> SinglesigWalletParty for T {
             AssetSchema::Uda => self.issue_asset_uda_result(None, None, vec![])?.asset_id,
             AssetSchema::Cfa => self.issue_asset_cfa_result(None, None)?.asset_id,
             AssetSchema::Ifa => self.issue_asset_ifa_result(None, None, None)?.asset_id,
+            AssetSchema::Bfa => {
+                self.issue_asset_bfa_result(1, FAKE_EVM_ADDRESS.to_string(), None)?
+                    .asset_id
+            }
         })
     }
 
@@ -1287,8 +1537,30 @@ impl SinglesigParty {
         assert_eq!(online, self.online);
     }
 
+    /// Go online again with the same indexer, setting the given EVM RPC endpoints
+    #[cfg(feature = "electrum")]
+    pub(crate) fn set_evm_rpc_urls(&mut self, evm_rpc_urls: HashMap<u64, String>) {
+        self.set_evm_chains(test_evm_chains(evm_rpc_urls));
+    }
+
+    /// Go online again with the same indexer, setting the given EVM chains
+    #[cfg(feature = "electrum")]
+    pub(crate) fn set_evm_chains(&mut self, evm_chains: HashMap<u64, EvmChain>) {
+        let mut online_options = test_go_online_options(None);
+        online_options.evm_chains = evm_chains;
+        let online = self.wallet.go_online(online_options).unwrap();
+        assert_eq!(online, self.online);
+    }
+
     pub(crate) fn blind_receive(&mut self) -> ReceiveData {
         self.blind_receive_result().unwrap()
+    }
+
+    /// Change the max number of allocations per UTXO, as reopening the wallet with another
+    /// setting would.
+    #[cfg(feature = "electrum")]
+    pub(crate) fn set_max_allocations_per_utxo(&mut self, max_allocations_per_utxo: u32) {
+        self.wallet.internals.wallet_data.max_allocations_per_utxo = max_allocations_per_utxo;
     }
 
     #[cfg(feature = "electrum")]
@@ -1306,6 +1578,7 @@ impl SinglesigParty {
                 TRANSPORT_ENDPOINTS.clone(),
                 MIN_CONFIRMATIONS,
                 None,
+                None,
             )
             .unwrap()
     }
@@ -1318,6 +1591,7 @@ impl SinglesigParty {
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
     }
@@ -1337,6 +1611,7 @@ impl SinglesigParty {
                 transport_endpoints,
                 MIN_CONFIRMATIONS,
                 None,
+                None,
             )
             .unwrap()
     }
@@ -1350,6 +1625,7 @@ impl SinglesigParty {
                 default_rcv_expiration(),
                 TRANSPORT_ENDPOINTS.clone(),
                 MIN_CONFIRMATIONS,
+                None,
                 None,
             )
             .unwrap()
@@ -1366,6 +1642,7 @@ impl SinglesigParty {
                 default_rcv_expiration(),
                 vec![],
                 MIN_CONFIRMATIONS,
+                None,
                 None,
             )
             .unwrap()
@@ -1452,10 +1729,7 @@ impl SinglesigParty {
         let check = || {
             let unspents = self.list_unspents_with_sync(false);
             let colorable = unspents.iter().filter(|u| u.utxo.colorable).count();
-            if (colorable - colorable_before) == expected as usize {
-                return true;
-            }
-            false
+            (colorable - colorable_before) == expected as usize
         };
         if !wait_for_function(check, 10, 500) {
             panic!(
@@ -1533,6 +1807,59 @@ impl SinglesigParty {
     }
 
     #[cfg(feature = "electrum")]
+    pub(crate) fn mint_begin(
+        &mut self,
+        online: Online,
+        asset_id: &str,
+        recipient: Recipient,
+    ) -> MintBeginResult {
+        self.mint_begin_result(online, asset_id, recipient).unwrap()
+    }
+
+    #[cfg(feature = "electrum")]
+    pub(crate) fn mint_begin_result(
+        &mut self,
+        online: Online,
+        asset_id: &str,
+        recipient: Recipient,
+    ) -> Result<MintBeginResult, Error> {
+        self.mint_begin_before_result(online, asset_id, recipient, default_before_block())
+    }
+
+    #[cfg(feature = "electrum")]
+    pub(crate) fn mint_begin_before_result(
+        &mut self,
+        online: Online,
+        asset_id: &str,
+        recipient: Recipient,
+        before_block: u64,
+    ) -> Result<MintBeginResult, Error> {
+        self.wallet.mint_begin(
+            online,
+            asset_id.to_string(),
+            recipient,
+            before_block,
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            PROXY_ENDPOINT.clone(),
+        )
+    }
+
+    #[cfg(feature = "electrum")]
+    pub(crate) fn mint_end(&mut self, online: Online, signed_psbt: String) -> OperationResult {
+        self.mint_end_result(online, signed_psbt).unwrap()
+    }
+
+    #[cfg(feature = "electrum")]
+    pub(crate) fn mint_end_result(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
+        self.wallet.mint_end(online, signed_psbt)
+    }
+
+    #[cfg(feature = "electrum")]
     pub(crate) fn list_unspents_vanilla(
         &mut self,
         min_confirmations: Option<u8>,
@@ -1593,27 +1920,6 @@ impl SinglesigParty {
 
         let consignment_path = self.wallet.get_send_consignment_path(asset_id, &txid);
         let consignment = RgbTransfer::load_file(consignment_path).unwrap();
-
-        let contract = consignment.clone().into_contract();
-        let asset_schema: AssetSchema = consignment.schema_id().try_into().unwrap();
-        let validation_config = ValidationConfig {
-            chain_net: rcv_party.wallet.chain_net(),
-            ..Default::default()
-        };
-        let txn = rcv_party.wallet.database().begin_transaction().unwrap();
-        let mut stock = rcv_party.wallet.rgb_stock(&txn).unwrap();
-        let valid_contract = contract
-            .clone()
-            .validate(
-                &asset_schema.schema_rules(),
-                &DumbResolver,
-                &validation_config,
-            )
-            .unwrap();
-        stock
-            .import_contract(valid_contract, &rcv_party.wallet.blockchain_resolver())
-            .unwrap();
-        txn.commit().unwrap();
 
         rcv_party
             .wallet

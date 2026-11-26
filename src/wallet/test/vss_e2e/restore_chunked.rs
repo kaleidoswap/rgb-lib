@@ -43,6 +43,7 @@ fn scenario_1_chunked_encrypted_backup_upload_and_restore() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .expect("witness_receive");
     let recipient_map = HashMap::from([(

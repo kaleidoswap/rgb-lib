@@ -8,6 +8,79 @@ pub(crate) const SCHEMA_ID_CFA: &str =
     "rgb:sch:JgqK5hJX9YBT4osCV7VcW_iLTcA5csUCnLzvaKTTrNY#mars-house-friend";
 pub(crate) const SCHEMA_ID_IFA: &str =
     "rgb:sch:A2n9kPNWtXUqwQJyXfY8yGHKyEPZgvrNYYYPGhXawOk#graph-salute-retro";
+pub(crate) const SCHEMA_ID_BFA: &str =
+    "rgb:sch:3I0xZVEQnQxYVk7vDnh5uNtQyUfsmThw6dX9n_Gvb5o#mama-swing-album";
+
+/// Implement the traits a type needs to be stored in a JSON column: the conversions from and to a
+/// DB `Value`, the `ValueType` the migrations describe the column with, the read of a column and
+/// the null value of a nullable one.
+#[cfg(feature = "wallet")]
+macro_rules! impl_json_column {
+    ($ty:ty) => {
+        impl From<$ty> for Value {
+            fn from(value: $ty) -> Self {
+                Value::Json(Some(Box::new(serde_json::to_value(value).unwrap())))
+            }
+        }
+
+        impl TryFrom<Value> for $ty {
+            type Error = sea_orm::DbErr;
+
+            fn try_from(v: Value) -> Result<Self, Self::Error> {
+                match v {
+                    Value::Json(Some(json)) => serde_json::from_value(*json)
+                        .map_err(|e| sea_orm::DbErr::Custom(e.to_string())),
+                    _ => Err(sea_orm::DbErr::Type("Expected JSON value".into())),
+                }
+            }
+        }
+
+        impl rgb_lib_migration::ValueType for $ty {
+            fn type_name() -> String {
+                "json".to_string()
+            }
+
+            fn column_type() -> ColumnType {
+                ColumnType::Json
+            }
+
+            fn array_type() -> ArrayType {
+                ArrayType::Json
+            }
+
+            fn try_from(v: Value) -> Result<Self, ValueTypeErr> {
+                match v {
+                    Value::Json(Some(json)) => {
+                        serde_json::from_value(*json).map_err(|_| ValueTypeErr)
+                    }
+                    _ => Err(ValueTypeErr),
+                }
+            }
+        }
+
+        impl TryGetable for $ty {
+            fn try_get_by<I: sea_orm::ColIdx>(
+                res: &QueryResult,
+                index: I,
+            ) -> Result<Self, TryGetError> {
+                let json_value_opt: Option<JsonValue> = res.try_get_by(index)?;
+                match json_value_opt {
+                    Some(json_value) => serde_json::from_value(json_value)
+                        .map_err(|e| TryGetError::DbErr(DbErr::Type(e.to_string()))),
+                    None => Err(TryGetError::Null(
+                        concat!("Null value for ", stringify!($ty)).to_string(),
+                    )),
+                }
+            }
+        }
+
+        impl Nullable for $ty {
+            fn null() -> Value {
+                Value::Json(None)
+            }
+        }
+    };
+}
 
 /// The schema of an asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -26,6 +99,9 @@ pub enum AssetSchema {
     /// IFA schema
     #[cfg_attr(feature = "wallet", sea_orm(num_value = 4))]
     Ifa = 4,
+    /// BFA schema
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 5))]
+    Bfa = 5,
 }
 
 impl fmt::Display for AssetSchema {
@@ -43,6 +119,7 @@ impl TryFrom<String> for AssetSchema {
             SCHEMA_ID_UDA => AssetSchema::Uda,
             SCHEMA_ID_CFA => AssetSchema::Cfa,
             SCHEMA_ID_IFA => AssetSchema::Ifa,
+            SCHEMA_ID_BFA => AssetSchema::Bfa,
             _ => return Err(Error::UnknownRgbSchema { schema_id }),
         })
     }
@@ -63,6 +140,7 @@ impl AssetSchema {
             SCHEMA_ID_UDA => AssetSchema::Uda,
             SCHEMA_ID_CFA => AssetSchema::Cfa,
             SCHEMA_ID_IFA => AssetSchema::Ifa,
+            SCHEMA_ID_BFA => AssetSchema::Bfa,
             _ => return Err(Error::UnknownRgbSchema { schema_id }),
         })
     }
@@ -79,39 +157,7 @@ impl AssetSchema {
             Self::Uda => UniqueDigitalAsset::schema(),
             Self::Cfa => CollectibleFungibleAsset::schema(),
             Self::Ifa => InflatableFungibleAsset::schema(),
-        }
-    }
-}
-
-#[cfg(feature = "wallet")]
-impl AssetSchema {
-    pub(crate) const VALUES: [Self; NUM_KNOWN_SCHEMAS] =
-        [Self::Nia, Self::Uda, Self::Cfa, Self::Ifa];
-
-    pub(crate) fn get_from_contract_id(
-        contract_id: ContractId,
-        stock: &RgbStock<'_>,
-    ) -> Result<Self, Error> {
-        let schema_id = stock.genesis(contract_id)?.schema_id;
-        Self::from_schema_id(schema_id)
-    }
-
-    #[cfg(feature = "_online")]
-    pub(crate) fn schema_rules(&self) -> SchemaRules {
-        match self {
-            Self::Nia => NonInflatableAsset::schema_rules(),
-            Self::Uda => UniqueDigitalAsset::schema_rules(),
-            Self::Cfa => CollectibleFungibleAsset::schema_rules(),
-            Self::Ifa => InflatableFungibleAsset::schema_rules(),
-        }
-    }
-
-    pub(crate) fn schema_definition(&self) -> SchemaDefinition {
-        match self {
-            Self::Nia => NonInflatableAsset::schema_definition(),
-            Self::Uda => UniqueDigitalAsset::schema_definition(),
-            Self::Cfa => CollectibleFungibleAsset::schema_definition(),
-            Self::Ifa => InflatableFungibleAsset::schema_definition(),
+            Self::Bfa => BridgedFungibleAsset::schema(),
         }
     }
 
@@ -121,38 +167,93 @@ impl AssetSchema {
     pub(crate) fn supports_assignment(&self, assignment: &Assignment) -> bool {
         match assignment {
             Assignment::Fungible(_) => match self {
-                Self::Nia | Self::Cfa | Self::Ifa => true,
+                Self::Nia | Self::Cfa | Self::Ifa | Self::Bfa => true,
                 Self::Uda => false,
             },
             Assignment::NonFungible => match self {
                 Self::Uda => true,
-                Self::Nia | Self::Cfa | Self::Ifa => false,
+                Self::Nia | Self::Cfa | Self::Ifa | Self::Bfa => false,
             },
             Assignment::InflationRight(_) => match self {
                 Self::Ifa => true,
+                Self::Nia | Self::Uda | Self::Cfa | Self::Bfa => false,
+            },
+            Assignment::LinkRight => match self {
+                Self::Ifa | Self::Bfa => true,
                 Self::Nia | Self::Uda | Self::Cfa => false,
             },
-            // link rights are not requested through invoices
-            Assignment::LinkRight | Assignment::Any => false,
+            Assignment::MintRight => match self {
+                Self::Bfa => true,
+                Self::Nia | Self::Uda | Self::Cfa | Self::Ifa => false,
+            },
+            Assignment::Any => false,
         }
     }
 
+    pub(crate) fn schema_rules(&self) -> SchemaRules {
+        match self {
+            Self::Nia => NonInflatableAsset::schema_rules(),
+            Self::Uda => UniqueDigitalAsset::schema_rules(),
+            Self::Cfa => CollectibleFungibleAsset::schema_rules(),
+            Self::Ifa => InflatableFungibleAsset::schema_rules(),
+            Self::Bfa => BridgedFungibleAsset::schema_rules(),
+        }
+    }
+
+    /// Whether the schema can carry a reject list.
+    pub(crate) fn supports_reject_list(&self) -> bool {
+        match self {
+            Self::Bfa | Self::Ifa => true,
+            Self::Nia | Self::Uda | Self::Cfa => false,
+        }
+    }
+
+    /// Whether the schema supports mint operations.
+    pub(crate) fn supports_mint(&self) -> bool {
+        match self {
+            Self::Bfa => true,
+            Self::Nia | Self::Uda | Self::Cfa | Self::Ifa => false,
+        }
+    }
+}
+
+#[cfg(feature = "wallet")]
+impl AssetSchema {
+    pub(crate) const VALUES: [Self; NUM_KNOWN_SCHEMAS] =
+        [Self::Nia, Self::Uda, Self::Cfa, Self::Ifa, Self::Bfa];
+
+    pub(crate) fn get_from_contract_id(
+        contract_id: ContractId,
+        stock: &RgbStock<'_>,
+    ) -> Result<Self, Error> {
+        let schema_id = stock.genesis(contract_id)?.schema_id;
+        Self::from_schema_id(schema_id)
+    }
+
+    pub(crate) fn schema_definition(&self) -> SchemaDefinition {
+        match self {
+            Self::Nia => NonInflatableAsset::schema_definition(),
+            Self::Uda => UniqueDigitalAsset::schema_definition(),
+            Self::Cfa => CollectibleFungibleAsset::schema_definition(),
+            Self::Ifa => InflatableFungibleAsset::schema_definition(),
+            Self::Bfa => BridgedFungibleAsset::schema_definition(),
+        }
+    }
+
+    /// Whether the schema can be used on mainnet.
+    pub(crate) fn allowed_on_mainnet(&self) -> bool {
+        match self {
+            Self::Nia | Self::Uda | Self::Cfa => true,
+            Self::Ifa | Self::Bfa => false,
+        }
+    }
     /// What a request for [`Assignment::Any`] of the schema refers to: the only kind of state it
     /// can be requested for, or [`Assignment::Any`] itself if there is more than one.
     pub(crate) fn any_assignment(&self) -> Assignment {
         match self {
             Self::Nia | Self::Cfa => Assignment::Fungible(0),
             Self::Uda => Assignment::NonFungible,
-            Self::Ifa => Assignment::Any,
-        }
-    }
-
-    /// Whether the schema can carry a reject list.
-    #[cfg(feature = "_online")]
-    pub(crate) fn supports_reject_list(&self) -> bool {
-        match self {
-            Self::Ifa => true,
-            Self::Nia | Self::Uda | Self::Cfa => false,
+            Self::Ifa | Self::Bfa => Assignment::Any,
         }
     }
 
@@ -161,7 +262,7 @@ impl AssetSchema {
     pub(crate) fn supports_inflation(&self) -> bool {
         match self {
             Self::Ifa => true,
-            Self::Nia | Self::Uda | Self::Cfa => false,
+            Self::Nia | Self::Uda | Self::Cfa | Self::Bfa => false,
         }
     }
 
@@ -169,11 +270,18 @@ impl AssetSchema {
     #[cfg(feature = "_online")]
     pub(crate) fn supports_burn(&self) -> bool {
         match self {
-            Self::Ifa => true,
+            Self::Bfa | Self::Ifa => true,
             Self::Nia | Self::Uda | Self::Cfa => false,
         }
     }
 
+    /// Whether the schema has a link right, to link the asset to another contract.
+    pub(crate) fn supports_link(&self) -> bool {
+        match self {
+            Self::Ifa | Self::Bfa => true,
+            Self::Nia | Self::Uda | Self::Cfa => false,
+        }
+    }
     pub(crate) fn import_schema_definition(&self, stock: &mut RgbStock<'_>) -> Result<(), Error> {
         stock.import_schema_definition(self.schema_definition())
     }
@@ -186,6 +294,7 @@ impl From<AssetSchema> for SchemaId {
             AssetSchema::Ifa => SchemaId::from_str(SCHEMA_ID_IFA).unwrap(),
             AssetSchema::Nia => SchemaId::from_str(SCHEMA_ID_NIA).unwrap(),
             AssetSchema::Uda => SchemaId::from_str(SCHEMA_ID_UDA).unwrap(),
+            AssetSchema::Bfa => SchemaId::from_str(SCHEMA_ID_BFA).unwrap(),
         }
     }
 }
@@ -205,92 +314,31 @@ pub enum ColoringType {
 }
 
 #[cfg(feature = "wallet")]
+impl ColoringType {
+    /// The types of the colorings assigning allocations to a TXO (the others spend them).
+    pub(crate) const INCOMING: [Self; 3] = [Self::Receive, Self::Change, Self::Issue];
+}
+
+#[cfg(feature = "wallet")]
 /// The type of an RGB recipient.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum RecipientTypeFull {
     /// Receive via blinded UTXO
     Blind { unblinded_utxo: Outpoint },
     /// Receive via witness TX
-    Witness {
-        vout: Option<u32>,
-        /// Per-invoice random bytes mixed into the proxy routing key.
-        /// Empty when no nonce is in use (e.g. wallets without address reuse).
-        #[serde(default)]
-        recipient_nonce: Vec<u8>,
-    },
+    Witness { vout: Option<u32> },
 }
 
 #[cfg(feature = "wallet")]
-impl From<RecipientTypeFull> for Value {
-    fn from(value: RecipientTypeFull) -> Self {
-        Value::Json(Some(Box::new(serde_json::to_value(value).unwrap())))
-    }
-}
+impl_json_column!(RecipientTypeFull);
 
-#[cfg(feature = "wallet")]
-impl TryFrom<Value> for RecipientTypeFull {
-    type Error = sea_orm::DbErr;
-
-    fn try_from(v: Value) -> Result<Self, Self::Error> {
-        match v {
-            Value::Json(Some(json)) => {
-                serde_json::from_value(*json).map_err(|e| sea_orm::DbErr::Custom(e.to_string()))
-            }
-            _ => Err(sea_orm::DbErr::Type("Expected JSON value".into())),
-        }
-    }
-}
-
-#[cfg(feature = "wallet")]
-impl rgb_lib_migration::ValueType for RecipientTypeFull {
-    fn type_name() -> String {
-        "json".to_string()
-    }
-
-    fn column_type() -> ColumnType {
-        ColumnType::Json
-    }
-
-    fn array_type() -> ArrayType {
-        ArrayType::Json
-    }
-
-    fn try_from(v: Value) -> Result<Self, ValueTypeErr> {
-        match v {
-            Value::Json(Some(json)) => serde_json::from_value(*json).map_err(|_| ValueTypeErr),
-            _ => Err(ValueTypeErr),
-        }
-    }
-}
-
-#[cfg(feature = "wallet")]
-impl TryGetable for RecipientTypeFull {
-    fn try_get_by<I: sea_orm::ColIdx>(res: &QueryResult, index: I) -> Result<Self, TryGetError> {
-        let json_value_opt: Option<JsonValue> = res.try_get_by(index)?;
-        match json_value_opt {
-            Some(json_value) => serde_json::from_value(json_value)
-                .map_err(|e| TryGetError::DbErr(DbErr::Type(e.to_string()))),
-            None => Err(TryGetError::Null(
-                "Null value for RecipientTypeFull".to_string(),
-            )),
-        }
-    }
-}
-
-#[cfg(feature = "wallet")]
-impl Nullable for RecipientTypeFull {
-    fn null() -> Value {
-        Value::Json(None)
-    }
-}
-
-#[cfg(feature = "wallet")]
 /// The type of an RGB transport.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Deserialize, Serialize)]
-#[sea_orm(rs_type = "u8", db_type = "TinyUnsigned")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "wallet", derive(EnumIter, DeriveActiveEnum))]
+#[cfg_attr(feature = "wallet", sea_orm(rs_type = "u8", db_type = "TinyUnsigned"))]
 pub enum TransportType {
     /// HTTP(s) JSON-RPC ([specification](https://github.com/RGB-Tools/rgb-http-json-rpc))
-    #[sea_orm(num_value = 1)]
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 1))]
     JsonRpc = 1,
 }
 
@@ -307,26 +355,23 @@ pub enum TransportEndpointKind {
     SenderProxy = 2,
 }
 
-#[cfg(feature = "wallet")]
 /// The consignment and media encryption preference of a recipient (mirrors
 /// [`rgbinvoice::Encryption`]).
-#[derive(
-    Debug, Copy, Clone, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum, Deserialize, Serialize,
-)]
-#[sea_orm(rs_type = "u8", db_type = "TinyUnsigned")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "wallet", derive(EnumIter, DeriveActiveEnum))]
+#[cfg_attr(feature = "wallet", sea_orm(rs_type = "u8", db_type = "TinyUnsigned"))]
 pub enum Encryption {
     /// Encryption is mandatory for consignment and media (the recipient refuses cleartext)
-    #[sea_orm(num_value = 1)]
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 1))]
     Required = 1,
     /// Encryption must not be used for consignment and media (the recipient refuses encrypted)
-    #[sea_orm(num_value = 2)]
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 2))]
     Unsupported = 2,
     /// Encryption may be used for consignment and media (the recipient accepts both)
-    #[sea_orm(num_value = 3)]
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 3))]
     Optional = 3,
 }
 
-#[cfg(feature = "wallet")]
 impl From<rgbinvoice::Encryption> for Encryption {
     fn from(e: rgbinvoice::Encryption) -> Self {
         match e {
@@ -337,7 +382,6 @@ impl From<rgbinvoice::Encryption> for Encryption {
     }
 }
 
-#[cfg(feature = "wallet")]
 impl From<Encryption> for rgbinvoice::Encryption {
     fn from(e: Encryption) -> Self {
         match e {
@@ -472,14 +516,44 @@ pub enum Assignment {
     InflationRight(u64),
     /// Link right
     LinkRight,
+    /// Mint right
+    MintRight,
     /// Any assignment
     Any,
+}
+
+/// Type of RGB assignment
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum TypeOfAssignment {
+    /// The asset itself, fungible or not
+    Asset,
+    /// An inflation right, allowing to issue new tokens
+    InflationRight,
+    /// A link right, allowing to link the asset to a contract on another chain
+    LinkRight,
+    /// A mint right, allowing to mint tokens backed by the ones locked on the external chain
+    MintRight,
+}
+
+impl TypeOfAssignment {
+    /// Get the type of the given RGB assignment type, returning `None` for the ones unknown to the
+    /// supported schemas.
+    pub(crate) fn from_assignment_type(ty: AssignmentType) -> Option<Self> {
+        match ty {
+            OS_ASSET => Some(Self::Asset),
+            OS_INFLATION => Some(Self::InflationRight),
+            OS_LINK => Some(Self::LinkRight),
+            OS_MINT => Some(Self::MintRight),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(feature = "wallet")]
 impl Assignment {
     /// A fungible owned state of type `ty`, or `None` for a type the wallet's schemas don't
     /// define as fungible.
+    #[cfg(feature = "_online")]
     pub(crate) fn fungible(ty: rgbstd::AssignmentType, amount: u64) -> Option<Self> {
         match ty {
             OS_ASSET => Some(Self::Fungible(amount)),
@@ -490,12 +564,12 @@ impl Assignment {
 
     pub(crate) fn from_opout_and_state(opout: Opout, state: &AllocatedState) -> Self {
         match state {
-            AllocatedState::Amount(amt) if opout.ty == OS_ASSET => Self::Fungible(amt.as_u64()),
-            AllocatedState::Amount(amt) if opout.ty == OS_INFLATION => {
-                Self::InflationRight(amt.as_u64())
+            AllocatedState::Amount(amt) => {
+                Self::from_fungible(opout.ty, amt.as_u64()).unwrap_or_else(|| unreachable!())
             }
             AllocatedState::Data(_) => Self::NonFungible,
             AllocatedState::Void if opout.ty == OS_LINK => Self::LinkRight,
+            AllocatedState::Void if opout.ty == OS_MINT => Self::MintRight,
             _ => unreachable!(),
         }
     }
@@ -516,7 +590,13 @@ impl Assignment {
                     .checked_add(*amt)
                     .expect("total inflation amount cannot exceed u64::MAX")
             }
-            Self::LinkRight => {}
+            Self::LinkRight => assignments.link = true,
+            Self::MintRight => {
+                assignments.mint = assignments
+                    .mint
+                    .checked_add(1)
+                    .expect("total mint rights cannot exceed u64::MAX")
+            }
             _ => unreachable!("when using this method we should know the assignment type"),
         }
     }
@@ -526,8 +606,9 @@ impl Assignment {
         match self {
             Self::Fungible(_) | Self::NonFungible => Some(RGB_STATE_ASSET_OWNER),
             Self::InflationRight(_) => Some(RGB_STATE_INFLATION_ALLOWANCE),
-            // link rights are not requested through invoices
-            Self::LinkRight | Self::Any => None,
+            Self::LinkRight => Some(RGB_STATE_LINK_RIGHT),
+            Self::MintRight => Some(RGB_STATE_MINT_RIGHT),
+            Self::Any => None,
         }
     }
 
@@ -552,68 +633,19 @@ impl Assignment {
 }
 
 #[cfg(feature = "wallet")]
-impl From<Assignment> for Value {
-    fn from(value: Assignment) -> Self {
-        Value::Json(Some(Box::new(serde_json::to_value(value).unwrap())))
-    }
-}
-
-#[cfg(feature = "wallet")]
-impl TryFrom<Value> for Assignment {
-    type Error = sea_orm::DbErr;
-
-    fn try_from(v: Value) -> Result<Self, Self::Error> {
-        match v {
-            Value::Json(Some(json)) => {
-                serde_json::from_value(*json).map_err(|e| sea_orm::DbErr::Custom(e.to_string()))
-            }
-            _ => Err(sea_orm::DbErr::Type("Expected JSON value".into())),
-        }
-    }
-}
-
-#[cfg(feature = "wallet")]
-impl rgb_lib_migration::ValueType for Assignment {
-    fn type_name() -> String {
-        "json".to_string()
-    }
-
-    fn column_type() -> ColumnType {
-        ColumnType::Json
-    }
-
-    fn array_type() -> ArrayType {
-        ArrayType::Json
-    }
-
-    fn try_from(v: Value) -> Result<Self, ValueTypeErr> {
-        match v {
-            Value::Json(Some(json)) => serde_json::from_value(*json).map_err(|_| ValueTypeErr),
-            _ => Err(ValueTypeErr),
-        }
-    }
-}
-
-#[cfg(feature = "wallet")]
-impl TryGetable for Assignment {
-    fn try_get_by<I: sea_orm::ColIdx>(res: &QueryResult, index: I) -> Result<Self, TryGetError> {
-        let json_value_opt: Option<JsonValue> = res.try_get_by(index)?;
-        match json_value_opt {
-            Some(json_value) => serde_json::from_value(json_value)
-                .map_err(|e| TryGetError::DbErr(DbErr::Type(e.to_string()))),
-            None => Err(TryGetError::Null("Null value for Assignment".to_string())),
-        }
-    }
-}
-
-#[cfg(feature = "wallet")]
-impl Nullable for Assignment {
-    fn null() -> Value {
-        Value::Json(None)
-    }
-}
+impl_json_column!(Assignment);
 
 impl Assignment {
+    /// The assignment of the given fungible `amount` of type `ty`, `None` for assignment types
+    /// unknown to the supported schemas.
+    pub(crate) fn from_fungible(ty: AssignmentType, amount: u64) -> Option<Self> {
+        match ty {
+            OS_ASSET => Some(Self::Fungible(amount)),
+            OS_INFLATION => Some(Self::InflationRight(amount)),
+            _ => None,
+        }
+    }
+
     /// Get the assignment at the given index of the given typed assignments, returning `None` for
     /// assignment types unknown to the supported schemas.
     pub(crate) fn from_typed_assigns<Seal: ExposedSeal>(
@@ -624,39 +656,53 @@ impl Assignment {
         let no = no as usize;
         match typed_assigns {
             TypedAssigns::Fungible(assigns) => {
-                let amount = assigns.get(no)?.state.as_u64();
-                match ty {
-                    OS_ASSET => Some(Self::Fungible(amount)),
-                    OS_INFLATION => Some(Self::InflationRight(amount)),
-                    _ => None,
-                }
+                Self::from_fungible(ty, assigns.get(no)?.state.as_u64())
             }
             TypedAssigns::Structured(assigns) => match ty {
                 OS_ASSET => assigns.get(no).map(|_| Self::NonFungible),
                 _ => None,
             },
-            TypedAssigns::Declarative(_) => None,
+            TypedAssigns::Declarative(assigns) => match ty {
+                OS_LINK => assigns.get(no).map(|_| Self::LinkRight),
+                OS_MINT => assigns.get(no).map(|_| Self::MintRight),
+                _ => None,
+            },
         }
     }
 }
 
 /// Type of RGB transition
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "wallet", derive(EnumIter, DeriveActiveEnum))]
+#[cfg_attr(feature = "wallet", sea_orm(rs_type = "u8", db_type = "TinyUnsigned"))]
 pub enum TypeOfTransition {
     /// Inflation transition (issuing new tokens)
-    Inflate,
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 1))]
+    Inflate = 1,
     /// Transfer transition (moving existing tokens)
-    Transfer,
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 2))]
+    Transfer = 2,
     /// Burn transition (burning existing tokens)
-    Burn,
-    /// Link transition (linking the contract to a child contract)
-    Link,
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 3))]
+    Burn = 3,
+    /// Link transition (spending the link right to link the asset to another contract)
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 4))]
+    Link = 4,
+    /// Mint transition (minting assets backed by tokens locked on the external chain)
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 7))]
+    Mint = 7,
     /// Transfer of inflation rights, by a transition of its own in the bundle of an operation, as
     /// the main transition of the operation (e.g. a transfer) can't move them
-    TransferInflation,
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 5))]
+    TransferInflation = 5,
     /// Transfer of link rights, by a transition of its own in the bundle of an operation, as the
     /// main transition of the operation (e.g. a transfer) can't move them
-    TransferLink,
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 6))]
+    TransferLink = 6,
+    /// Propagation of mint rights: transferring them to other wallets, multiplying them locally,
+    /// to be consumed by mint transitions, or moving them along as extra
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 8))]
+    Propagate = 8,
 }
 
 impl TypeOfTransition {
@@ -667,8 +713,10 @@ impl TypeOfTransition {
             Self::Transfer => "transfer",
             Self::Burn => "burn",
             Self::Link => "link",
+            Self::Mint => "mint",
             Self::TransferInflation => "transferInflation",
             Self::TransferLink => "transferLink",
+            Self::Propagate => "propagate",
         }
     }
 }
@@ -682,12 +730,25 @@ impl TryFrom<TransitionType> for TypeOfTransition {
             TS_INFLATION => Self::Inflate,
             TS_BURN => Self::Burn,
             TS_LINK => Self::Link,
+            TS_MINT => Self::Mint,
             TS_TRANSFER_INFLATION => Self::TransferInflation,
             TS_TRANSFER_LINK => Self::TransferLink,
+            TS_PROPAGATE => Self::Propagate,
             _ => return Err(()),
         })
     }
 }
+
+// The DB representation of a bridge location (see `RgbBridgeLocationInfo`): the location of the
+// bridge contract the genesis of an asset commits to is cached in a JSON column when the asset is
+// saved.
+#[cfg(feature = "wallet")]
+impl_json_column!(RgbBridgeLocationInfo);
+
+// The DB representation of a reject list location (see `RgbRejectListInfo`): the location the
+// genesis of an asset commits to is cached in a JSON column when the asset is saved.
+#[cfg(feature = "wallet")]
+impl_json_column!(RgbRejectListInfo);
 
 #[cfg(all(test, feature = "wallet"))]
 mod tests {
@@ -701,7 +762,6 @@ mod tests {
             let asset_schema_from_schema_id = AssetSchema::from_schema_id(schema_id).unwrap();
             assert_eq!(asset_schema, asset_schema_from_schema_id);
             // the constants match the compiled schemata
-            #[cfg(feature = "_online")]
             assert_eq!(asset_schema.schema_rules().schema_id(), schema_id);
         }
 
@@ -716,6 +776,7 @@ mod tests {
         assert_eq!(AssetSchema::Uda.to_string(), "Uda");
         assert_eq!(AssetSchema::Cfa.to_string(), "Cfa");
         assert_eq!(AssetSchema::Ifa.to_string(), "Ifa");
+        assert_eq!(AssetSchema::Bfa.to_string(), "Bfa");
     }
 
     #[test]
@@ -741,40 +802,13 @@ mod tests {
                 vout: 0,
             },
         };
-        let witness = RecipientTypeFull::Witness {
-            vout: Some(1),
-            recipient_nonce: vec![],
-        };
-        let witness_none = RecipientTypeFull::Witness {
-            vout: None,
-            recipient_nonce: vec![],
-        };
+        let witness = RecipientTypeFull::Witness { vout: Some(1) };
+        let witness_none = RecipientTypeFull::Witness { vout: None };
         for recipient in [blind, witness, witness_none] {
             let value: Value = recipient.clone().into();
             let recovered = RecipientTypeFull::try_from(value).unwrap();
             assert_eq!(recipient, recovered);
         }
-
-        // roundtrip with non-empty nonce
-        let witness_nonce = RecipientTypeFull::Witness {
-            vout: Some(2),
-            recipient_nonce: vec![1, 2, 3, 4],
-        };
-        let value: Value = witness_nonce.clone().into();
-        let recovered = RecipientTypeFull::try_from(value).unwrap();
-        assert_eq!(witness_nonce, recovered);
-
-        // legacy JSON (no recipient_nonce field) deserializes with empty nonce
-        let legacy_json = serde_json::json!({ "Witness": { "vout": null } });
-        let value = Value::Json(Some(Box::new(legacy_json)));
-        let recovered = RecipientTypeFull::try_from(value).unwrap();
-        assert_eq!(
-            recovered,
-            RecipientTypeFull::Witness {
-                vout: None,
-                recipient_nonce: vec![]
-            }
-        );
 
         // try from value: not JSON
         let value = Value::Int(Some(42));
@@ -837,6 +871,8 @@ mod tests {
             Assignment::Fungible(100),
             Assignment::NonFungible,
             Assignment::InflationRight(500),
+            Assignment::LinkRight,
+            Assignment::MintRight,
             Assignment::Any,
         ];
         for assignment in assignments {
@@ -899,6 +935,8 @@ mod tests {
         assert_eq!(Assignment::Fungible(0).main_amount(), 0);
         assert_eq!(Assignment::NonFungible.main_amount(), 1);
         assert_eq!(Assignment::InflationRight(500).main_amount(), 0);
+        assert_eq!(Assignment::LinkRight.main_amount(), 0);
+        assert_eq!(Assignment::MintRight.main_amount(), 0);
         assert_eq!(Assignment::Any.main_amount(), 0);
     }
 

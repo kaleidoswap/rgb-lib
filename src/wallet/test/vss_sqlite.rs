@@ -2,11 +2,10 @@ use super::*;
 use crate::wallet::vss::{PendingAutoBackup, VssBackupClient, VssBackupConfig};
 use bdk_wallet::bitcoin::secp256k1::SecretKey;
 
-fn local_wallet(reuse: bool) -> (tempfile::TempDir, Wallet, crate::keys::Keys) {
+fn local_wallet() -> (tempfile::TempDir, Wallet, crate::keys::Keys) {
     let dir = tempfile::tempdir().unwrap();
     let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
-    let mut data = get_test_wallet_data(dir.path().to_str().unwrap());
-    data.reuse_addresses = reuse;
+    let data = get_test_wallet_data(dir.path().to_str().unwrap());
     let wallet = Wallet::new(data, SinglesigKeys::from_keys(&keys, None)).unwrap();
     (dir, wallet, keys)
 }
@@ -17,7 +16,7 @@ impl RuntimeLockFile {
     fn create(wallet: &Wallet) -> Self {
         let path = wallet
             .get_wallet_dir()
-            .join(crate::utils::RGB_RUNTIME_LOCK_FILE);
+            .join(crate::wallet::utils::RGB_RUNTIME_LOCK_FILE);
         std::fs::write(&path, b"").unwrap();
         Self(path)
     }
@@ -38,12 +37,9 @@ fn config() -> VssBackupConfig {
 }
 
 #[test]
-fn sqlite_snapshot_preserves_committed_bdk_and_pinned_addresses() {
-    let (_dir, mut wallet, keys) = local_wallet(true);
+fn sqlite_snapshot_preserves_committed_bdk() {
+    let (_dir, mut wallet, keys) = local_wallet();
     let initial = wallet.get_address().unwrap();
-    let rotated = wallet.rotate_address(KeychainKind::Internal).unwrap();
-    assert_ne!(initial, rotated);
-    assert_eq!(wallet.get_address().unwrap(), rotated);
     let (bytes, timestamp) = wallet.create_vss_snapshot().unwrap();
     assert!(timestamp > 0);
     // Taking a snapshot alone never marks the live wallet as backed up.
@@ -67,18 +63,16 @@ fn sqlite_snapshot_preserves_committed_bdk_and_pinned_addresses() {
         Some(keys.mnemonic),
     )
     .unwrap();
-    assert!(restored.get_wallet_data().reuse_addresses);
     assert!(!restored.backup_info().unwrap());
-    assert_eq!(restored.get_address().unwrap(), rotated);
-    assert_eq!(
-        restored.rotate_address(KeychainKind::Internal).unwrap(),
-        wallet.rotate_address(KeychainKind::Internal).unwrap()
-    );
+    // the restored BDK data goes on deriving where the wallet was
+    let next = restored.get_address().unwrap();
+    assert_ne!(next, initial);
+    assert_eq!(next, wallet.get_address().unwrap());
 }
 
 #[test]
 fn completed_snapshot_never_marks_a_later_operation_backed_up() {
-    let (_dir, mut wallet, _) = local_wallet(false);
+    let (_dir, mut wallet, _) = local_wallet();
     wallet.get_address().unwrap();
     let (_, timestamp) = wallet.create_vss_snapshot().unwrap();
     wallet.get_address().unwrap();
@@ -109,7 +103,7 @@ fn completed_snapshot_never_marks_a_later_operation_backed_up() {
 
 #[test]
 fn plaintext_configuration_and_upload_are_rejected_before_network_access() {
-    let (_dir, mut wallet, _) = local_wallet(false);
+    let (_dir, mut wallet, _) = local_wallet();
     let config = config().with_encryption(false).with_auto_backup(true);
     assert!(matches!(
         wallet.configure_vss_backup(config.clone()),
@@ -129,7 +123,7 @@ fn plaintext_configuration_and_upload_are_rejected_before_network_access() {
 
 #[test]
 fn auto_backup_queue_retains_the_latest_snapshot_and_ignores_stale_workers() {
-    let (_dir, wallet, _) = local_wallet(false);
+    let (_dir, wallet, _) = local_wallet();
     let client = VssBackupClient::new(config()).unwrap();
     let snapshot = |timestamp| PendingAutoBackup {
         wallet_dir: wallet.get_wallet_dir(),
@@ -159,7 +153,7 @@ fn auto_backup_queue_retains_the_latest_snapshot_and_ignores_stale_workers() {
 
 #[test]
 fn snapshots_wait_for_rgb_writers_and_capture_matching_files_and_database() {
-    let (_dir, wallet, _keys) = local_wallet(false);
+    let (_dir, wallet, _keys) = local_wallet();
     let marker = wallet.get_wallet_dir().join("state-marker");
     std::fs::write(&marker, b"before").unwrap();
     let runtime = wallet.database().state_guard();
@@ -224,7 +218,7 @@ fn snapshots_wait_for_rgb_writers_and_capture_matching_files_and_database() {
 
 #[test]
 fn snapshots_reject_reentrant_capture_and_exclude_transient_runtime_locks() {
-    let (_dir, wallet, keys) = local_wallet(false);
+    let (_dir, wallet, keys) = local_wallet();
     let runtime = RuntimeLockFile::create(&wallet);
     assert!(
         matches!(wallet.create_vss_snapshot(), Err(Error::Internal { details }) if details == "cannot snapshot an active RGB runtime")
@@ -254,7 +248,7 @@ fn snapshots_reject_reentrant_capture_and_exclude_transient_runtime_locks() {
 
 #[test]
 fn queued_auto_backups_do_not_build_intermediate_snapshots() {
-    let (_dir, mut wallet, _) = local_wallet(false);
+    let (_dir, mut wallet, _) = local_wallet();
     wallet.get_address().unwrap();
     let client = Arc::new(VssBackupClient::new(config().with_auto_backup(true)).unwrap());
     let generation = client
@@ -284,7 +278,7 @@ fn queued_auto_backups_do_not_build_intermediate_snapshots() {
 #[test]
 fn failed_publication_does_not_acknowledge_new_wallet_operations() {
     use crate::wallet::vss::publication_tests::{Failure, MockVss};
-    let (_dir, mut wallet, _) = local_wallet(false);
+    let (_dir, mut wallet, _) = local_wallet();
     let server = MockVss::new();
     wallet.get_address().unwrap();
     server
@@ -332,7 +326,7 @@ fn restore_removes_stale_runtime_locks_from_legacy_backups() {
         restore_from_vss,
     };
     use std::io::Write;
-    let (_dir, mut wallet, keys) = local_wallet(true);
+    let (_dir, mut wallet, keys) = local_wallet();
     let address = wallet.get_address().unwrap();
     let (bytes, _) = wallet.create_vss_snapshot().unwrap();
     let mut zip = zip::ZipWriter::new_append(std::io::Cursor::new(bytes)).unwrap();
@@ -385,8 +379,8 @@ fn restore_removes_stale_runtime_locks_from_legacy_backups() {
 #[test]
 fn restore_uses_the_fingerprint_from_its_captured_generation() {
     use crate::wallet::vss::{publication_tests::MockVss, restore_from_vss};
-    let (_dir_a, mut wallet_a, keys_a) = local_wallet(false);
-    let (_dir_b, mut wallet_b, _keys_b) = local_wallet(false);
+    let (_dir_a, mut wallet_a, keys_a) = local_wallet();
+    let (_dir_b, mut wallet_b, _keys_b) = local_wallet();
     wallet_a.get_address().unwrap();
     wallet_b.get_address().unwrap();
     let server = MockVss::new();
@@ -434,7 +428,7 @@ fn restore_uses_the_fingerprint_from_its_captured_generation() {
 
 #[test]
 fn coalesced_requests_preserve_all_blocking_callers_and_release_them_on_completion() {
-    let (_dir, wallet, _) = local_wallet(false);
+    let (_dir, wallet, _) = local_wallet();
     let client = Arc::new(VssBackupClient::new(config()).unwrap());
     let (first_tx, first_rx) = std::sync::mpsc::channel();
     let (second_tx, second_rx) = std::sync::mpsc::channel();

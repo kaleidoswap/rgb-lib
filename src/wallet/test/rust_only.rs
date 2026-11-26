@@ -77,7 +77,10 @@ fn success() {
             .iter()
             .any(|o| o.script_pubkey.is_op_return())
     );
-    assert!(!psbt.proprietary.is_empty());
+    // the RGB data are removed once committed
+    assert!(psbt.proprietary.is_empty());
+    assert!(psbt.inputs.iter().all(|i| i.proprietary.is_empty()));
+    assert!(psbt.outputs.iter().all(|o| o.proprietary.is_empty()));
     let vout = vout + 1;
 
     // check fascia
@@ -123,7 +126,7 @@ fn success() {
     // save consignment to file
     let txid = psbt_copy.unsigned_tx.compute_txid().to_string();
     let transfers_dir = party_send.wallet.get_transfers_dir().join(&txid);
-    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE);
+    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE.as_str());
     std::fs::create_dir_all(&transfers_dir).unwrap();
     assert_eq!(transfers.len(), 1);
     transfers
@@ -140,6 +143,7 @@ fn success() {
             &invoice_id(&txid, &recipient_pk),
             &(now().unix_timestamp() + 3600).to_string(),
             &recipient_pk,
+            1,
             None,
         )
         .unwrap();
@@ -152,7 +156,7 @@ fn success() {
     );
 
     // accept transfer
-    recv_party
+    let (consignment, assignments, _) = recv_party
         .wallet
         .accept_transfer_consignment(
             recv_party.online,
@@ -162,6 +166,8 @@ fn success() {
             blinding,
         )
         .unwrap();
+    assert_eq!(consignment.contract_id().to_string(), asset.asset_id);
+    assert_eq!(assignments, vec![Assignment::Fungible(AMOUNT)]);
 
     // consume fascia
     party_send.wallet.consume_fascia(fascia, None).unwrap();
@@ -388,7 +394,10 @@ fn color_psbt_uda() {
             .iter()
             .any(|o| o.script_pubkey.is_op_return())
     );
-    assert!(!psbt.proprietary.is_empty());
+    // the RGB data are removed once committed
+    assert!(psbt.proprietary.is_empty());
+    assert!(psbt.inputs.iter().all(|i| i.proprietary.is_empty()));
+    assert!(psbt.outputs.iter().all(|o| o.proprietary.is_empty()));
     assert!(
         psbt.unsigned_tx
             .output
@@ -649,7 +658,10 @@ fn accept_transfer_consignment_fail() {
     let mut party = get_empty_party!();
 
     // invalid txid
-    let consignment_path = party.wallet.get_transfers_dir().join(CONSIGNMENT_FILE);
+    let consignment_path = party
+        .wallet
+        .get_transfers_dir()
+        .join(CONSIGNMENT_FILE.as_str());
     let result = party.wallet.accept_transfer_consignment(
         party.online,
         consignment_path,
@@ -668,6 +680,130 @@ fn accept_transfer_consignment_fail() {
         0,
     );
     assert_matches!(result, Err(Error::InvalidFilePath { file_path: m }) if m == "invalidConsignmentPath");
+}
+
+/// Send the whole `amount` of the asset with ID `asset_id` held by `party_send` (on its only UTXO)
+/// to an output of `recv_party`, paid with `color_psbt_and_consume` at a seal with the given
+/// `blinding`. Returns the path of the saved consignment, the TXID and the vout of the colored TX
+/// paying `recv_party`, as `accept_transfer_consignment` takes them.
+#[cfg(feature = "electrum")]
+fn color_psbt_and_save_consignment(
+    party_send: &mut SinglesigParty,
+    recv_party: &mut SinglesigParty,
+    asset_id: &str,
+    amount: u64,
+    blinding: u64,
+) -> (PathBuf, String, u32) {
+    let amt_sat = 500;
+    let address = BdkAddress::from_str(&recv_party.get_address()).unwrap();
+    let mut tx_builder = party_send.wallet.bdk_wallet_mut().build_tx();
+    tx_builder
+        .add_recipient(
+            address.assume_checked().script_pubkey(),
+            BdkAmount::from_sat(amt_sat),
+        )
+        .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
+    let mut psbt = tx_builder.finish().unwrap();
+    let vout = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .position(|o| o.value.to_sat() == amt_sat)
+        .unwrap() as u32;
+    let coloring_info = ColoringInfo {
+        asset_info_map: HashMap::from([(
+            ContractId::from_str(asset_id).unwrap(),
+            AssetColoringInfo {
+                output_map: HashMap::from([(vout, amount)]),
+                static_blinding: Some(blinding),
+            },
+        )]),
+        static_blinding: Some(blinding),
+        nonce: None,
+    };
+    let transfers = party_send
+        .wallet
+        .color_psbt_and_consume(&mut psbt, coloring_info)
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    // the OP_RETURN commitment is added as the first output
+    let vout = vout + 1;
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+    let transfers_dir = party_send.wallet.get_transfers_dir().join(&txid);
+    std::fs::create_dir_all(&transfers_dir).unwrap();
+    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE.as_str());
+    transfers[0].save_file(&consignment_path).unwrap();
+    (consignment_path, txid, vout)
+}
+
+/// Accepting a transfer consignment checks the assignments it receives against the reject list of
+/// the asset, as a refresh does: an allowed assignment shields its history, even when the inputs
+/// of the operation paying it are rejected (which the standalone validation refuses, see
+/// `validate_consignment::reject_list`).
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn accept_transfer_consignment_reject_list() {
+    initialize();
+
+    let blinding = 777;
+    let list_name = "accept_transfer_consignment.list";
+    write_opouts_to_reject_list(list_name, &[]);
+
+    // wallets
+    let mut party_send = get_funded_noutxo_party!();
+    let mut recv_party = get_empty_party!();
+
+    // a single UTXO, holding the issued asset (with no inflation right)
+    party_send.create_utxos(false, Some(1), None, FEE_RATE, None);
+    party_send.send_btc(&recv_party.get_address(), 99_998_200);
+    let asset = party_send.issue_asset_ifa(
+        Some(&[AMOUNT]),
+        Some(&[]),
+        Some(format!("http://localhost:8140/lists/{list_name}")),
+    );
+
+    let (consignment_path, txid, vout) = color_psbt_and_save_consignment(
+        &mut party_send,
+        &mut recv_party,
+        &asset.asset_id,
+        AMOUNT,
+        blinding,
+    );
+    let consignment = RgbTransfer::load_file(&consignment_path).unwrap();
+    let transfer = consignment
+        .bundles
+        .iter()
+        .flat_map(|wb| wb.bundle.known_transitions.iter())
+        .next()
+        .unwrap();
+    let issuance = transfer.transition.inputs().into_iter().next().unwrap();
+    let received = Opout::new(transfer.opid, OS_ASSET, 0);
+
+    let mut accept = || {
+        recv_party.wallet.accept_transfer_consignment(
+            recv_party.online,
+            consignment_path.clone(),
+            txid.clone(),
+            vout,
+            blinding,
+        )
+    };
+
+    // the received assignment rejected
+    write_opouts_to_reject_list(list_name, &[received.to_string()]);
+    let result = accept();
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![received.to_string()]);
+
+    // a rejected ancestor taints the received assignment
+    write_opouts_to_reject_list(list_name, &[issuance.to_string()]);
+    let result = accept();
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![received.to_string()]);
+
+    // an allowed received assignment shields its rejected ancestor
+    write_opouts_to_reject_list(list_name, &[issuance.to_string(), format!("!{received}")]);
+    let (_, assignments, _) = accept().unwrap();
+    assert_eq!(assignments, vec![Assignment::Fungible(AMOUNT)]);
 }
 
 #[cfg(feature = "electrum")]
@@ -1001,7 +1137,7 @@ fn create_consignments_success() {
     let consignment_path = party
         .wallet
         .get_asset_transfer_dir(party.wallet.get_transfers_dir().join(txid), &asset.asset_id)
-        .join(CONSIGNMENT_FILE);
+        .join(CONSIGNMENT_FILE.as_str());
     assert!(consignment_path.is_file());
 }
 
@@ -1193,7 +1329,7 @@ fn color_psbt_and_prepare_consume_round_trip() {
     // the receiver accepts the consignment built before the stash update
     let consignment_dir = recv_party.wallet.get_transfers_dir().join(&txid);
     std::fs::create_dir_all(&consignment_dir).unwrap();
-    let consignment_path = consignment_dir.join(CONSIGNMENT_FILE);
+    let consignment_path = consignment_dir.join(CONSIGNMENT_FILE.as_str());
     loaded.save_file(&consignment_path).unwrap();
     let (_, assignments, _) = recv_party
         .wallet
@@ -6223,7 +6359,7 @@ fn received_consignment_from_base64_success() {
 
     let txid = psbt.unsigned_tx.compute_txid().to_string();
     let transfers_dir = party_send.wallet.get_transfers_dir().join(&txid);
-    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE);
+    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE.as_str());
     std::fs::create_dir_all(&transfers_dir).unwrap();
     transfers
         .first()
@@ -6736,7 +6872,7 @@ fn setup_accept_pin_fixture(
 
     let txid = psbt.unsigned_tx.compute_txid().to_string();
     let transfers_dir = party_send.wallet.get_transfers_dir().join(&txid);
-    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE);
+    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE.as_str());
     std::fs::create_dir_all(&transfers_dir).unwrap();
     transfers
         .first()
@@ -6893,7 +7029,7 @@ fn import_asset_contract_repairs_partial_persistence() {
         // Read metadata from the issuer's stock so the recipient's stock remains untouched. This
         // deterministically models a database commit that completed before the stock write.
         let issuer_txn = issuer.wallet.database().begin_transaction().unwrap();
-        let issuer_stock = issuer.wallet.rgb_stock(&issuer_txn).unwrap();
+        let mut issuer_stock = issuer.wallet.rgb_stock(&issuer_txn).unwrap();
         let txn = database_only_recipient
             .wallet
             .database()
@@ -6903,8 +7039,7 @@ fn import_asset_contract_repairs_partial_persistence() {
             .wallet
             .save_new_asset_internal(
                 &txn,
-                &issuer_stock,
-                contract_id,
+                &mut issuer_stock,
                 AssetSchema::Nia,
                 valid_contract,
                 None,
@@ -7057,7 +7192,7 @@ fn create_consignments_return_path_success() {
             party.wallet.get_transfers_dir().join(&txid),
             &asset.asset_id,
         )
-        .join(CONSIGNMENT_FILE);
+        .join(CONSIGNMENT_FILE.as_str());
     let public_path = party
         .wallet
         .get_send_consignment_path(&asset.asset_id, &txid);

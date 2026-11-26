@@ -13,6 +13,14 @@ mod m20261020_093003_add_pending_witness_indexes;
 mod m20261020_111428_reserved_txo_colored;
 mod m20261020_141856_add_rgb_storage_tables;
 mod m20261020_142324_proxy_v1;
+mod m20261020_142840_asset_transfer_transition;
+mod m20261020_143313_asset_links;
+mod m20261117_104500_asset_reject_list;
+mod m20261117_160000_asset_bridge_location;
+mod m20261124_120000_consignment_extension;
+mod m20261125_120000_invoice_reuse;
+
+pub use m20261124_120000_consignment_extension::Migration as ConsignmentExtensionMigration;
 
 pub struct Migrator;
 
@@ -52,6 +60,12 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_111428_reserved_txo_colored::Migration),
             Box::new(m20261020_141856_add_rgb_storage_tables::Migration),
             Box::new(m20261020_142324_proxy_v1::Migration),
+            Box::new(m20261020_142840_asset_transfer_transition::Migration),
+            Box::new(m20261020_143313_asset_links::Migration),
+            Box::new(m20261117_104500_asset_reject_list::Migration),
+            Box::new(m20261117_160000_asset_bridge_location::Migration),
+            Box::new(m20261124_120000_consignment_extension::Migration),
+            Box::new(m20261125_120000_invoice_reuse::Migration),
         ]
     }
 }

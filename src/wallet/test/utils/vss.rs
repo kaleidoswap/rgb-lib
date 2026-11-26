@@ -101,7 +101,7 @@ pub(crate) struct TransferSummary {
     pub(crate) assignments: Vec<Assignment>,
     pub(crate) recipient_id: Option<String>,
     pub(crate) receive_utxo: Option<Outpoint>,
-    pub(crate) change_utxo: Option<Outpoint>,
+    pub(crate) change_utxos: Vec<Outpoint>,
 }
 
 fn kind_order(kind: &TransferKind) -> u8 {
@@ -113,6 +113,7 @@ fn kind_order(kind: &TransferKind) -> u8 {
         TransferKind::Inflation => 4,
         TransferKind::Burn => 5,
         TransferKind::Link => 6,
+        TransferKind::Mint => 7,
     }
 }
 
@@ -133,7 +134,7 @@ pub(crate) fn summarize_transfers(
             assignments: t.assignments,
             recipient_id: t.recipient_id,
             receive_utxo: t.receive_utxo,
-            change_utxo: t.change_utxo,
+            change_utxos: t.change_utxos,
         })
         .collect())
 }

@@ -13,16 +13,26 @@ pub(crate) mod offline;
 pub(crate) mod online;
 pub mod rust_only;
 pub(crate) mod singlesig;
+pub mod utils;
 #[cfg(feature = "vss")]
 pub mod vss;
 
 #[cfg(test)]
 pub(crate) mod test;
 
-pub use crate::database::enums::TypeOfTransition;
+pub use crate::database::enums::{TypeOfAssignment, TypeOfTransition};
+#[cfg(feature = "_validation")]
 pub use crate::no_wallet::{
-    RgbInputInfo, RgbInspection, RgbOperationInfo, RgbOutputInfo, RgbTransitionInfo,
-    TransitionGlobal, TransitionMetadata,
+    BitcoindAuth, IndexerConfig, IndexerProtocol, SpvProofFill, WitnessWithoutProof,
+};
+pub use crate::no_wallet::{
+    ConsignmentValidation, ValidatedWitness, ValidationOptions, ValidationWarning,
+    WitnessValidationStatus,
+};
+pub use crate::no_wallet::{
+    Invoice, InvoiceData, Outpoint, RecipientInfo, RecipientType, RgbInputInfo, RgbInspection,
+    RgbOperationInfo, RgbOutputInfo, RgbTransitionInfo, TransitionGlobal, TransitionMetadata,
+    TransportEndpoint,
 };
 pub use backup::{BackupSnapshot, SealedBackup, restore_backup, seal_backup};
 pub use multisig::{Cosigner, MultisigKeys, MultisigWallet};
@@ -32,23 +42,22 @@ pub use multisig::{
     OperationInfo, RespondToOperation, UserRole,
 };
 pub use objects::{
-    Address, AssetCFA, AssetFilter, AssetIFA, AssetNIA, AssetUDA, Assets, AssignmentsCollection,
-    Balance, BlockTime, BtcBalance, DatabaseType, EmbeddedMedia, IfaIssuanceType, Invoice,
-    InvoiceData, Media, Metadata, Online, Outpoint, PendingVanillaTx, ProofOfReserves,
-    PsbtInputInfo, PsbtInspection, PsbtOutputInfo, ReceiveData, Recipient, RecipientInfo,
-    RecipientType, RgbAllocation, Token, TokenLight, Transaction, TransactionType, Transfer,
-    TransferKind, TransferScope, TransferTransportEndpoint, TransportEndpoint, Unspent, Utxo,
-    WalletData, WalletDescriptors, WitnessData,
+    Address, AssetBFA, AssetCFA, AssetFilter, AssetIFA, AssetNIA, AssetUDA, Assets,
+    AssignmentsCollection, Balance, BlockTime, BtcBalance, DatabaseType, EmbeddedMedia, Media,
+    Metadata, Online, PendingVanillaTx, ProofOfReserves, PsbtInputInfo, PsbtInspection,
+    PsbtOutputInfo, ReceiveData, ReceivedMint, Recipient, RgbAllocation, Token, TokenLight,
+    Transaction, TransactionType, Transfer, TransferKind, TransferScope, TransferTransportEndpoint,
+    Unspent, Utxo, WalletData, WalletDescriptors, WitnessData,
 };
 #[cfg(feature = "_online")]
 pub use objects::{
-    BitcoindAuth, BurnBeginResult, BurnDetails, IndexerConfig, IndexerProtocol, InflateBeginResult,
-    InflateDetails, OnchainSwapAssetHistory, OnchainSwapCompletion, OnchainSwapConsignment,
-    OnchainSwapExtraOutput, OnchainSwapInput, OnchainSwapLeg, OnchainSwapLegKind, OnchainSwapOffer,
-    OnchainSwapProposal, OnchainSwapReceiveResult, OnchainSwapRequest, OnchainSwapRole,
-    OnchainSwapStage, OnchainSwapSummary, OnlineOptions, OperationResult, RefreshFilter,
-    RefreshResult,
-    RefreshTransferStatus, RefreshedTransfer, SendBeginResult, SendDetails,
+    BurnBeginResult, BurnDetails, EvmChain, InflateBeginResult, InflateDetails, LinkBeginResult,
+    LinkDetails, MintBeginResult, MintDetails, OnchainSwapAssetHistory, OnchainSwapCompletion,
+    OnchainSwapConsignment, OnchainSwapExtraOutput, OnchainSwapInput, OnchainSwapLeg,
+    OnchainSwapLegKind, OnchainSwapOffer, OnchainSwapProposal, OnchainSwapReceiveResult,
+    OnchainSwapRequest, OnchainSwapRole, OnchainSwapStage, OnchainSwapSummary, OnlineOptions,
+    OperationResult, RefreshFilter, RefreshResult, RefreshTransferStatus, RefreshedTransfer,
+    SendBeginResult, SendDetails,
 };
 pub use offline::RgbWalletOpsOffline;
 #[cfg(feature = "_online")]
@@ -68,10 +77,12 @@ pub(crate) use indexer::BitcoindClient;
 pub(crate) use indexer::Indexer;
 #[cfg(feature = "_online")]
 pub(crate) use objects::{
-    AssetInfo, AssetSpend, BeginOperationData, BtcChange, CleanAckOutcome, ConsignmentPayment,
-    FailTransfersOutcome, LocalRecipient, LocalRecipientData, LocalWitnessData, OnlineData,
-    PrepareRgbPsbtResult, PrepareTransferPsbtResult, ProxyReceiveData, ReceiveMatcher, ReceiveMode,
-    ReceivedConsignmentMeta, RefreshResultTrait, RejectList, TryFailBatchTransferOutcome,
+    AssetInfo, AssetSpend, BeginOperationData, BtcChange, ChangeDestination, ChangeSlots,
+    CleanAckOutcome, ConsignmentPayment, ExtraAllocations, FailTransfersOutcome, LocalRecipient,
+    LocalRecipientData, LocalWitnessData, MainTransition, OnlineData, PaymentSeal,
+    PendingMintLocks, PrepareRgbPsbtResult, PrepareTransferPsbtResult, ProxyReceiveData,
+    ReceiveMatcher, ReceiveMode, ReceivedConsignmentMeta, RefreshResultTrait, SavedConsignment,
+    SelectedInputs, SentMint, TakenSlots, TryFailBatchTransferOutcome, WatchedWitnessScript,
 };
 pub(crate) use objects::{
     AssetTransferColoringInfo, InfoAssetTransfer, InfoBatchTransfer, IssueData, IssuedAssetDetails,
@@ -80,15 +91,18 @@ pub(crate) use objects::{
 };
 #[cfg(feature = "_online")]
 pub(crate) use offline::TRANSFER_DATA_FILE;
-#[cfg(feature = "rgb_fs_store_migration")]
 pub(crate) use offline::TRANSFERS_DIR;
 pub(crate) use offline::WalletOffline;
+#[cfg(feature = "_online")]
+pub(crate) use offline::max_utxo_asset_allocations;
 #[cfg(feature = "_online")]
 pub(crate) use online::WalletOnline;
 
 use super::*;
 
-pub(crate) const CONSIGNMENT_FILE: &str = "consignment_out";
+pub(crate) const RGB_BIN_EXTENSION: &str = "rgb";
+pub(crate) static CONSIGNMENT_FILE: LazyLock<String> =
+    LazyLock::new(|| format!("consignment_out.{RGB_BIN_EXTENSION}"));
 pub(crate) const FASCIA_FILE: &str = "fascia";
 pub(crate) const UNSIGNED_PSBT_FILE: &str = "unsigned.psbt";
 
@@ -112,6 +126,16 @@ pub const MAX_EXPIRATION_SECS: u32 = 10 * 365 * 24 * 60 * 60;
 /// update them along with it.
 #[cfg(feature = "_online")]
 pub(crate) const PROXY_CLOCK_SKEW_MARGIN_SECS: u32 = 300;
+
+/// The clock skew margin (see [`PROXY_CLOCK_SKEW_MARGIN_SECS`]), which tests can mock.
+#[cfg(feature = "_online")]
+pub(crate) fn clock_skew_margin() -> u32 {
+    #[cfg(test)]
+    if let Some(margin) = mock_clock_skew_margin() {
+        return margin;
+    }
+    PROXY_CLOCK_SKEW_MARGIN_SECS
+}
 
 /// Minimum time, in seconds, between the expiration of an outgoing operation and the earliest
 /// invoice expiration among its recipients, so the TX can only be released while the recipients
@@ -139,9 +163,6 @@ pub(crate) const CONFIRMATION_MARGIN_SECS: u32 = 86400;
 #[cfg(feature = "_online")]
 pub(crate) const MAX_POW_DIFFICULTY: u32 = 28;
 
-pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
-pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
-pub(crate) const RGB_GLOBAL_LINKED_FROM_CONTRACT: &str = "linkedFromContract";
-#[cfg(feature = "_online")]
-pub(crate) const RGB_GLOBAL_LINKED_TO_CONTRACT: &str = "linkedToContract";
+pub(crate) const RGB_GLOBAL_BRIDGE_LOCATION: &str = "bridgeLocation";
+pub(crate) const RGB_GLOBAL_REJECT_LIST: &str = "rejectList";
 pub(crate) const RGB_GLOBAL_REJECT_LIST_URL: &str = "rejectListUrl";

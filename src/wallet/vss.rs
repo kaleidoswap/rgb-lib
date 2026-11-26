@@ -31,11 +31,11 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
 use crate::error::{Error, InternalError};
-use crate::utils::LOG_FILE;
-use crate::utils::setup_logger;
 use crate::wallet::backup::stream_be32_nonce;
 #[cfg(test)]
 use crate::wallet::core::WALLET_MANIFEST_FILE;
+use crate::wallet::utils::LOG_FILE;
+use crate::wallet::utils::setup_logger;
 
 /// Whether auto-backup uploads block the calling operation or run asynchronously.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1159,7 +1159,7 @@ pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Resu
 
     // Old backups could contain a transient lock from the source process.
     // The target directory is newly extracted and has no live runtime owner.
-    match fs::remove_file(wallet_dir.join(crate::utils::RGB_RUNTIME_LOCK_FILE)) {
+    match fs::remove_file(wallet_dir.join(crate::wallet::utils::RGB_RUNTIME_LOCK_FILE)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),

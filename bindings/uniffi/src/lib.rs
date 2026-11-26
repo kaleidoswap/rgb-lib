@@ -24,46 +24,52 @@ use rgb_lib::wallet::vss::{
     VssBackupInfo, VssBackupMode, restore_from_vss as rgb_lib_restore_from_vss,
 };
 use rgb_lib::{
-    AssetSchema, Assignment as RgbLibAssignment, CloseMethod, ContractId, Encryption,
-    Error as RgbLibError, FileContent, RgbTransfer, TransferStatus, TransportType,
+    AssetSchema, Assignment as RgbLibAssignment, BitcoinNetwork, CloseMethod, ContractId,
+    Encryption, Error as RgbLibError, FileContent, RgbTransfer, TransferStatus, TransportType,
     WalletTransactionType,
     bdk_wallet::bitcoin::{OutPoint as BitcoinOutPoint, Psbt, Txid},
     keys::{Keys, WitnessVersion},
     no_wallet::{
         BundleFilter as RgbLibBundleFilter, ConsignmentInspection as RgbLibConsignmentInspection,
-        RgbGenesisInfo as RgbLibRgbGenesisInfo, RgbMediaInfo,
+        Opout as RgbLibOpout, RgbBridgeLocationInfo as RgbLibRgbBridgeLocationInfo,
+        RgbEvmContractInfo, RgbGenesisInfo as RgbLibRgbGenesisInfo, RgbMediaInfo,
+        RgbRejectListInfo as RgbLibRgbRejectListInfo,
         TransitionMetadata as RgbLibTransitionMetadata,
     },
-    utils::BitcoinNetwork,
     wallet::{
-        Address as RgbLibAddress, AssetCFA, AssetFilter as RgbLibAssetFilter, AssetIFA, AssetNIA,
-        OnchainSwapAssetHistory, OnchainSwapCompletion, OnchainSwapConsignment,
-        OnchainSwapExtraOutput, OnchainSwapInput, OnchainSwapLeg, OnchainSwapLegKind,
-        OnchainSwapOffer, OnchainSwapProposal,
-        OnchainSwapReceiveResult as RgbLibOnchainSwapReceiveResult, OnchainSwapRequest,
-        OnchainSwapRole,
-        AssetUDA, Assets, AssignmentsCollection, Balance, BitcoindAuth as RgbLibBitcoindAuth,
-        BlockTime, BtcBalance, BurnBeginResult, BurnDetails, Cosigner as CosignerData,
-        DatabaseType, EmbeddedMedia, HubInfo, IndexerConfig as RgbLibIndexerConfig,
+        Address as RgbLibAddress, AssetBFA as RgbLibAssetBFA, AssetCFA,
+        AssetFilter as RgbLibAssetFilter, AssetIFA as RgbLibAssetIFA, AssetNIA, AssetUDA,
+        Assets as RgbLibAssets, AssignmentsCollection, Balance, BitcoindAuth as RgbLibBitcoindAuth,
+        BlockTime, BtcBalance, BurnBeginResult, BurnDetails,
+        ConsignmentValidation as RgbLibConsignmentValidation, Cosigner as CosignerData,
+        DatabaseType, EmbeddedMedia, EvmChain, HubInfo, IndexerConfig as RgbLibIndexerConfig,
         IndexerProtocol, InflateBeginResult, InflateDetails, InitOperationResult,
-        Invoice as RgbLibInvoice, InvoiceData as RgbLibInvoiceData, Media, Metadata, MultisigKeys,
+        Invoice as RgbLibInvoice, InvoiceData as RgbLibInvoiceData, LinkBeginResult, LinkDetails,
+        Media, Metadata as RgbLibMetadata, MintBeginResult, MintDetails, MultisigKeys,
         MultisigOnlineOptions, MultisigVotingStatus as RgbLibMultisigVotingStatus,
-        MultisigWallet as RgbLibMultisigWallet, Online, OnlineOptions as RgbLibOnlineOptions,
+        MultisigWallet as RgbLibMultisigWallet, OnchainSwapAssetHistory, OnchainSwapCompletion,
+        OnchainSwapConsignment, OnchainSwapExtraOutput, OnchainSwapInput, OnchainSwapLeg,
+        OnchainSwapLegKind, OnchainSwapOffer, OnchainSwapProposal,
+        OnchainSwapReceiveResult as RgbLibOnchainSwapReceiveResult, OnchainSwapRequest,
+        OnchainSwapRole, Online, OnlineOptions as RgbLibOnlineOptions,
         Operation as RgbLibOperation, OperationInfo as RgbLibOperationInfo, OperationResult,
         Outpoint, PendingVanillaTx, ProofOfReserves, PsbtInputInfo, PsbtInspection, PsbtOutputInfo,
-        ReceiveData, Recipient as RgbLibRecipient, RecipientInfo as RgbLibRecipientInfo,
-        RecipientType, RefreshFilter, RefreshTransferStatus, RefreshedTransfer,
-        RespondToOperation as RgbLibRespondToOperation, RgbAllocation as RgbLibRgbAllocation,
-        RgbInputInfo as RgbLibRgbInputInfo, RgbInspection as RgbLibRgbInspection,
-        RgbOperationInfo as RgbLibRgbOperationInfo, RgbOutputInfo as RgbLibRgbOutputInfo,
-        RgbTransitionInfo as RgbLibRgbTransitionInfo, RgbWalletOpsOffline, RgbWalletOpsOnline,
-        SendBeginResult, SendDetails, SinglesigKeys, SyncKeychain as RgbLibSyncKeychain,
-        SyncOptions as RgbLibSyncOptions, SyncStrategy, Token, TokenLight, Transaction,
-        TransactionType, Transfer as RgbLibTransfer, TransferKind,
-        TransferScope as RgbLibTransferScope, TransferTransportEndpoint,
+        ReceiveData, ReceivedMint, Recipient as RgbLibRecipient,
+        RecipientInfo as RgbLibRecipientInfo, RecipientType, RefreshFilter, RefreshTransferStatus,
+        RefreshedTransfer, RespondToOperation as RgbLibRespondToOperation,
+        RgbAllocation as RgbLibRgbAllocation, RgbInputInfo as RgbLibRgbInputInfo,
+        RgbInspection as RgbLibRgbInspection, RgbOperationInfo as RgbLibRgbOperationInfo,
+        RgbOutputInfo as RgbLibRgbOutputInfo, RgbTransitionInfo as RgbLibRgbTransitionInfo,
+        RgbWalletOpsOffline, RgbWalletOpsOnline, SendBeginResult, SendDetails, SinglesigKeys,
+        SpvProofFill, SyncKeychain as RgbLibSyncKeychain, SyncOptions as RgbLibSyncOptions,
+        SyncStrategy, Token, TokenLight, Transaction, TransactionType, Transfer as RgbLibTransfer,
+        TransferKind, TransferScope as RgbLibTransferScope, TransferTransportEndpoint,
         TransitionGlobal as RgbLibTransitionGlobal, TransportEndpoint as RgbLibTransportEndpoint,
-        TypeOfTransition, Unspent as RgbLibUnspent, UserRole, Utxo, Wallet as RgbLibWallet,
-        WalletData, WalletDescriptors, WitnessData,
+        TypeOfAssignment, TypeOfTransition, Unspent as RgbLibUnspent, UserRole, Utxo,
+        ValidatedWitness as RgbLibValidatedWitness, ValidationOptions,
+        ValidationWarning as RgbLibValidationWarning, Wallet as RgbLibWallet, WalletData,
+        WalletDescriptors, WitnessData, WitnessValidationStatus as RgbLibWitnessValidationStatus,
+        WitnessWithoutProof,
         rust_only::{
             AssetColoringInfo as RgbAssetColoringInfo, ColoringInfo as RgbColoringInfo,
             ExpectedTransfer as RgbExpectedTransfer,
@@ -111,6 +117,7 @@ pub struct OnlineOptions {
     pub vanilla_sync_lookback: u32,
     pub failed_witness_receive_grace_secs: u32,
     pub proxy_auth_keys: HashMap<String, String>,
+    pub evm_chains: HashMap<u64, EvmChain>,
 }
 impl From<OnlineOptions> for RgbLibOnlineOptions {
     fn from(orig: OnlineOptions) -> Self {
@@ -120,6 +127,7 @@ impl From<OnlineOptions> for RgbLibOnlineOptions {
             vanilla_sync_lookback: orig.vanilla_sync_lookback,
             failed_witness_receive_grace_secs: orig.failed_witness_receive_grace_secs,
             proxy_auth_keys: orig.proxy_auth_keys,
+            evm_chains: orig.evm_chains,
         }
     }
 }
@@ -197,6 +205,7 @@ pub enum Assignment {
     NonFungible,
     InflationRight { amount: u64 },
     LinkRight,
+    MintRight,
     Any,
 }
 impl From<RgbLibAssignment> for Assignment {
@@ -206,6 +215,7 @@ impl From<RgbLibAssignment> for Assignment {
             RgbLibAssignment::NonFungible => Assignment::NonFungible,
             RgbLibAssignment::InflationRight(amount) => Assignment::InflationRight { amount },
             RgbLibAssignment::LinkRight => Assignment::LinkRight,
+            RgbLibAssignment::MintRight => Assignment::MintRight,
             RgbLibAssignment::Any => Assignment::Any,
         }
     }
@@ -217,6 +227,7 @@ impl From<Assignment> for RgbLibAssignment {
             Assignment::NonFungible => RgbLibAssignment::NonFungible,
             Assignment::InflationRight { amount } => RgbLibAssignment::InflationRight(amount),
             Assignment::LinkRight => RgbLibAssignment::LinkRight,
+            Assignment::MintRight => RgbLibAssignment::MintRight,
             Assignment::Any => RgbLibAssignment::Any,
         }
     }
@@ -401,9 +412,86 @@ fn save_rgb_transfer(transfer: &RgbTransfer) -> Result<Vec<u8>, RgbLibError> {
     Ok(buf)
 }
 
+pub struct ConsignmentValidation {
+    pub consignment_id: String,
+    pub is_transfer: bool,
+    pub asset_id: String,
+    pub asset_schema: AssetSchema,
+    pub safe_height: Option<u32>,
+    pub witnesses: Vec<ValidatedWitness>,
+    pub warnings: Vec<ValidationWarning>,
+}
+impl From<RgbLibConsignmentValidation> for ConsignmentValidation {
+    fn from(orig: RgbLibConsignmentValidation) -> Self {
+        Self {
+            consignment_id: orig.consignment_id,
+            is_transfer: orig.is_transfer,
+            asset_id: orig.asset_id,
+            asset_schema: orig.asset_schema,
+            safe_height: orig.safe_height,
+            witnesses: orig.witnesses.into_iter().map(|w| w.into()).collect(),
+            warnings: orig.warnings.into_iter().map(|w| w.into()).collect(),
+        }
+    }
+}
+
+pub struct ValidatedWitness {
+    pub txid: String,
+    pub status: WitnessValidationStatus,
+    pub from_consignment: bool,
+}
+impl From<RgbLibValidatedWitness> for ValidatedWitness {
+    fn from(orig: RgbLibValidatedWitness) -> Self {
+        Self {
+            txid: orig.txid,
+            status: orig.status.into(),
+            from_consignment: orig.from_consignment,
+        }
+    }
+}
+
+// temporary solution needed because the UDL Enum and Remote attributes are incompatible with each other
+pub enum WitnessValidationStatus {
+    Mined { height: u32, timestamp: i64 },
+    Tentative,
+    Ignored,
+    Archived,
+}
+impl From<RgbLibWitnessValidationStatus> for WitnessValidationStatus {
+    fn from(orig: RgbLibWitnessValidationStatus) -> Self {
+        match orig {
+            RgbLibWitnessValidationStatus::Mined { height, timestamp } => {
+                WitnessValidationStatus::Mined { height, timestamp }
+            }
+            RgbLibWitnessValidationStatus::Tentative => WitnessValidationStatus::Tentative,
+            RgbLibWitnessValidationStatus::Ignored => WitnessValidationStatus::Ignored,
+            RgbLibWitnessValidationStatus::Archived => WitnessValidationStatus::Archived,
+        }
+    }
+}
+
+// temporary solution needed because the UDL Enum and Remote attributes are incompatible with each other
+pub enum ValidationWarning {
+    UnsafeHistory { txids: Vec<String> },
+    InvalidSpvProof { bundle_id: String, txid: String },
+    Other { details: String },
+}
+impl From<RgbLibValidationWarning> for ValidationWarning {
+    fn from(orig: RgbLibValidationWarning) -> Self {
+        match orig {
+            RgbLibValidationWarning::UnsafeHistory { txids } => {
+                ValidationWarning::UnsafeHistory { txids }
+            }
+            RgbLibValidationWarning::InvalidSpvProof { bundle_id, txid } => {
+                ValidationWarning::InvalidSpvProof { bundle_id, txid }
+            }
+            RgbLibValidationWarning::Other { details } => ValidationWarning::Other { details },
+        }
+    }
+}
+
 pub struct InvoiceData {
     pub recipient_id: String,
-    pub proxy_recipient_id: String,
     pub asset_schema: Option<AssetSchema>,
     pub asset_id: Option<String>,
     pub assignment: Assignment,
@@ -419,7 +507,6 @@ impl From<RgbLibInvoiceData> for InvoiceData {
     fn from(orig: RgbLibInvoiceData) -> Self {
         Self {
             recipient_id: orig.recipient_id,
-            proxy_recipient_id: orig.proxy_recipient_id,
             asset_schema: orig.asset_schema,
             asset_id: orig.asset_id,
             assignment: orig.assignment.into(),
@@ -437,7 +524,6 @@ impl From<InvoiceData> for RgbLibInvoiceData {
     fn from(orig: InvoiceData) -> Self {
         RgbLibInvoiceData {
             recipient_id: orig.recipient_id,
-            proxy_recipient_id: orig.proxy_recipient_id,
             asset_schema: orig.asset_schema,
             asset_id: orig.asset_id,
             assignment: orig.assignment.into(),
@@ -520,9 +606,8 @@ pub struct Transfer {
     pub kind: TransferKind,
     pub txid: Option<String>,
     pub recipient_id: Option<String>,
-    pub proxy_recipient_id: Option<String>,
     pub receive_utxo: Option<Outpoint>,
-    pub change_utxo: Option<Outpoint>,
+    pub change_utxos: Vec<Outpoint>,
     pub expiration_timestamp: Option<u64>,
     pub transport_endpoints: Vec<TransferTransportEndpoint>,
     pub sender_transport_endpoint: Option<String>,
@@ -543,9 +628,8 @@ impl From<RgbLibTransfer> for Transfer {
             kind: orig.kind,
             txid: orig.txid,
             recipient_id: orig.recipient_id,
-            proxy_recipient_id: orig.proxy_recipient_id,
             receive_utxo: orig.receive_utxo,
-            change_utxo: orig.change_utxo,
+            change_utxos: orig.change_utxos,
             expiration_timestamp: orig.expiration_timestamp,
             transport_endpoints: orig.transport_endpoints,
             sender_transport_endpoint: orig.sender_transport_endpoint,
@@ -568,9 +652,8 @@ impl From<Transfer> for RgbLibTransfer {
             kind: orig.kind,
             txid: orig.txid,
             recipient_id: orig.recipient_id,
-            proxy_recipient_id: orig.proxy_recipient_id,
             receive_utxo: orig.receive_utxo,
-            change_utxo: orig.change_utxo,
+            change_utxos: orig.change_utxos,
             expiration_timestamp: orig.expiration_timestamp,
             transport_endpoints: orig.transport_endpoints,
             sender_transport_endpoint: orig.sender_transport_endpoint,
@@ -603,23 +686,49 @@ impl From<Unspent> for RgbLibUnspent {
         }
     }
 }
+pub struct Opout {
+    pub opid: String,
+    pub assignment_type: TypeOfAssignment,
+    pub index: u16,
+}
+impl From<RgbLibOpout> for Opout {
+    fn from(orig: RgbLibOpout) -> Self {
+        Self {
+            opid: orig.opid,
+            assignment_type: orig.assignment_type,
+            index: orig.index,
+        }
+    }
+}
+impl From<Opout> for RgbLibOpout {
+    fn from(orig: Opout) -> Self {
+        Self {
+            opid: orig.opid,
+            assignment_type: orig.assignment_type,
+            index: orig.index,
+        }
+    }
+}
 pub struct RgbInputInfo {
-    pub vin: u32,
-    pub assignment: Assignment,
+    pub opout: Opout,
+    pub vin: Option<u32>,
+    pub assignment: Option<Assignment>,
 }
 impl From<RgbLibRgbInputInfo> for RgbInputInfo {
     fn from(orig: RgbLibRgbInputInfo) -> Self {
         Self {
+            opout: orig.opout.into(),
             vin: orig.vin,
-            assignment: orig.assignment.into(),
+            assignment: orig.assignment.map(|a| a.into()),
         }
     }
 }
 impl From<RgbInputInfo> for RgbLibRgbInputInfo {
     fn from(orig: RgbInputInfo) -> Self {
         Self {
+            opout: orig.opout.into(),
             vin: orig.vin,
-            assignment: orig.assignment.into(),
+            assignment: orig.assignment.map(|a| a.into()),
         }
     }
 }
@@ -666,6 +775,7 @@ pub enum TransitionGlobal {
     BurnedAsset { amount: u64 },
     BurnedInflation { amount: u64 },
     BurnReason { reason: String },
+    LinkedToContract { contract_id: String },
 }
 impl From<RgbLibTransitionGlobal> for TransitionGlobal {
     fn from(orig: RgbLibTransitionGlobal) -> Self {
@@ -678,6 +788,9 @@ impl From<RgbLibTransitionGlobal> for TransitionGlobal {
                 TransitionGlobal::BurnedInflation { amount }
             }
             RgbLibTransitionGlobal::BurnReason(reason) => TransitionGlobal::BurnReason { reason },
+            RgbLibTransitionGlobal::LinkedToContract(contract_id) => {
+                TransitionGlobal::LinkedToContract { contract_id }
+            }
         }
     }
 }
@@ -692,6 +805,9 @@ impl From<TransitionGlobal> for RgbLibTransitionGlobal {
                 RgbLibTransitionGlobal::BurnedInflation(amount)
             }
             TransitionGlobal::BurnReason { reason } => RgbLibTransitionGlobal::BurnReason(reason),
+            TransitionGlobal::LinkedToContract { contract_id } => {
+                RgbLibTransitionGlobal::LinkedToContract(contract_id)
+            }
         }
     }
 }
@@ -711,12 +827,16 @@ impl From<BundleFilter> for RgbLibBundleFilter {
 }
 pub enum TransitionMetadata {
     AllowedInflation { amount: u64 },
+    BeforeBlock { block: u64 },
 }
 impl From<RgbLibTransitionMetadata> for TransitionMetadata {
     fn from(orig: RgbLibTransitionMetadata) -> Self {
         match orig {
             RgbLibTransitionMetadata::AllowedInflation(amount) => {
                 TransitionMetadata::AllowedInflation { amount }
+            }
+            RgbLibTransitionMetadata::BeforeBlock(block) => {
+                TransitionMetadata::BeforeBlock { block }
             }
         }
     }
@@ -726,6 +846,9 @@ impl From<TransitionMetadata> for RgbLibTransitionMetadata {
         match orig {
             TransitionMetadata::AllowedInflation { amount } => {
                 RgbLibTransitionMetadata::AllowedInflation(amount)
+            }
+            TransitionMetadata::BeforeBlock { block } => {
+                RgbLibTransitionMetadata::BeforeBlock(block)
             }
         }
     }
@@ -814,6 +937,167 @@ impl From<RgbInspection> for RgbLibRgbInspection {
         }
     }
 }
+pub enum RgbBridgeLocationInfo {
+    Evm { contract: RgbEvmContractInfo },
+}
+impl From<RgbLibRgbBridgeLocationInfo> for RgbBridgeLocationInfo {
+    fn from(orig: RgbLibRgbBridgeLocationInfo) -> Self {
+        match orig {
+            RgbLibRgbBridgeLocationInfo::Evm(contract) => RgbBridgeLocationInfo::Evm { contract },
+        }
+    }
+}
+impl From<RgbBridgeLocationInfo> for RgbLibRgbBridgeLocationInfo {
+    fn from(orig: RgbBridgeLocationInfo) -> Self {
+        match orig {
+            RgbBridgeLocationInfo::Evm { contract } => RgbLibRgbBridgeLocationInfo::Evm(contract),
+        }
+    }
+}
+pub enum RgbRejectListInfo {
+    Url { url: String },
+    Evm { contract: RgbEvmContractInfo },
+}
+impl From<RgbLibRgbRejectListInfo> for RgbRejectListInfo {
+    fn from(orig: RgbLibRgbRejectListInfo) -> Self {
+        match orig {
+            RgbLibRgbRejectListInfo::Url(url) => RgbRejectListInfo::Url { url },
+            RgbLibRgbRejectListInfo::Evm(contract) => RgbRejectListInfo::Evm { contract },
+        }
+    }
+}
+impl From<RgbRejectListInfo> for RgbLibRgbRejectListInfo {
+    fn from(orig: RgbRejectListInfo) -> Self {
+        match orig {
+            RgbRejectListInfo::Url { url } => RgbLibRgbRejectListInfo::Url(url),
+            RgbRejectListInfo::Evm { contract } => RgbLibRgbRejectListInfo::Evm(contract),
+        }
+    }
+}
+pub struct AssetIFA {
+    pub asset_id: String,
+    pub ticker: String,
+    pub name: String,
+    pub details: Option<String>,
+    pub precision: u8,
+    pub initial_supply: u64,
+    pub max_supply: u64,
+    pub known_circulating_supply: u64,
+    pub timestamp: i64,
+    pub added_at: i64,
+    pub balance: Balance,
+    pub media: Option<Media>,
+    pub reject_list: Option<RgbRejectListInfo>,
+}
+impl From<RgbLibAssetIFA> for AssetIFA {
+    fn from(orig: RgbLibAssetIFA) -> Self {
+        Self {
+            asset_id: orig.asset_id,
+            ticker: orig.ticker,
+            name: orig.name,
+            details: orig.details,
+            precision: orig.precision,
+            initial_supply: orig.initial_supply,
+            max_supply: orig.max_supply,
+            known_circulating_supply: orig.known_circulating_supply,
+            timestamp: orig.timestamp,
+            added_at: orig.added_at,
+            balance: orig.balance,
+            media: orig.media,
+            reject_list: orig.reject_list.map(|l| l.into()),
+        }
+    }
+}
+pub struct AssetBFA {
+    pub asset_id: String,
+    pub ticker: String,
+    pub name: String,
+    pub details: Option<String>,
+    pub precision: u8,
+    pub known_circulating_supply: u64,
+    pub timestamp: i64,
+    pub added_at: i64,
+    pub balance: Balance,
+    pub media: Option<Media>,
+    pub bridge_location: RgbBridgeLocationInfo,
+    pub reject_list: Option<RgbRejectListInfo>,
+}
+impl From<RgbLibAssetBFA> for AssetBFA {
+    fn from(orig: RgbLibAssetBFA) -> Self {
+        Self {
+            asset_id: orig.asset_id,
+            ticker: orig.ticker,
+            name: orig.name,
+            details: orig.details,
+            precision: orig.precision,
+            known_circulating_supply: orig.known_circulating_supply,
+            timestamp: orig.timestamp,
+            added_at: orig.added_at,
+            balance: orig.balance,
+            media: orig.media,
+            bridge_location: orig.bridge_location.into(),
+            reject_list: orig.reject_list.map(|l| l.into()),
+        }
+    }
+}
+pub struct Assets {
+    pub nia: Option<Vec<AssetNIA>>,
+    pub uda: Option<Vec<AssetUDA>>,
+    pub cfa: Option<Vec<AssetCFA>>,
+    pub ifa: Option<Vec<AssetIFA>>,
+    pub bfa: Option<Vec<AssetBFA>>,
+}
+impl From<RgbLibAssets> for Assets {
+    fn from(orig: RgbLibAssets) -> Self {
+        Self {
+            nia: orig.nia,
+            uda: orig.uda,
+            cfa: orig.cfa,
+            ifa: orig
+                .ifa
+                .map(|assets| assets.into_iter().map(|a| a.into()).collect()),
+            bfa: orig
+                .bfa
+                .map(|assets| assets.into_iter().map(|a| a.into()).collect()),
+        }
+    }
+}
+pub struct Metadata {
+    pub asset_schema: AssetSchema,
+    pub initial_supply: u64,
+    pub max_supply: u64,
+    pub known_circulating_supply: u64,
+    pub timestamp: i64,
+    pub name: String,
+    pub precision: u8,
+    pub ticker: Option<String>,
+    pub details: Option<String>,
+    pub token: Option<Token>,
+    pub bridge_location: Option<RgbBridgeLocationInfo>,
+    pub reject_list: Option<RgbRejectListInfo>,
+    pub linked_from_contract: Option<String>,
+    pub linked_to_contract: Option<String>,
+}
+impl From<RgbLibMetadata> for Metadata {
+    fn from(orig: RgbLibMetadata) -> Self {
+        Self {
+            asset_schema: orig.asset_schema,
+            initial_supply: orig.initial_supply,
+            max_supply: orig.max_supply,
+            known_circulating_supply: orig.known_circulating_supply,
+            timestamp: orig.timestamp,
+            name: orig.name,
+            precision: orig.precision,
+            ticker: orig.ticker,
+            details: orig.details,
+            token: orig.token,
+            bridge_location: orig.bridge_location.map(|l| l.into()),
+            reject_list: orig.reject_list.map(|l| l.into()),
+            linked_from_contract: orig.linked_from_contract,
+            linked_to_contract: orig.linked_to_contract,
+        }
+    }
+}
 pub struct RgbGenesisInfo {
     pub chain_net: String,
     pub timestamp: i64,
@@ -822,6 +1106,11 @@ pub struct RgbGenesisInfo {
     pub ticker: Option<String>,
     pub details: Option<String>,
     pub precision: u8,
+    pub issued_supply: Option<u64>,
+    pub max_supply: Option<u64>,
+    pub linked_from_contract: Option<String>,
+    pub bridge_location: Option<RgbBridgeLocationInfo>,
+    pub reject_list: Option<RgbRejectListInfo>,
     pub media: Vec<RgbMediaInfo>,
     pub outputs: Vec<RgbOutputInfo>,
 }
@@ -835,6 +1124,11 @@ impl From<RgbLibRgbGenesisInfo> for RgbGenesisInfo {
             ticker: orig.ticker,
             details: orig.details,
             precision: orig.precision,
+            issued_supply: orig.issued_supply,
+            max_supply: orig.max_supply,
+            linked_from_contract: orig.linked_from_contract,
+            bridge_location: orig.bridge_location.map(|l| l.into()),
+            reject_list: orig.reject_list.map(|l| l.into()),
             media: orig.media,
             outputs: orig.outputs.into_iter().map(|o| o.into()).collect(),
         }
@@ -850,6 +1144,11 @@ impl From<RgbGenesisInfo> for RgbLibRgbGenesisInfo {
             ticker: orig.ticker,
             details: orig.details,
             precision: orig.precision,
+            issued_supply: orig.issued_supply,
+            max_supply: orig.max_supply,
+            linked_from_contract: orig.linked_from_contract,
+            bridge_location: orig.bridge_location.map(|l| l.into()),
+            reject_list: orig.reject_list.map(|l| l.into()),
             media: orig.media,
             outputs: orig.outputs.into_iter().map(|o| o.into()).collect(),
         }
@@ -1332,24 +1631,6 @@ pub struct ValidateConsignmentResult {
     pub details: Option<String>,
 }
 
-fn validate_consignment(
-    file_path: String,
-    indexer_url: String,
-    bitcoin_network: BitcoinNetwork,
-) -> Result<ValidateConsignmentResult, RgbLibError> {
-    let r = rgb_lib::wallet::rust_only::validate_consignment(
-        &file_path,
-        &indexer_url,
-        bitcoin_network,
-    )?;
-    Ok(ValidateConsignmentResult {
-        valid: r.valid,
-        warnings: r.warnings,
-        error: r.error,
-        details: r.details,
-    })
-}
-
 fn validate_consignment_offchain(
     file_path: String,
     txid: String,
@@ -1371,8 +1652,10 @@ fn validate_consignment_offchain(
 }
 
 fn script_hex_from_recipient_id(recipient_id: String) -> Result<Option<String>, RgbLibError> {
-    Ok(rgb_lib::utils::script_buf_from_recipient_id(recipient_id)?
-        .map(|script| script.to_hex_string()))
+    Ok(
+        rgb_lib::no_wallet::script_buf_from_recipient_id(recipient_id)?
+            .map(|script| script.to_hex_string()),
+    )
 }
 
 fn inspect_consignment(
@@ -1381,6 +1664,49 @@ fn inspect_consignment(
 ) -> Result<ConsignmentInspection, RgbLibError> {
     rgb_lib::no_wallet::inspect_consignment(consignment_path, bundle_filter.into())
         .map(|i| i.into())
+}
+
+fn inspect_fascia(
+    psbt: String,
+    fascia_path: String,
+    entropy: Option<u64>,
+    max_fascia_size: u64,
+    max_bundles: u32,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<RgbInspection, RgbLibError> {
+    rgb_lib::no_wallet::inspect_fascia(
+        psbt,
+        fascia_path,
+        entropy,
+        max_fascia_size,
+        max_bundles,
+        bitcoin_network,
+    )
+    .map(|i| i.into())
+}
+
+fn validate_consignment(
+    consignment_path: String,
+    indexer_config: IndexerConfig,
+    evm_rpc_urls: HashMap<u64, String>,
+    min_confirmations: Option<u8>,
+    options: ValidationOptions,
+) -> Result<ConsignmentValidation, RgbLibError> {
+    rgb_lib::no_wallet::validate_consignment(
+        &consignment_path,
+        &indexer_config.into(),
+        &evm_rpc_urls,
+        min_confirmations,
+        &options,
+    )
+    .map(|v| v.into())
+}
+
+fn fill_spv_proofs(
+    consignment_path: String,
+    indexer_config: IndexerConfig,
+) -> Result<SpvProofFill, RgbLibError> {
+    rgb_lib::no_wallet::fill_spv_proofs(&consignment_path, &indexer_config.into())
 }
 
 struct RecipientInfo {
@@ -1565,6 +1891,7 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
+        quota: Option<u32>,
     ) -> Result<ReceiveData, RgbLibError> {
         self._get_wallet().blind_receive(
             online,
@@ -1574,9 +1901,11 @@ impl Wallet {
             transport_endpoints,
             min_confirmations,
             encryption,
+            quota,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn witness_receive(
         &self,
         online: Option<Online>,
@@ -1586,6 +1915,7 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
+        quota: Option<u32>,
     ) -> Result<ReceiveData, RgbLibError> {
         self._get_wallet().witness_receive(
             online,
@@ -1595,6 +1925,7 @@ impl Wallet {
             transport_endpoints,
             min_confirmations,
             encryption,
+            quota,
         )
     }
 
@@ -1673,18 +2004,16 @@ impl Wallet {
         min_confirmations: u8,
         expected: ExpectedTransfer,
     ) -> Result<AcceptTransferResult, RgbLibError> {
-        let (transfer, assignments) = self
-            ._get_wallet()
-            .accept_htlc_consignment(
-                online,
-                consignment,
-                txid,
-                vout,
-                witness_recipient_id,
-                blinding,
-                min_confirmations,
-                expected.into(),
-            )?;
+        let (transfer, assignments) = self._get_wallet().accept_htlc_consignment(
+            online,
+            consignment,
+            txid,
+            vout,
+            witness_recipient_id,
+            blinding,
+            min_confirmations,
+            expected.into(),
+        )?;
         Ok(AcceptTransferResult {
             consignment: save_rgb_transfer(&transfer)?,
             assignments: assignments.into_iter().map(Into::into).collect(),
@@ -1763,6 +2092,15 @@ impl Wallet {
         self._get_wallet().drain_to_end(online, signed_psbt)
     }
 
+    fn export_contract(
+        &self,
+        asset_id: String,
+        destination_dir: String,
+    ) -> Result<String, RgbLibError> {
+        self._get_wallet()
+            .export_contract(asset_id, destination_dir)
+    }
+
     fn fail_transfers(
         &self,
         online: Online,
@@ -1778,16 +2116,6 @@ impl Wallet {
         self._get_wallet().get_address()
     }
 
-    fn rotate_vanilla_address(&self) -> Result<String, RgbLibError> {
-        self._get_wallet()
-            .rotate_address(rgb_lib::bdk_wallet::KeychainKind::Internal)
-    }
-
-    fn rotate_colored_address(&self) -> Result<String, RgbLibError> {
-        self._get_wallet()
-            .rotate_address(rgb_lib::bdk_wallet::KeychainKind::External)
-    }
-
     fn get_asset_balance(&self, asset_id: String) -> Result<Balance, RgbLibError> {
         self._get_wallet().get_asset_balance(asset_id)
     }
@@ -1801,7 +2129,9 @@ impl Wallet {
     }
 
     fn get_asset_metadata(&self, asset_id: String) -> Result<Metadata, RgbLibError> {
-        self._get_wallet().get_asset_metadata(asset_id)
+        self._get_wallet()
+            .get_asset_metadata(asset_id)
+            .map(|m| m.into())
     }
 
     fn get_fee_estimation(&self, online: Online, blocks: u16) -> Result<f64, RgbLibError> {
@@ -1858,6 +2188,15 @@ impl Wallet {
         signed_psbt: String,
     ) -> Result<OperationResult, RgbLibError> {
         self._get_wallet().burn_end(online, signed_psbt)
+    }
+
+    fn import_contract(
+        &self,
+        contract_path: String,
+        media_file_paths: Vec<String>,
+    ) -> Result<(), RgbLibError> {
+        self._get_wallet()
+            .import_contract(contract_path, media_file_paths)
     }
 
     fn inflate(
@@ -1946,6 +2285,7 @@ impl Wallet {
             .issue_asset_cfa(name, details, precision, amounts, file_path)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn issue_asset_ifa(
         &self,
         ticker: String,
@@ -1954,20 +2294,108 @@ impl Wallet {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
     ) -> Result<AssetIFA, RgbLibError> {
-        self._get_wallet().issue_asset_ifa(
-            ticker,
-            name,
-            precision,
-            amounts,
-            inflation_amounts,
-            reject_list_url,
-            None,
+        self._get_wallet()
+            .issue_asset_ifa(
+                ticker,
+                name,
+                precision,
+                amounts,
+                inflation_amounts,
+                reject_list_url,
+                link_right,
+                linked_from_contract,
+                skip_contract_checks,
+            )
+            .map(|a| a.into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn issue_asset_bfa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        mint_rights: u8,
+        chain_id: u64,
+        contract_address: String,
+        reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
+    ) -> Result<AssetBFA, RgbLibError> {
+        self._get_wallet()
+            .issue_asset_bfa(
+                ticker,
+                name,
+                precision,
+                mint_rights,
+                chain_id,
+                contract_address,
+                reject_list_address,
+                link_right,
+                linked_from_contract,
+                skip_contract_checks,
+            )
+            .map(|a| a.into())
+    }
+
+    fn link(
+        &self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        skip_contract_checks: bool,
+    ) -> Result<OperationResult, RgbLibError> {
+        self._get_wallet().link(
+            online,
+            asset_id,
+            linked_to_contract,
+            fee_rate,
+            min_confirmations,
+            skip_contract_checks,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn link_begin(
+        &self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        skip_contract_checks: bool,
+        dry_run: bool,
+    ) -> Result<LinkBeginResult, RgbLibError> {
+        self._get_wallet().link_begin(
+            online,
+            asset_id,
+            linked_to_contract,
+            fee_rate,
+            min_confirmations,
+            skip_contract_checks,
+            dry_run,
+        )
+    }
+
+    fn link_end(
+        &self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, RgbLibError> {
+        self._get_wallet().link_end(online, signed_psbt)
+    }
+
     fn list_assets(&self, filter_asset_schemas: Vec<AssetSchema>) -> Result<Assets, RgbLibError> {
-        self._get_wallet().list_assets(filter_asset_schemas)
+        self._get_wallet()
+            .list_assets(filter_asset_schemas)
+            .map(|a| a.into())
     }
 
     fn list_transactions(
@@ -2003,6 +2431,35 @@ impl Wallet {
             .into_iter()
             .map(|u| u.into())
             .collect())
+    }
+
+    fn mint_begin(
+        &self,
+        online: Online,
+        asset_id: String,
+        recipient: Recipient,
+        before_block: u64,
+        fee_rate: u64,
+        min_confirmations: u8,
+        sender_transport_endpoint: String,
+    ) -> Result<MintBeginResult, RgbLibError> {
+        self._get_wallet().mint_begin(
+            online,
+            asset_id,
+            recipient.into(),
+            before_block,
+            fee_rate,
+            min_confirmations,
+            sender_transport_endpoint,
+        )
+    }
+
+    fn mint_end(
+        &self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, RgbLibError> {
+        self._get_wallet().mint_end(online, signed_psbt)
     }
 
     fn refresh(
@@ -2211,19 +2668,25 @@ impl Wallet {
         self._get_wallet().sync(online, options.into())
     }
 
+    fn get_received_mint(&self, recipient_id: String) -> Result<Vec<ReceivedMint>, RgbLibError> {
+        self._get_wallet().get_received_mint(recipient_id)
+    }
+
     fn inspect_psbt(&self, psbt: String) -> Result<PsbtInspection, RgbLibError> {
         self._get_wallet().inspect_psbt(psbt)
     }
 
-    fn inspect_rgb_transfer(
+    fn inspect_fascia(
         &self,
         psbt: String,
         fascia_path: String,
-        entropy: u64,
+        entropy: Option<u64>,
+        max_fascia_size: u64,
+        max_bundles: u32,
     ) -> Result<RgbInspection, RgbLibError> {
         Ok(self
             ._get_wallet()
-            .inspect_rgb_transfer(psbt, fascia_path, entropy)?
+            .inspect_fascia(psbt, fascia_path, entropy, max_fascia_size, max_bundles)?
             .into())
     }
 
@@ -2453,6 +2916,15 @@ impl MultisigWallet {
             .delete_transfers(batch_transfer_idx, no_asset_only)
     }
 
+    fn export_contract(
+        &self,
+        asset_id: String,
+        destination_dir: String,
+    ) -> Result<String, RgbLibError> {
+        self._get_wallet()
+            .export_contract(asset_id, destination_dir)
+    }
+
     fn fail_transfers(
         &self,
         online: Online,
@@ -2477,7 +2949,9 @@ impl MultisigWallet {
     }
 
     fn get_asset_metadata(&self, asset_id: String) -> Result<Metadata, RgbLibError> {
-        self._get_wallet().get_asset_metadata(asset_id)
+        self._get_wallet()
+            .get_asset_metadata(asset_id)
+            .map(|m| m.into())
     }
 
     fn get_fee_estimation(&self, online: Online, blocks: u16) -> Result<f64, RgbLibError> {
@@ -2589,20 +3063,23 @@ impl MultisigWallet {
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
     ) -> Result<AssetIFA, RgbLibError> {
-        self._get_wallet().issue_asset_ifa(
-            online,
-            ticker,
-            name,
-            precision,
-            amounts,
-            inflation_amounts,
-            reject_list_url,
-            None,
-        )
+        self._get_wallet()
+            .issue_asset_ifa(
+                online,
+                ticker,
+                name,
+                precision,
+                amounts,
+                inflation_amounts,
+                reject_list_url,
+            )
+            .map(|a| a.into())
     }
 
     fn list_assets(&self, filter_asset_schemas: Vec<AssetSchema>) -> Result<Assets, RgbLibError> {
-        self._get_wallet().list_assets(filter_asset_schemas)
+        self._get_wallet()
+            .list_assets(filter_asset_schemas)
+            .map(|a| a.into())
     }
 
     fn list_transactions(
@@ -2711,19 +3188,25 @@ impl MultisigWallet {
             .into())
     }
 
+    fn get_received_mint(&self, recipient_id: String) -> Result<Vec<ReceivedMint>, RgbLibError> {
+        self._get_wallet().get_received_mint(recipient_id)
+    }
+
     fn inspect_psbt(&self, psbt: String) -> Result<PsbtInspection, RgbLibError> {
         self._get_wallet().inspect_psbt(psbt)
     }
 
-    fn inspect_rgb_transfer(
+    fn inspect_fascia(
         &self,
         psbt: String,
         fascia_path: String,
-        entropy: u64,
+        entropy: Option<u64>,
+        max_fascia_size: u64,
+        max_bundles: u32,
     ) -> Result<RgbInspection, RgbLibError> {
         Ok(self
             ._get_wallet()
-            .inspect_rgb_transfer(psbt, fascia_path, entropy)?
+            .inspect_fascia(psbt, fascia_path, entropy, max_fascia_size, max_bundles)?
             .into())
     }
 

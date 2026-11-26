@@ -8,7 +8,6 @@ authors = [
 edition = "2024"
 rust-version = "1.94.0"
 repository = "https://github.com/RGB-Tools/rgb-lib"
-homepage = "https://github.com/RGB-Tools/rgb-lib"
 license = "MIT"
 description = "RGB wallet library"
 exclude = ["migration"]
@@ -32,6 +31,12 @@ bdk_electrum = { version = "0.24.1", optional = true, default-features = false, 
 ] }
 bdk_esplora = { version = "0.22.3", optional = true, default-features = false, features = [
     "blocking-https-rustls",
+] }
+# the bitcoin crate the RGB (and BDK) ones depend on: it's declared to enable its base64 feature,
+# which parsing a PSBT from its string needs also without the wallet (bdk_wallet enables it)
+bitcoin = { version = "0.32.102", default-features = false, features = [
+    "base64",
+    "std",
 ] }
 chacha20poly1305 = { version = "0.11.0", optional = true, default-features = false, features = [
     "alloc",
@@ -128,6 +133,7 @@ secp256k1_musig = { package = "secp256k1", version = "0.33.1", default-features 
     "std",
 ] }
 serial_test = { version = "4.0", default-features = false }
+tempfile = { version = "3.27.0", default-features = false }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
@@ -146,13 +152,14 @@ features = ["rustls"]
 default = ["wallet", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration"]
 all = ["wallet", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration", "vss"]
 # the wallet functionality; without it only the APIs that don't need a wallet (e.g. consignment
-# inspection) are available, pulling in just the RGB crates and few other lightweight dependencies
+# inspection and validation with resolvers provided by the caller, or with an indexer with an
+# indexer validation feature) are available, pulling in just the RGB crates and few other
+# lightweight dependencies
 wallet = [
     "dep:base64",
     "dep:bdk_wallet",
     "dep:chacha20poly1305",
     "dep:ed25519-dalek",
-    "dep:x25519-dalek",
     "dep:hkdf",
     "dep:hmac",
     "dep:sha2",
@@ -182,25 +189,41 @@ bdk_file_store_migration = ["wallet", "bdk_wallet/file_store"]
 # data moved into the rgb-lib DB; only needed to upgrade such wallets, so it can be turned off to
 # drop the legacy formats support of rgb-ops
 rgb_fs_store_migration = ["wallet", "rgb-ops/legacy"]
-# implied by each indexer feature, marking a build that can reach the network; it exists only to
-# avoid repeating the list of indexer features in cfgs and must not be enabled on its own
-_online = ["wallet"]
+# implied by each indexer feature, marking a build whose wallet can reach the network; it exists
+# only to avoid repeating the list of indexer features in cfgs and must not be enabled on its own
+_online = ["wallet", "dep:x25519-dalek"]
+# implied by each indexer validation feature, marking a build that can validate consignments
+# reaching the network; it exists only to avoid repeating the list of indexer validation features
+# in cfgs and must not be enabled on its own
+_validation = ["reqwest"]
+# support for an indexer, to use it with an online wallet (enabling the wallet functionality)
 bitcoind = [
     "_online",
+    "bitcoind_validation",
     "bdk_bitcoind_rpc",
-    "reqwest",
-    "rgb-ops/bitcoind_blocking",
 ]
 electrum = [
     "_online",
+    "electrum_validation",
     "bdk_electrum",
-    "reqwest",
-    "rgb-ops/electrum_blocking",
 ]
 esplora = [
     "_online",
+    "esplora_validation",
     "bdk_esplora",
-    "reqwest",
+]
+# support for an indexer, only to validate consignments (not enabling the wallet functionality)
+bitcoind_validation = [
+    "_validation",
+    "rgb-ops/bitcoind_blocking",
+]
+electrum_validation = [
+    "_validation",
+    "dep:rustls",
+    "rgb-ops/electrum_blocking",
+]
+esplora_validation = [
+    "_validation",
     "rgb-ops/esplora_blocking",
 ]
 vss = ["wallet", "dep:vss-client", "dep:hkdf", "dep:sha2", "dep:parking_lot", "tokio/rt"]

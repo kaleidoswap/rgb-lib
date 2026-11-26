@@ -14,13 +14,6 @@ namespace rgb_lib {
   string? script_hex_from_recipient_id(string recipient_id);
 
   [Throws=RgbLibError]
-  ValidateConsignmentResult validate_consignment(
-    string file_path,
-    string indexer_url,
-    BitcoinNetwork bitcoin_network
-  );
-
-  [Throws=RgbLibError]
   ValidateConsignmentResult validate_consignment_offchain(
     string file_path,
     string txid,
@@ -36,6 +29,18 @@ namespace rgb_lib {
 
   [Throws=RgbLibError]
   ConsignmentInspection inspect_consignment(string consignment_path, BundleFilter bundle_filter);
+
+  [Throws=RgbLibError]
+  RgbInspection inspect_fascia(string psbt, string fascia_path, u64? entropy,
+    u64 max_fascia_size, u32 max_bundles, BitcoinNetwork bitcoin_network);
+
+  [Throws=RgbLibError]
+  ConsignmentValidation validate_consignment(string consignment_path,
+    IndexerConfig indexer_config, record<u64, string> evm_rpc_urls, u8? min_confirmations,
+    ValidationOptions options);
+
+  [Throws=RgbLibError]
+  SpvProofFill fill_spv_proofs(string consignment_path, IndexerConfig indexer_config);
 };
 
 [Error, Remote]
@@ -47,8 +52,8 @@ interface RgbLibError {
   VssEncryptionRequired();
   BatchTransferAlreadyExists(string txid, i32 idx);
   UnsafeTransferHistory(string details);
-  AddressReuseDisabled();
   AllocationsAlreadyAvailable();
+  AssetAlreadyKnown(string asset_id);
   AssetNotFound(string asset_id);
   BatchTransferNotFound(i32 idx);
   BitcoinNetworkMismatch();
@@ -60,17 +65,22 @@ interface RgbLibError {
   CannotEstimateFees();
   CannotFailBatchTransfer();
   CannotFinalizePsbt();
+  CannotLinkToItself();
   CannotProvideOutOfBandAck(string details);
   CannotProvideOutOfBandConsignment(string details);
-  CannotUseIfaOnMainnet();
+  CannotUseSchemaOnMainnet(AssetSchema asset_schema);
+  ConsignmentRejected(sequence<string> opouts);
+  ConsignmentValidationFailed(string details);
   Database(string details);
   DuplicateProxyAuthKey(string details);
   EmptyFile(string file_path);
+  EvmChainIdMismatch(u64 expected, u64 actual);
   ExpirationInvalid();
   FailedBdkSync(string details);
   FailedBroadcast(string details);
   FailedIssuance(string details);
   FileAlreadyExists(string path);
+  FileTooLarge(string file_path, u64 max_size);
   FingerprintMismatch();
   PsbtOperationNotFound(string operation_id);
   HashMismatch();
@@ -88,6 +98,7 @@ interface RgbLibError {
   InvalidAmountZero();
   InvalidAssignment();
   InvalidAttachments(string details);
+  InvalidBeforeBlock(string details);
   InvalidBitcoinKeys();
   InvalidBitcoinNetwork(string network);
   InvalidBurnReason(string details);
@@ -95,12 +106,17 @@ interface RgbLibError {
   InvalidConsignment();
   InvalidContractLink(string details);
   InvalidContentSignature();
+  InvalidContract(string file_path);
+  InvalidContractId(string contract_id);
   InvalidCosigner(string details);
   InvalidDetails(string details);
   InvalidElectrum(string details);
   InvalidEncryptedBlob(string details);
   InvalidEndpointAuthSignature();
   InvalidEstimationBlocks();
+  InvalidEvmChain(string details);
+  InvalidEvmContractAddress(string details);
+  InvalidEvmRpcUrl(string details);
   InvalidExpiration();
   InvalidFeeRate(string details);
   InvalidFilePath(string file_path);
@@ -108,6 +124,7 @@ interface RgbLibError {
   InvalidPsbtOperationStatus(string details);
   InvalidIndexer(string details);
   InvalidInvoice(string details);
+  InvalidLinkedContract(string contract_id, string details);
   InvalidMnemonic(string details);
   InvalidMultisigThreshold(u8 required, u8 total);
   InvalidName(string details);
@@ -117,6 +134,7 @@ interface RgbLibError {
   InvalidProxyProtocol(string version);
   InvalidPsbt(string details);
   InvalidPubkey(string details);
+  InvalidQuota(string details);
   InvalidRecipientData(string details);
   InvalidRecipientID();
   InvalidRecipientMap();
@@ -132,8 +150,11 @@ interface RgbLibError {
   InvoiceExpired();
   InvoiceNotReserved();
   InvoiceQuotaExceeded();
+  LastMintRight();
   MaxFeeExceeded(string txid);
   MinFeeNotMet(string txid);
+  MintLockExpired(string opid, u64 before_block);
+  MintLockNotFound(string opid);
   MultisigCannotMarkOperationProcessed(string details);
   MultisigCannotRespondToOperation(string details);
   MultisigHubService(string details);
@@ -144,17 +165,22 @@ interface RgbLibError {
   MultisigUnexpectedData(string details);
   MultisigUserNotCosigner();
   Network(string details);
+  NoClaimResolver();
   NoBurnAmount();
   NoConsignment();
   NoCosignersSupplied();
+  NoEvmRpcUrl(u64 chain_id);
   NoInflationAmounts();
   NoIssuanceAmounts();
   NoKeysSupplied();
   NoMaxAllocationsPerUtxo();
   NoMedia();
+  NoMintRights();
+  NoRejectListResolver();
   NoSupportedSchemas();
   NoValidTransportEndpoint();
   Offline();
+  OffchainTxidNotFound(string txid);
   OnlineNeeded();
   OperationExpired();
   OperationNotFound();
@@ -178,6 +204,7 @@ interface RgbLibError {
   TooManySignaturesInPsbt();
   TransferIDDeleted();
   TransferIDInUse();
+  UnknownLinkedContract(string contract_id);
   UnknownRgbSchema(string schema_id);
   UnknownTransfer(string txid);
   UnexpectedTransfer(string details);
@@ -185,6 +212,8 @@ interface RgbLibError {
   UnsupportedBurn(AssetSchema asset_schema);
   UnsupportedInflation(AssetSchema asset_schema);
   UnsupportedLayer1(string layer_1);
+  UnsupportedLink(AssetSchema asset_schema);
+  UnsupportedMint(AssetSchema asset_schema);
   UnsupportedSchema(AssetSchema asset_schema);
   UnsupportedTransportType();
   UnsupportedWalletManifestVersion(string version);
@@ -202,6 +231,7 @@ enum AssetSchema {
   "Uda",
   "Cfa",
   "Ifa",
+  "Bfa",
 };
 
 [Remote]
@@ -264,7 +294,6 @@ dictionary AssetCFA {
   Media? media;
 };
 
-[Remote]
 dictionary AssetIFA {
   string asset_id;
   string ticker;
@@ -278,18 +307,30 @@ dictionary AssetIFA {
   i64 added_at;
   Balance balance;
   Media? media;
-  string? reject_list_url;
-  Outpoint? issuance_link_right_outpoint;
-  string? linked_from_asset_id;
-  string? linked_to_asset_id;
+  RgbRejectListInfo? reject_list;
 };
 
-[Remote]
+dictionary AssetBFA {
+  string asset_id;
+  string ticker;
+  string name;
+  string? details;
+  u8 precision;
+  u64 known_circulating_supply;
+  i64 timestamp;
+  i64 added_at;
+  Balance balance;
+  Media? media;
+  RgbBridgeLocationInfo bridge_location;
+  RgbRejectListInfo? reject_list;
+};
+
 dictionary Assets {
   sequence<AssetNIA>? nia;
   sequence<AssetUDA>? uda;
   sequence<AssetCFA>? cfa;
   sequence<AssetIFA>? ifa;
+  sequence<AssetBFA>? bfa;
 };
 
 [Remote]
@@ -491,6 +532,7 @@ interface Assignment {
   NonFungible();
   InflationRight(u64 amount);
   LinkRight();
+  MintRight();
   Any();
 };
 
@@ -499,11 +541,12 @@ dictionary AssignmentsCollection {
   u64 fungible;
   boolean non_fungible;
   u64 inflation;
+  boolean link;
+  u64 mint;
 };
 
 dictionary InvoiceData {
   string recipient_id;
-  string proxy_recipient_id;
   AssetSchema? asset_schema;
   string? asset_id;
   Assignment assignment;
@@ -557,7 +600,6 @@ dictionary Token {
     ProofOfReserves? reserves;
 };
 
-[Remote]
 dictionary Metadata {
   AssetSchema asset_schema;
   u64 initial_supply;
@@ -569,10 +611,10 @@ dictionary Metadata {
   string? ticker;
   string? details;
   Token? token;
-  string? reject_list_url;
-  string? linked_from_asset_id;
-  string? linked_to_asset_id;
-  Outpoint? unspent_link_right_outpoint;
+  RgbBridgeLocationInfo? bridge_location;
+  RgbRejectListInfo? reject_list;
+  string? linked_from_contract;
+  string? linked_to_contract;
 };
 
 [Remote]
@@ -600,12 +642,20 @@ enum IndexerProtocol {
   "Esplora",
 };
 
+[Remote]
+dictionary EvmChain {
+  string rpc_url;
+  u64 min_mint_lock_blocks;
+  u64 max_mint_lock_blocks;
+};
+
 dictionary OnlineOptions {
   IndexerConfig indexer_config;
   boolean skip_consistency_check;
   u32 vanilla_sync_lookback;
   u32 failed_witness_receive_grace_secs;
   record<string, string> proxy_auth_keys;
+  record<u64, EvmChain> evm_chains;
 };
 
 [Remote]
@@ -685,6 +735,7 @@ enum TransferKind {
   "Inflation",
   "Burn",
   "Link",
+  "Mint",
 };
 
 [Remote]
@@ -754,9 +805,8 @@ dictionary Transfer {
   TransferKind kind;
   string? txid;
   string? recipient_id;
-  string? proxy_recipient_id;
   Outpoint? receive_utxo;
-  Outpoint? change_utxo;
+  sequence<Outpoint> change_utxos;
   u64? expiration_timestamp;
   sequence<TransferTransportEndpoint> transport_endpoints;
   string? sender_transport_endpoint;
@@ -787,7 +837,7 @@ dictionary WalletData {
   DatabaseType database_type;
   u32 max_allocations_per_utxo;
   sequence<AssetSchema> supported_schemas;
-  boolean reuse_addresses;
+  boolean allow_reckless_schemas;
 };
 
 [Remote]
@@ -850,6 +900,45 @@ dictionary InflateBeginResult {
   string psbt;
   i32? batch_transfer_idx;
   InflateDetails details;
+};
+
+[Remote]
+dictionary LinkDetails {
+  string fascia_path;
+  u8 min_confirmations;
+  u64 entropy;
+};
+
+[Remote]
+dictionary LinkBeginResult {
+  string psbt;
+  i32? batch_transfer_idx;
+  LinkDetails details;
+};
+
+[Remote]
+dictionary MintDetails {
+  string fascia_path;
+  u8 min_confirmations;
+  u64 entropy;
+  string opid;
+};
+
+[Remote]
+dictionary MintBeginResult {
+  string psbt;
+  i32 batch_transfer_idx;
+  MintDetails details;
+};
+
+[Remote]
+dictionary ReceivedMint {
+  string opid;
+  string lock_id;
+  u64 amount;
+  u64 before_block;
+  u64 evm_chain_id;
+  string bridge_contract;
 };
 
 [Remote]
@@ -936,9 +1025,17 @@ dictionary PsbtInspection {
 };
 
 [Remote]
+dictionary Opout {
+  string opid;
+  TypeOfAssignment assignment_type;
+  u16 index;
+};
+
+[Remote]
 dictionary RgbInputInfo {
-  u32 vin;
-  Assignment assignment;
+  Opout opout;
+  u32? vin;
+  Assignment? assignment;
 };
 
 [Remote]
@@ -962,13 +1059,23 @@ dictionary RgbOperationInfo {
 };
 
 [Remote]
+enum TypeOfAssignment {
+  "Asset",
+  "InflationRight",
+  "LinkRight",
+  "MintRight",
+};
+
+[Remote]
 enum TypeOfTransition {
   "Inflate",
   "Transfer",
   "Burn",
   "Link",
+  "Mint",
   "TransferInflation",
   "TransferLink",
+  "Propagate",
 };
 
 [Remote]
@@ -983,6 +1090,7 @@ interface TransitionGlobal {
   BurnedAsset(u64 amount);
   BurnedInflation(u64 amount);
   BurnReason(string reason);
+  LinkedToContract(string contract_id);
 };
 
 [Enum]
@@ -995,6 +1103,7 @@ interface BundleFilter {
 [Enum]
 interface TransitionMetadata {
   AllowedInflation(u64 amount);
+  BeforeBlock(u64 block);
 };
 
 [Remote]
@@ -1125,6 +1234,23 @@ dictionary RgbMediaInfo {
 };
 
 [Remote]
+dictionary RgbEvmContractInfo {
+  u64 chain_id;
+  string address;
+};
+
+[Enum]
+interface RgbBridgeLocationInfo {
+  Evm(RgbEvmContractInfo contract);
+};
+
+[Enum]
+interface RgbRejectListInfo {
+  Url(string url);
+  Evm(RgbEvmContractInfo contract);
+};
+
+[Remote]
 dictionary RgbGenesisInfo {
   string chain_net;
   i64 timestamp;
@@ -1133,8 +1259,62 @@ dictionary RgbGenesisInfo {
   string? ticker;
   string? details;
   u8 precision;
+  u64? issued_supply;
+  u64? max_supply;
+  string? linked_from_contract;
+  RgbBridgeLocationInfo? bridge_location;
+  RgbRejectListInfo? reject_list;
   sequence<RgbMediaInfo> media;
   sequence<RgbOutputInfo> outputs;
+};
+
+[Remote]
+dictionary ValidationOptions {
+  BitcoinNetwork bitcoin_network;
+  string? offchain_txid;
+};
+
+dictionary ConsignmentValidation {
+  string consignment_id;
+  boolean is_transfer;
+  string asset_id;
+  AssetSchema asset_schema;
+  u32? safe_height;
+  sequence<ValidatedWitness> witnesses;
+  sequence<ValidationWarning> warnings;
+};
+
+dictionary ValidatedWitness {
+  string txid;
+  WitnessValidationStatus status;
+  boolean from_consignment;
+};
+
+[Enum]
+interface WitnessValidationStatus {
+  Mined(u32 height, i64 timestamp);
+  Tentative();
+  Ignored();
+  Archived();
+};
+
+[Enum]
+interface ValidationWarning {
+  UnsafeHistory(sequence<string> txids);
+  InvalidSpvProof(string bundle_id, string txid);
+  Other(string details);
+};
+
+[Remote]
+dictionary SpvProofFill {
+  sequence<WitnessWithoutProof> without_proof;
+  boolean rewritten;
+};
+
+[Remote]
+dictionary WitnessWithoutProof {
+  string txid;
+  string details;
 };
 
 [Remote]
@@ -1226,11 +1406,15 @@ interface Wallet {
   string get_media_dir();
 
   [Throws=RgbLibError]
+  sequence<ReceivedMint> get_received_mint(string recipient_id);
+
+  [Throws=RgbLibError]
   PsbtInspection inspect_psbt(string psbt);
 
   [Throws=RgbLibError]
-  RgbInspection inspect_rgb_transfer(
-    string psbt, string fascia_path, u64 entropy);
+  RgbInspection inspect_fascia(
+    string psbt, string fascia_path, u64? entropy, u64 max_fascia_size,
+    u32 max_bundles);
 
   [Throws=RgbLibError]
   void backup(string backup_path, string password);
@@ -1241,12 +1425,14 @@ interface Wallet {
   [Throws=RgbLibError]
   ReceiveData blind_receive(
     Online? online, string? asset_id, Assignment assignment, u64 expiration_timestamp,
-    sequence<string> transport_endpoints, u8 min_confirmations, Encryption? encryption);
+    sequence<string> transport_endpoints, u8 min_confirmations, Encryption? encryption,
+    u32? quota);
 
   [Throws=RgbLibError]
   ReceiveData witness_receive(
     Online? online, string? asset_id, Assignment assignment, u64 expiration_timestamp,
-    sequence<string> transport_endpoints, u8 min_confirmations, Encryption? encryption);
+    sequence<string> transport_endpoints, u8 min_confirmations, Encryption? encryption,
+    u32? quota);
 
   // High-level HTLC color lifecycle (final vout output_map only).
   // prepare → sign/broadcast → apply. abort if never broadcast. reconcile for status.
@@ -1327,18 +1513,15 @@ interface Wallet {
   string drain_to_end(Online online, string signed_psbt);
 
   [Throws=RgbLibError]
+  string export_contract(string asset_id, string destination_dir);
+
+  [Throws=RgbLibError]
   boolean fail_transfers(
     Online online, i32? batch_transfer_idx, boolean no_asset_only,
     boolean skip_sync);
 
   [Throws=RgbLibError]
   string get_address();
-
-  [Throws=RgbLibError]
-  string rotate_vanilla_address();
-
-  [Throws=RgbLibError]
-  string rotate_colored_address();
 
   [Throws=RgbLibError]
   Balance get_asset_balance(string asset_id);
@@ -1367,6 +1550,9 @@ interface Wallet {
 
   [Throws=RgbLibError]
   OperationResult burn_end(Online online, string signed_psbt);
+
+  [Throws=RgbLibError]
+  void import_contract(string contract_path, sequence<string> media_file_paths);
 
   [Throws=RgbLibError]
   OperationResult inflate(
@@ -1398,7 +1584,27 @@ interface Wallet {
   [Throws=RgbLibError]
   AssetIFA issue_asset_ifa(
     string ticker, string name, u8 precision, sequence<u64> amounts,
-    sequence<u64> inflation_amounts, string? reject_list_url);
+    sequence<u64> inflation_amounts, string? reject_list_url, boolean link_right,
+    string? linked_from_contract, boolean skip_contract_checks);
+
+  [Throws=RgbLibError]
+  AssetBFA issue_asset_bfa(
+    string ticker, string name, u8 precision, u8 mint_rights, u64 chain_id,
+    string contract_address, string? reject_list_address, boolean link_right,
+    string? linked_from_contract, boolean skip_contract_checks);
+
+  [Throws=RgbLibError]
+  OperationResult link(
+    Online online, string asset_id, string linked_to_contract, u64 fee_rate,
+    u8 min_confirmations, boolean skip_contract_checks);
+
+  [Throws=RgbLibError]
+  LinkBeginResult link_begin(
+    Online online, string asset_id, string linked_to_contract, u64 fee_rate,
+    u8 min_confirmations, boolean skip_contract_checks, boolean dry_run);
+
+  [Throws=RgbLibError]
+  OperationResult link_end(Online online, string signed_psbt);
 
   [Throws=RgbLibError]
   Assets list_assets(sequence<AssetSchema> filter_asset_schemas);
@@ -1412,6 +1618,14 @@ interface Wallet {
   [Throws=RgbLibError]
   sequence<Unspent> list_unspents(
     Online? online, boolean settled_only, boolean skip_sync);
+
+  [Throws=RgbLibError]
+  MintBeginResult mint_begin(
+    Online online, string asset_id, Recipient recipient, u64 before_block,
+    u64 fee_rate, u8 min_confirmations, string sender_transport_endpoint);
+
+  [Throws=RgbLibError]
+  OperationResult mint_end(Online online, string signed_psbt);
 
   [Throws=RgbLibError]
   record<i32, RefreshedTransfer> refresh(
@@ -1525,11 +1739,15 @@ interface MultisigWallet {
   string get_media_dir();
 
   [Throws=RgbLibError]
+  sequence<ReceivedMint> get_received_mint(string recipient_id);
+
+  [Throws=RgbLibError]
   PsbtInspection inspect_psbt(string psbt);
 
   [Throws=RgbLibError]
-  RgbInspection inspect_rgb_transfer(
-    string psbt, string fascia_path, u64 entropy);
+  RgbInspection inspect_fascia(
+    string psbt, string fascia_path, u64? entropy, u64 max_fascia_size,
+    u32 max_bundles);
 
   [Throws=RgbLibError]
   void backup(string backup_path, string password);
@@ -1557,6 +1775,9 @@ interface MultisigWallet {
 
   [Throws=RgbLibError]
   boolean delete_transfers(i32? batch_transfer_idx, boolean no_asset_only);
+
+  [Throws=RgbLibError]
+  string export_contract(string asset_id, string destination_dir);
 
   [Throws=RgbLibError]
   boolean fail_transfers(

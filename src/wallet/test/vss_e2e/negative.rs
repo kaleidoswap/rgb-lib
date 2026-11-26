@@ -142,6 +142,7 @@ fn scenario_4_1_wrong_signing_key_restore_fails_and_writes_no_wallet_data() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .expect("witness_receive");
     let recipient_map = HashMap::from([(
@@ -290,7 +291,7 @@ fn scenario_4_3_wrong_url_vss_backup_fails_and_keeps_backup_info() {
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: vec![AssetSchema::Nia],
-            reuse_addresses: false,
+            allow_reckless_schemas: false,
         },
         wallet_keys,
     )

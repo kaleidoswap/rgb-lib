@@ -445,9 +445,9 @@ pub(crate) fn wait_indexers_sync() {
         max_blockcount = std::cmp::max(blockcount, max_blockcount);
     }
     // bitcoind is queried directly, so there is no indexer to wait for
-    #[cfg(not(feature = "_online"))]
+    #[cfg(not(any(feature = "electrum", feature = "esplora")))]
     let _ = (t_0, max_blockcount);
-    #[cfg(feature = "_online")]
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let mut all_synced = true;

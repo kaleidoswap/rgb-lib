@@ -1,19 +1,5 @@
 use super::*;
 
-/// Panic if the given expression doesn't match the provided pattern, logging the unexpected result
-#[macro_export]
-macro_rules! assert_matches {
-    ($expression:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {{
-        #[allow(unreachable_patterns)]
-        match $expression {
-            $pattern $(if $guard)? => {},
-            _ => {
-                panic!("received unexpected result: {}", format!("{:?}", $expression));
-            }
-        }
-    }};
-}
-
 /// A data dir of its own for a test that doesn't call `initialize()`.
 ///
 /// `initialize()` runs `regtest.sh prepare_tests_environment`, which wipes the shared
@@ -153,12 +139,12 @@ pub(crate) fn create_test_data_dir() -> PathBuf {
 
 pub(crate) fn get_test_wallet_data(data_dir: &str) -> WalletData {
     WalletData {
-        reuse_addresses: false,
         data_dir: data_dir.to_string(),
         bitcoin_network: BitcoinNetwork::Regtest,
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
         supported_schemas: AssetSchema::VALUES.to_vec(),
+        allow_reckless_schemas: false,
     }
 }
 
@@ -228,12 +214,12 @@ fn get_test_wallet_raw_in(
 ) -> Wallet {
     let wallet = Wallet::new(
         WalletData {
-            reuse_addresses: false,
             data_dir: data_dir.to_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: max_allocations_per_utxo.unwrap_or(MAX_ALLOCATIONS_PER_UTXO),
             supported_schemas: AssetSchema::VALUES.to_vec(),
+            allow_reckless_schemas: false,
         },
         wallet_keys.clone(),
     )
@@ -416,6 +402,78 @@ pub(crate) fn write_opouts_to_reject_list(filename: &str, opouts: &[String]) {
     }
 }
 
+/// The config of the electrum indexer the tests run against.
+#[cfg(feature = "electrum")]
+pub(crate) fn electrum_indexer_config() -> IndexerConfig {
+    IndexerConfig::Electrum {
+        url: ELECTRUM_URL.to_string(),
+    }
+}
+
+/// The validation options of a consignment of the tests, taking the witness with the given TXID
+/// (if any) from the consignment.
+#[cfg(feature = "electrum")]
+pub(crate) fn validation_options(offchain_txid: Option<&str>) -> ValidationOptions {
+    ValidationOptions {
+        bitcoin_network: BitcoinNetwork::Regtest,
+        offchain_txid: offchain_txid.map(str::to_string),
+    }
+}
+
+/// Validate the consignment at the given path with the indexer the tests run against, taking the
+/// witness with the given TXID (if any) from the consignment and applying the given confirmation
+/// policy.
+#[cfg(feature = "electrum")]
+pub(crate) fn validate_test_consignment(
+    consignment_path: &str,
+    offchain_txid: Option<&str>,
+    min_confirmations: Option<u8>,
+) -> Result<ConsignmentValidation, Error> {
+    validate_consignment(
+        consignment_path,
+        &electrum_indexer_config(),
+        &HashMap::new(),
+        min_confirmations,
+        &validation_options(offchain_txid),
+    )
+}
+
+/// Fill in the SPV proofs the consignment at the given path is missing, with the indexer the
+/// tests run against.
+#[cfg(feature = "electrum")]
+pub(crate) fn fill_proofs(consignment_path: &str) -> SpvProofFill {
+    fill_spv_proofs(consignment_path, &electrum_indexer_config()).unwrap()
+}
+
+/// The SPV proof the consignment at the given path carries for the witness transaction with the
+/// given TXID, if any.
+#[cfg(feature = "electrum")]
+pub(crate) fn witness_spv_proof(consignment_path: &str, txid: &str) -> Option<SpvProof> {
+    RgbTransfer::load_file(consignment_path)
+        .unwrap()
+        .bundled_witnesses()
+        .find(|witness_bundle| witness_bundle.witness_id().to_string() == txid)
+        .and_then(|witness_bundle| witness_bundle.spv_proof.clone())
+}
+
+/// The assignment an inspected input spends, which the wallet and the consignment inspections
+/// always resolve (only a fascia inspected without a wallet leaves it unresolved).
+#[cfg(feature = "electrum")]
+pub(crate) fn input_assignment(input: &RgbInputInfo) -> &Assignment {
+    input
+        .assignment
+        .as_ref()
+        .expect("input assignment should be resolved")
+}
+
+/// The index of the transaction input an inspected input is spent by, which the wallet and the
+/// consignment inspections always resolve (only a fascia inspected without a wallet leaves it
+/// unresolved).
+#[cfg(feature = "electrum")]
+pub(crate) fn input_vin(input: &RgbInputInfo) -> u32 {
+    input.vin.expect("input vin should be resolved")
+}
+
 /// A recipient of the given `assignment` paying the blind receive described by `receive_data`,
 /// with optional encryption and the default transport endpoints.
 #[cfg(feature = "electrum")]
@@ -431,6 +489,95 @@ pub(crate) fn blind_recipient(receive_data: &ReceiveData, assignment: Assignment
     }
 }
 
+/// A recipient of the given `assignment` paying the witness receive described by `receive_data`,
+/// with the given witness amount, no blinding and the same defaults as [`blind_recipient`].
+#[cfg(feature = "electrum")]
+pub(crate) fn witness_recipient(
+    receive_data: &ReceiveData,
+    assignment: Assignment,
+    amount_sat: u64,
+) -> Recipient {
+    Recipient {
+        witness_data: Some(WitnessData {
+            amount_sat,
+            blinding: None,
+        }),
+        ..blind_recipient(receive_data, assignment)
+    }
+}
+
+/// Build a recipient map sending the given `assignment` of the asset with ID `asset_id` to the
+/// blind receive described by `receive_data`.
+#[cfg(feature = "electrum")]
+pub(crate) fn blind_recipient_map(
+    asset_id: &str,
+    receive_data: &ReceiveData,
+    assignment: Assignment,
+) -> HashMap<String, Vec<Recipient>> {
+    HashMap::from([(
+        asset_id.to_string(),
+        vec![blind_recipient(receive_data, assignment)],
+    )])
+}
+
+/// Refresh both parties until the batch send with the given TXID and each of the receives with
+/// the given recipient IDs are settled.
+///
+/// Waiting for the statuses the test expects, instead of for some transfer to change status, is
+/// immune to a transfer being settled by a block another test mines and to a refresh taking longer
+/// than a change wait allows.
+#[cfg(feature = "electrum")]
+pub(crate) fn settle_batch(
+    sender: &mut SinglesigParty,
+    receiver: &mut SinglesigParty,
+    txid: &str,
+    recipient_ids: &[&str],
+) {
+    for recipient_id in recipient_ids {
+        receiver.wait_for_transfer_status_recipient(None, recipient_id, TransferStatus::Settled);
+    }
+    sender.wait_for_transfer_status_sender(None, txid, TransferStatus::Settled);
+}
+
+/// Send the given `assignment` of the asset with ID `asset_id` from `sender` to the blind receive
+/// of `receiver` described by `receive_data`, then settle the transfer, returning its TXID.
+#[cfg(feature = "electrum")]
+pub(crate) fn send_to_blind_and_settle(
+    sender: &mut SinglesigParty,
+    receiver: &mut SinglesigParty,
+    asset_id: &str,
+    receive_data: &ReceiveData,
+    assignment: Assignment,
+) -> String {
+    let recipient_map = blind_recipient_map(asset_id, receive_data, assignment);
+    let txid = sender.send_retry(&recipient_map);
+    receiver.wait_for_refresh(None);
+    sender.wait_for_refresh(None);
+    mine(false);
+    settle_batch(sender, receiver, &txid, &[&receive_data.recipient_id]);
+    txid
+}
+
+/// Send the given `assignment` of the asset with ID `asset_id` from `sender` to the blind receive
+/// of `receiver` described by `receive_data`, and have `receiver` refuse the transfer.
+#[cfg(feature = "electrum")]
+pub(crate) fn send_to_blind_refused(
+    sender: &mut SinglesigParty,
+    receiver: &mut SinglesigParty,
+    asset_id: &str,
+    receive_data: &ReceiveData,
+    assignment: Assignment,
+) {
+    let recipient_map = blind_recipient_map(asset_id, receive_data, assignment);
+    let txid = sender.send_result(&recipient_map).unwrap().txid;
+    receiver.wait_for_transfer_status_recipient(
+        None,
+        &receive_data.recipient_id,
+        TransferStatus::Failed,
+    );
+    sender.wait_for_transfer_status_sender(Some(asset_id), &txid, TransferStatus::Failed);
+}
+
 /// Send the given `assignment` of the asset with ID `asset_id` from `sender` to a new blind receive
 /// of `receiver`, then settle the transfer, returning its TXID.
 #[cfg(feature = "electrum")]
@@ -441,17 +588,117 @@ pub(crate) fn send_and_settle(
     assignment: Assignment,
 ) -> String {
     let receive_data = receiver.blind_receive();
-    let recipient_map = HashMap::from([(
-        asset_id.to_string(),
-        vec![blind_recipient(&receive_data, assignment)],
-    )]);
-    let txid = sender.send_retry(&recipient_map);
-    receiver.wait_for_refresh(None);
-    sender.wait_for_refresh(None);
-    mine(false);
-    receiver.wait_for_refresh(None);
-    sender.wait_for_refresh(None);
-    txid
+    send_to_blind_and_settle(sender, receiver, asset_id, &receive_data, assignment)
+}
+
+/// The allocations held by the only colored UTXO of `party`.
+#[cfg(feature = "electrum")]
+pub(crate) fn single_colored_utxo_allocations(party: &mut SinglesigParty) -> Vec<RgbAllocation> {
+    let unspents = party.list_unspents(true);
+    let colored: Vec<&Unspent> = unspents
+        .iter()
+        .filter(|u| !u.rgb_allocations.is_empty())
+        .collect();
+    assert_eq!(colored.len(), 1);
+    colored[0].rgb_allocations.clone()
+}
+
+/// The number of allocations of the UTXO at `outpoint` of `party`, if unspent.
+#[cfg(feature = "electrum")]
+pub(crate) fn utxo_num_allocations(
+    party: &mut SinglesigParty,
+    outpoint: &Outpoint,
+) -> Option<usize> {
+    party
+        .list_unspents(true)
+        .iter()
+        .find(|u| u.utxo.outpoint == *outpoint)
+        .map(|u| u.rgb_allocations.len())
+}
+
+/// Issue an IFA asset with its link right, linked from the contract with ID `linked_from`, if
+/// given, and with the given reject list URL.
+#[cfg(feature = "electrum")]
+pub(crate) fn issue_asset_ifa_link(
+    party: &mut SinglesigParty,
+    linked_from: Option<String>,
+    reject_list_url: Option<String>,
+) -> AssetIFA {
+    party
+        .wallet
+        .issue_asset_ifa(
+            TICKER.to_string(),
+            NAME.to_string(),
+            PRECISION,
+            vec![AMOUNT],
+            vec![],
+            reject_list_url,
+            true,
+            linked_from,
+            false,
+        )
+        .unwrap()
+}
+
+/// Issue an IFA asset with its link right, plus the IFA contract replacing it, issued linked from
+/// it: the pair a link needs, as the contract to link to has to be known to the wallet and to
+/// point back at the linking one.
+#[cfg(feature = "electrum")]
+pub(crate) fn issue_asset_ifa_link_pair(party: &mut SinglesigParty) -> (AssetIFA, AssetIFA) {
+    let asset = issue_asset_ifa_link(party, None, None);
+    let replacement = issue_asset_ifa_link(party, Some(asset.asset_id.clone()), None);
+    (asset, replacement)
+}
+
+/// The number of allocations of the link right of the asset with the given ID held by the given
+/// party.
+#[cfg(feature = "electrum")]
+pub(crate) fn link_rights(party: &mut SinglesigParty, asset_id: &str) -> usize {
+    party
+        .list_unspents(false)
+        .iter()
+        .flat_map(|u| u.rgb_allocations.iter())
+        .filter(|a| {
+            a.asset_id.as_deref() == Some(asset_id) && a.assignment == Assignment::LinkRight
+        })
+        .count()
+}
+
+/// The outpoints of the unspent UTXOs of the given wallet holding the link right of the given
+/// asset, according to its stock, which also knows about the ones rgb-lib doesn't track: at most
+/// one is expected, a list lets the tests check that.
+#[cfg(feature = "electrum")]
+pub(crate) fn link_right_outpoints(wallet: &Wallet, asset_id: &str) -> Vec<OutPoint> {
+    let contract_id = ContractId::from_str(asset_id).unwrap();
+    let txn = wallet.database().begin_transaction().unwrap();
+    let outpoints: Vec<OutPoint> = txn
+        .get_unspent_txos(vec![])
+        .unwrap()
+        .into_iter()
+        .map(OutPoint::from)
+        .collect();
+    let stock = wallet.rgb_stock(&txn).unwrap();
+    let mut link_right_outpoints = vec![];
+    for (seal, opout_state_map) in stock
+        .contract_assignments_for(contract_id, outpoints)
+        .unwrap()
+    {
+        if opout_state_map.keys().any(|opout| opout.ty == OS_LINK) {
+            link_right_outpoints.push(seal.to_outpoint());
+        }
+    }
+    txn.commit().unwrap();
+    link_right_outpoints
+}
+
+/// The TXID of the given PSBT.
+#[cfg(feature = "electrum")]
+pub(crate) fn psbt_txid(psbt: &str) -> String {
+    Psbt::from_str(psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string()
 }
 
 /// Whether an asset of the given schema supports the given assignment.
@@ -462,7 +709,11 @@ pub(crate) fn schema_supports_assignment(schema: AssetSchema, assignment: &Assig
         AssetSchema::Uda => matches!(assignment, Assignment::NonFungible),
         AssetSchema::Ifa => matches!(
             assignment,
-            Assignment::Fungible(_) | Assignment::InflationRight(_)
+            Assignment::Fungible(_) | Assignment::InflationRight(_) | Assignment::LinkRight
+        ),
+        AssetSchema::Bfa => matches!(
+            assignment,
+            Assignment::Fungible(_) | Assignment::LinkRight | Assignment::MintRight
         ),
     }
 }
@@ -483,7 +734,7 @@ fn expected_receive_assignment(
             Some(Assignment::Fungible(0))
         }
         (Some(AssetSchema::Uda), Assignment::Any) => Some(Assignment::NonFungible),
-        (Some(AssetSchema::Ifa), Assignment::Any) => Some(Assignment::Any),
+        (Some(AssetSchema::Ifa | AssetSchema::Bfa), Assignment::Any) => Some(Assignment::Any),
         (Some(schema), _) if schema_supports_assignment(schema, assignment) => {
             Some(assignment.clone())
         }
@@ -523,7 +774,10 @@ pub(crate) fn check_receive_schema_assignment_combinations(
         .map(|a| match a {
             Assignment::Fungible(_) => Assignment::Fungible(amount),
             Assignment::InflationRight(_) => Assignment::InflationRight(amount),
-            Assignment::NonFungible | Assignment::LinkRight | Assignment::Any => a,
+            Assignment::NonFungible
+            | Assignment::LinkRight
+            | Assignment::MintRight
+            | Assignment::Any => a,
         })
         .collect();
     for (schema, asset_id) in schemas {
@@ -656,7 +910,7 @@ pub(crate) fn test_indexer_config(indexer_url: &str) -> IndexerConfig {
             auth: bitcoind_cookie_auth(),
         };
     }
-    #[cfg(feature = "_online")]
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
     if indexer_url == ESPLORA_URL || indexer_url.starts_with("https://") {
         return IndexerConfig::Esplora { url };
     }
@@ -666,7 +920,7 @@ pub(crate) fn test_indexer_config(indexer_url: &str) -> IndexerConfig {
     return IndexerConfig::Esplora { url };
     #[cfg(all(
         feature = "bitcoind",
-        not(feature = "_online")
+        not(any(feature = "electrum", feature = "esplora"))
     ))]
     return IndexerConfig::Bitcoind {
         url,
@@ -682,7 +936,28 @@ pub(crate) fn test_go_online_options(indexer_url: Option<&str>) -> OnlineOptions
         vanilla_sync_lookback: INDEXER_SYNC_LOOKBACK as u32,
         failed_witness_receive_grace_secs: FAILED_WITNESS_RECEIVE_GRACE_SECS,
         proxy_auth_keys: HashMap::new(),
+        evm_chains: test_evm_chains(HashMap::from([(
+            super::super::ANVIL_CHAIN_ID,
+            super::super::EVM_RPC_URL.to_string(),
+        )])),
     }
+}
+
+/// The EVM chains with the given RPC URLs, by chain ID, allowing mints to leave from
+/// `MIN_MINT_LOCK_BLOCKS` to `MAX_MINT_LOCK_BLOCKS` blocks for their lock
+#[cfg(feature = "_online")]
+pub(crate) fn test_evm_chains(evm_rpc_urls: HashMap<u64, String>) -> HashMap<u64, EvmChain> {
+    evm_rpc_urls
+        .into_iter()
+        .map(|(chain_id, rpc_url)| {
+            let evm_chain = EvmChain {
+                rpc_url,
+                min_mint_lock_blocks: super::super::MIN_MINT_LOCK_BLOCKS,
+                max_mint_lock_blocks: super::super::MAX_MINT_LOCK_BLOCKS,
+            };
+            (chain_id, evm_chain)
+        })
+        .collect()
 }
 
 #[cfg(feature = "_online")]

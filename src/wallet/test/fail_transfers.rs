@@ -320,6 +320,7 @@ fn fail() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
     let result = party.fail_transfers(Some(receive_data.batch_transfer_idx), true, false);
@@ -694,12 +695,12 @@ fn waiting_safe_height() {
     party_2.wait_for_refresh(None);
     party_1.wait_for_refresh(Some(&asset.asset_id));
     force_mine_no_resume_when_alone(false);
-    party_2.wait_for_refresh(None);
-    party_1.wait_for_refresh(Some(&asset.asset_id));
-    assert!(party_2.check_test_transfer_status_recipient(
+    party_2.wait_for_transfer_status_recipient(
+        None,
         &receive_data_1.recipient_id,
-        TransferStatus::Settled
-    ));
+        TransferStatus::Settled,
+    );
+    party_1.wait_for_refresh(Some(&asset.asset_id));
 
     // 2nd transfer: wallet 1 > wallet 2 with min_confirmations = 2
     // txid_1 has only one confirmation, so transfer parks in WaitingSafeHeight
@@ -712,6 +713,7 @@ fn waiting_safe_height() {
             (now().unix_timestamp() + DURATION_RCV_TRANSFER as i64) as u64,
             TRANSPORT_ENDPOINTS.clone(),
             2,
+            None,
             None,
         )
         .unwrap();
@@ -902,6 +904,7 @@ fn witness_receive_cleanup() {
             vec![],
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
     let recipient_map = HashMap::from([(
@@ -947,6 +950,7 @@ fn witness_receive_cleanup() {
         default_rcv_expiration(),
         TRANSPORT_ENDPOINTS.clone(),
         MIN_CONFIRMATIONS,
+        None,
         None,
     );
     assert!(matches!(result, Err(Error::InsufficientAllocationSlots)));

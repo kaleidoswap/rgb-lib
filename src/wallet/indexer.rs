@@ -40,25 +40,8 @@ impl std::ops::Deref for BitcoindClient {
     }
 }
 
-/// Status of the Bitcoin Core node indexes relevant to the wallet.
-#[cfg(feature = "bitcoind")]
-pub(crate) struct BitcoindIndexes {
-    pub(crate) txindex: bool,
-    pub(crate) block_filters: bool,
-}
-
 #[cfg(feature = "bitcoind")]
 impl BitcoindClient {
-    /// Which indexes the node maintains and has finished building.
-    pub(crate) fn indexes(&self) -> Result<BitcoindIndexes, IndexerError> {
-        let info = self.inner.get_index_info()?;
-        let synced = |status: Option<BitcoindIndexStatus>| matches!(status, Some(s) if s.synced);
-        Ok(BitcoindIndexes {
-            txindex: synced(info.txindex),
-            block_filters: synced(info.basic_block_filter_index),
-        })
-    }
-
     /// Bring the BDK wallet up to date with the Bitcoin Core node: apply the blocks since the
     /// wallet's last checkpoint (handling reorgs), then the mempool.
     ///
@@ -266,7 +249,7 @@ impl Indexer {
         })
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) fn full_scan<K: Ord + Clone, R: Into<FullScanRequest<K>>>(
         &self,
         request: R,
@@ -474,6 +457,79 @@ impl Indexer {
         })
     }
 
+    /// Whether the output at `outpoint` has been spent by a confirmed TX. The output of a TX that
+    /// isn't confirmed, or doesn't exist, hasn't.
+    pub(crate) fn output_spent_on_chain(&self, outpoint: &BdkOutPoint) -> Result<bool, Error> {
+        Ok(match self {
+            #[cfg(feature = "bitcoind")]
+            Indexer::Bitcoind(client) => {
+                let info = match client.get_raw_transaction_info(&outpoint.txid, None) {
+                    Ok(info) => info,
+                    // the node has a synced txindex (checked when going online), so an unknown TX
+                    // is neither mined nor in the mempool
+                    Err(BitcoindRpcError::JsonRpc(BitcoindJsonRpcError::Rpc(e)))
+                        if e.code == BITCOIND_RPC_INVALID_ADDRESS_OR_KEY =>
+                    {
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(IndexerError::from(e).into()),
+                };
+                if info.confirmations.unwrap_or(0) == 0 || info.vout.len() <= outpoint.vout as usize
+                {
+                    return Ok(false);
+                }
+                // without the mempool, the node reports the output of a confirmed TX until a
+                // confirmed TX spends it
+                client
+                    .get_tx_out(&outpoint.txid, outpoint.vout, Some(false))
+                    .map_err(IndexerError::from)?
+                    .is_none()
+            }
+            #[cfg(feature = "electrum")]
+            Indexer::Electrum(client) => {
+                let prev_tx = match client.inner.transaction_get(&outpoint.txid) {
+                    Ok(tx) => tx,
+                    Err(e)
+                        if e.to_string()
+                            .contains("No such mempool or blockchain transaction") =>
+                    {
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(IndexerError::from(e).into()),
+                };
+                let Some(output) = prev_tx.output.get(outpoint.vout as usize) else {
+                    return Ok(false);
+                };
+                // a TX spending the output is in the history of its script, confirmed if its
+                // height is positive (it's 0 or -1 in the mempool)
+                let history = client
+                    .inner
+                    .script_get_history(&output.script_pubkey)
+                    .map_err(IndexerError::from)?;
+                for entry in history {
+                    if entry.height <= 0 || entry.tx_hash == outpoint.txid {
+                        continue;
+                    }
+                    let tx = client
+                        .inner
+                        .transaction_get(&entry.tx_hash)
+                        .map_err(IndexerError::from)?;
+                    if tx.input.iter().any(|i| i.previous_output == *outpoint) {
+                        return Ok(true);
+                    }
+                }
+                false
+            }
+            #[cfg(feature = "esplora")]
+            Indexer::Esplora(client) => client
+                .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
+                .map_err(IndexerError::from)?
+                .is_some_and(|status| {
+                    status.spent && status.status.is_some_and(|tx_status| tx_status.confirmed)
+                }),
+        })
+    }
+
     pub(crate) fn populate_tx_cache(
         &self,
         #[cfg_attr(any(feature = "esplora", feature = "bitcoind"), allow(unused))]
@@ -491,7 +547,7 @@ impl Indexer {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) fn sync<I: 'static>(
         &self,
         request: impl Into<SyncRequest<I>>,
@@ -743,7 +799,7 @@ mod tests {
         result
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn test_outpoint(vout: u32) -> OutPoint {
         OutPoint::new(
             bdk_wallet::bitcoin::Txid::from_str(TEST_TXID).unwrap(),
@@ -753,7 +809,7 @@ mod tests {
 
     /// The single output of `minimal_tx_raw_bytes`, and the one `test_outpoint(1)` points to in
     /// the Electrum mock, locks this script with this amount.
-    #[cfg(feature = "_online")]
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
     const TEST_TXO_AMOUNT: u64 = 50_000_000_000;
 
     #[cfg(feature = "electrum")]
@@ -1251,5 +1307,42 @@ mod tests {
         let res = indexer.broadcast(&tx).unwrap_err();
         assert_matches!(res, IndexerError::Esplora { .. });
         mock.assert();
+    }
+
+    #[cfg(feature = "esplora")]
+    fn run_esplora_output_spent_on_chain_case(outspend_body: &str) -> bool {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", format!("/tx/{TEST_TXID}/outspend/1").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(outspend_body)
+            .create();
+        let outpoint = BdkOutPoint {
+            txid: Txid::from_str(TEST_TXID).unwrap(),
+            vout: 1,
+        };
+        let res = esplora_indexer(&server.url())
+            .output_spent_on_chain(&outpoint)
+            .unwrap();
+        mock.assert();
+        res
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn test_esplora_output_spent_on_chain() {
+        // spent by a confirmed TX
+        assert!(run_esplora_output_spent_on_chain_case(&format!(
+            r#"{{"spent": true, "txid": "{TEST_TXID}", "vin": 0, "status": {{"confirmed": true, "block_height": 95, "block_hash": "0000000000000000000000000000000000000000000000000000000000000000", "block_time": 1600000000}}}}"#
+        )));
+        // spent by a TX in the mempool
+        assert!(!run_esplora_output_spent_on_chain_case(&format!(
+            r#"{{"spent": true, "txid": "{TEST_TXID}", "vin": 0, "status": {{"confirmed": false}}}}"#
+        )));
+        // unspent
+        assert!(!run_esplora_output_spent_on_chain_case(
+            r#"{"spent": false}"#
+        ));
     }
 }

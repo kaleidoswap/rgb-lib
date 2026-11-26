@@ -43,6 +43,7 @@ fn scenario_1_encrypted_backup_restore_matches_state_and_wallet_operational() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .expect("witness_receive");
     let recipient_map = HashMap::from([(

@@ -181,6 +181,7 @@ fn success() {
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
             None,
+            None,
         )
         .unwrap();
     assert!(party.fail_transfers_single(receive_data_1.batch_transfer_idx));
@@ -297,6 +298,7 @@ fn fail() {
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
         )
         .unwrap();

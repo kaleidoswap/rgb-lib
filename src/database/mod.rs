@@ -6,28 +6,12 @@ use super::*;
 #[cfg(feature = "vss")]
 use sea_orm::ConnectionTrait;
 
+#[cfg(feature = "_online")]
+use crate::database::entities::reserved_txo;
 use crate::database::entities::{
-    asset, asset_transfer, batch_transfer, coloring, media, prelude::*, reuse_address_index,
+    asset, asset_transfer, batch_transfer, coloring, media, pending_witness_script, prelude::*,
     transfer, transfer_transport_endpoint, transport_endpoint, txo, wallet_transaction,
 };
-use bdk_wallet::KeychainKind;
-
-fn keychain_to_u8(keychain: KeychainKind) -> u8 {
-    match keychain {
-        KeychainKind::External => 0,
-        KeychainKind::Internal => 1,
-    }
-}
-
-fn keychain_from_u8(value: u8) -> Option<KeychainKind> {
-    match value {
-        0 => Some(KeychainKind::External),
-        1 => Some(KeychainKind::Internal),
-        _ => None,
-    }
-}
-#[cfg(feature = "_online")]
-use crate::database::entities::{pending_witness_script, reserved_txo};
 
 /// Max number of values bound in a single `IN (...)` clause, well below SQLite's variable limit.
 const SQL_IN_CHUNK_SIZE: usize = 500;
@@ -156,12 +140,7 @@ pub(crate) struct DbBatchTransferData {
 
 impl DbColoring {
     pub(crate) fn incoming(&self) -> bool {
-        [
-            ColoringType::Receive,
-            ColoringType::Change,
-            ColoringType::Issue,
-        ]
-        .contains(&self.r#type)
+        ColoringType::INCOMING.contains(&self.r#type)
     }
 }
 
@@ -219,6 +198,67 @@ impl DbTransfer {
             .and_then(|s| RgbInvoice::from_str(s).ok())
             .map(|invoice| invoice.transports == vec![])
             .unwrap_or(false)
+    }
+
+    /// Whether this transfer is an invoice requesting a mint right of the asset with ID
+    /// `asset_id`, given the asset ID of its asset transfer.
+    pub(crate) fn requests_mint_right(
+        &self,
+        invoice_asset_id: Option<&str>,
+        asset_id: &str,
+    ) -> bool {
+        self.requested_assignment == Some(Assignment::MintRight)
+            && invoice_asset_id == Some(asset_id)
+    }
+}
+
+/// The unpaid blind invoices, with their UTXO and asset transfer: incoming transfers waiting for
+/// the counterparty without colorings yet. As an invoice is paid by a single allocation, each one
+/// reserves a slot on its UTXO until it's paid (and its coloring counts instead) or fails, which
+/// keeps counting it when its consignment's colorings get rolled back after an ACK.
+fn unpaid_invoices<'a>(
+    transfers: &'a [DbTransfer],
+    asset_transfers: &'a [DbAssetTransfer],
+    batch_transfers: &'a [DbBatchTransfer],
+    colorings: &[DbColoring],
+) -> impl Iterator<Item = (&'a Outpoint, &'a DbTransfer, DbAssetTransfer)> {
+    let colored: HashSet<i32> = colorings.iter().map(|c| c.asset_transfer_idx).collect();
+    transfers
+        .iter()
+        .filter_map(move |t| match &t.recipient_type {
+            Some(RecipientTypeFull::Blind { unblinded_utxo }) => {
+                let (at, bt) = t.related_transfers(asset_transfers, batch_transfers);
+                (bt.incoming
+                    && bt.status.waiting_counterparty()
+                    && !colored.contains(&t.asset_transfer_idx))
+                .then_some((unblinded_utxo, t, at))
+            }
+            _ => None,
+        })
+}
+
+/// The number of unpaid blind invoices on each UTXO (see `unpaid_invoices`).
+fn unpaid_invoice_utxos<'a>(
+    transfers: &'a [DbTransfer],
+    asset_transfers: &'a [DbAssetTransfer],
+    batch_transfers: &'a [DbBatchTransfer],
+    colorings: &[DbColoring],
+) -> HashMap<&'a Outpoint, u32> {
+    unpaid_invoices(transfers, asset_transfers, batch_transfers, colorings)
+        .map(|(utxo, _, _)| utxo)
+        .fold(HashMap::new(), |mut acc, utxo| {
+            *acc.entry(utxo).or_insert(0) += 1;
+            acc
+        })
+}
+
+impl DbInvoice {
+    /// Whether the reusable invoice can still receive transfers: until its deadline a transfer
+    /// created before its expiration can still be discovered on its recipient proxies, so its
+    /// blinded UTXO keeps room for it, its witness script stays watched and its proxies are asked
+    /// for new transfers.
+    pub(crate) fn live(&self, now: i64) -> bool {
+        now < self.deadline
     }
 }
 
@@ -357,7 +397,7 @@ impl RgbLibDatabase {
         let db = Self::new(connection);
         #[cfg(feature = "vss")]
         let db = Self {
-            state_lock: crate::utils::wallet_state_lock(wallet_dir)?,
+            state_lock: crate::wallet::utils::wallet_state_lock(wallet_dir)?,
             ..db
         };
         #[cfg(not(feature = "vss"))]
@@ -366,8 +406,8 @@ impl RgbLibDatabase {
     }
 
     #[cfg(feature = "vss")]
-    pub(crate) fn state_guard(&self) -> crate::utils::WalletStateGuard {
-        crate::utils::WalletStateGuard::new(self.state_lock.lock_arc())
+    pub(crate) fn state_guard(&self) -> crate::wallet::utils::WalletStateGuard {
+        crate::wallet::utils::WalletStateGuard::new(self.state_lock.lock_arc())
     }
 
     pub(crate) fn begin_transaction(&self) -> Result<DbTxn, Error> {
@@ -388,7 +428,7 @@ pub struct DbTxn {
     /// data the commit has just made durable.
     on_commit: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     #[cfg(feature = "vss")]
-    _state_guard: Option<crate::utils::WalletStateGuard>,
+    _state_guard: Option<crate::wallet::utils::WalletStateGuard>,
 }
 
 // required by the rgb-ops `RgbStore` trait (implemented on `&DbTxn`); the inner
@@ -510,44 +550,30 @@ impl DbTxn {
         Ok(res.last_insert_id)
     }
 
+    /// Watch a witness receive script, which may already be watched for another transfer to the
+    /// same reusable invoice.
     pub(crate) fn set_pending_witness_script(
         &self,
         pending_witness_script: DbPendingWitnessScriptActMod,
-    ) -> Result<i32, Error> {
-        let script = pending_witness_script
-            .script
-            .clone()
-            .take()
-            .expect("script must be set on the active model");
-        let on_conflict = sea_query::OnConflict::column(
-            crate::database::entities::pending_witness_script::Column::Script,
-        )
-        .do_nothing()
-        .to_owned();
-        let conn = self.inner();
+    ) -> Result<(), Error> {
         let res = block_on(
             PendingWitnessScript::insert(pending_witness_script)
-                .on_conflict(on_conflict)
-                .exec(conn),
+                .on_conflict(
+                    sea_query::OnConflict::column(pending_witness_script::Column::Script)
+                        .do_nothing()
+                        .to_owned(),
+                )
+                .exec(self.inner()),
         );
         match res {
-            Ok(insert_result) => Ok(insert_result.last_insert_id),
-            Err(DbErr::RecordNotInserted) => {
-                let existing = block_on(
-                    PendingWitnessScript::find()
-                        .filter(
-                            crate::database::entities::pending_witness_script::Column::Script
-                                .eq(script),
-                        )
-                        .one(conn),
-                )?;
-                match existing {
-                    Some(row) => Ok(row.idx),
-                    None => unreachable!("RecordNotInserted means the row exists"),
-                }
-            }
-            Err(err) => Err(err.into()),
+            Ok(_) | Err(DbErr::RecordNotInserted) => Ok(()),
+            Err(e) => Err(e.into()),
         }
+    }
+
+    pub(crate) fn set_invoice(&self, invoice: DbInvoiceActMod) -> Result<i32, Error> {
+        let res = block_on(Invoice::insert(invoice).exec(self.inner()))?;
+        Ok(res.last_insert_id)
     }
 
     #[cfg(feature = "_online")]
@@ -809,34 +835,10 @@ impl DbTxn {
         Ok(block_on(BackupInfo::find().one(self.inner()))?)
     }
 
-    pub(crate) fn set_reuse_address_index(
-        &self,
-        keychain: KeychainKind,
-        index: u32,
-    ) -> Result<(), Error> {
-        let model = reuse_address_index::ActiveModel {
-            keychain: ActiveValue::Set(keychain_to_u8(keychain)),
-            derivation_index: ActiveValue::Set(index),
-        };
-        let on_conflict = sea_query::OnConflict::column(reuse_address_index::Column::Keychain)
-            .update_column(reuse_address_index::Column::DerivationIndex)
-            .to_owned();
-        block_on(
-            ReuseAddressIndex::insert(model)
-                .on_conflict(on_conflict)
-                .exec(self.inner()),
-        )?;
-        Ok(())
+    #[cfg(feature = "_online")]
+    pub(crate) fn get_transfer(&self, idx: i32) -> Result<Option<DbTransfer>, Error> {
+        Ok(block_on(Transfer::find_by_id(idx).one(self.inner()))?)
     }
-
-    pub(crate) fn get_reuse_address_index(&self) -> Result<HashMap<KeychainKind, u32>, Error> {
-        let rows = block_on(ReuseAddressIndex::find().all(self.inner()))?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| keychain_from_u8(row.keychain).map(|k| (k, row.derivation_index)))
-            .collect())
-    }
-
 
     pub(crate) fn get_batch_transfer(&self, idx: i32) -> Result<Option<DbBatchTransfer>, Error> {
         Ok(block_on(BatchTransfer::find_by_id(idx).one(self.inner()))?)
@@ -936,6 +938,155 @@ impl DbTxn {
         )?)
     }
 
+    /// The colorings of the asset with ID `asset_id`, or of any asset if `None`, assigning the
+    /// TXO with index `txo_idx` an allocation it holds or is due to receive (receives, changes and
+    /// issuances), from transfers that haven't failed, other than the asset transfer with index
+    /// `exclude_asset_transfer_idx`.
+    #[cfg(feature = "_online")]
+    fn txo_incoming_colorings_query(
+        txo_idx: i32,
+        asset_id: Option<&str>,
+        exclude_asset_transfer_idx: i32,
+    ) -> Select<Coloring> {
+        let mut query = Coloring::find()
+            .join(JoinType::InnerJoin, coloring::Relation::AssetTransfer.def())
+            .join(
+                JoinType::InnerJoin,
+                asset_transfer::Relation::BatchTransfer.def(),
+            )
+            .filter(coloring::Column::TxoIdx.eq(txo_idx))
+            .filter(coloring::Column::Type.is_in(ColoringType::INCOMING))
+            .filter(coloring::Column::AssetTransferIdx.ne(exclude_asset_transfer_idx))
+            .filter(batch_transfer::Column::Status.ne(TransferStatus::Failed));
+        if let Some(asset_id) = asset_id {
+            query = query.filter(asset_transfer::Column::AssetId.eq(asset_id));
+        }
+        query
+    }
+
+    /// The number of allocations of the asset with ID `asset_id`, or of any asset if `None`, the
+    /// TXO with index `txo_idx` holds or is due to receive (receives, changes and issuances), from
+    /// transfers that haven't failed, other than the asset transfer with index
+    /// `exclude_asset_transfer_idx`, counted by the DB without loading the colorings.
+    #[cfg(feature = "_online")]
+    pub(crate) fn count_txo_incoming_colorings(
+        &self,
+        txo_idx: i32,
+        asset_id: Option<&str>,
+        exclude_asset_transfer_idx: i32,
+    ) -> Result<usize, Error> {
+        let query =
+            Self::txo_incoming_colorings_query(txo_idx, asset_id, exclude_asset_transfer_idx);
+        Ok(block_on(query.count(self.inner()))? as usize)
+    }
+
+    /// The total amount of the asset with ID `asset_id` the TXO with index `txo_idx` holds or is
+    /// due to receive (receives, changes and issuances), from transfers that haven't failed, other
+    /// than the asset transfer with index `exclude_asset_transfer_idx`.
+    #[cfg(feature = "_online")]
+    pub(crate) fn txo_incoming_amount(
+        &self,
+        txo_idx: i32,
+        asset_id: &str,
+        exclude_asset_transfer_idx: i32,
+    ) -> Result<u128, Error> {
+        let query =
+            Self::txo_incoming_colorings_query(txo_idx, Some(asset_id), exclude_asset_transfer_idx);
+        // the assignment is stored as JSON, so it's summed here
+        Ok(block_on(query.all(self.inner()))?
+            .into_iter()
+            .map(|c| u128::from(c.assignment.main_amount()))
+            .sum())
+    }
+
+    /// The number of mint rights of the asset with ID `asset_id` the TXO with index `txo_idx`
+    /// holds or is due to receive, from transfers that haven't failed, other than the asset
+    /// transfer with index `exclude_asset_transfer_idx`.
+    #[cfg(feature = "_online")]
+    pub(crate) fn count_txo_incoming_mint_rights(
+        &self,
+        txo_idx: i32,
+        asset_id: &str,
+        exclude_asset_transfer_idx: i32,
+    ) -> Result<usize, Error> {
+        let query =
+            Self::txo_incoming_colorings_query(txo_idx, Some(asset_id), exclude_asset_transfer_idx);
+        // the assignment is stored as JSON, so it's matched here
+        Ok(block_on(query.all(self.inner()))?
+            .into_iter()
+            .filter(|c| c.assignment == Assignment::MintRight)
+            .count())
+    }
+
+    /// The UTXOs with an unpaid blind invoice requesting a mint right of the asset with ID
+    /// `asset_id` (see `unpaid_invoices`).
+    pub(crate) fn get_mint_right_invoice_utxos(
+        &self,
+        asset_id: &str,
+    ) -> Result<HashSet<Outpoint>, Error> {
+        let transfers = self.iter_transfers()?;
+        let asset_transfers = self.iter_asset_transfers()?;
+        let batch_transfers = self.iter_batch_transfers()?;
+        let colorings = self.iter_colorings()?;
+        Ok(
+            unpaid_invoices(&transfers, &asset_transfers, &batch_transfers, &colorings)
+                .filter(|(_, t, at)| t.requests_mint_right(at.asset_id.as_deref(), asset_id))
+                .map(|(utxo, _, _)| utxo.clone())
+                .collect(),
+        )
+    }
+
+    /// The unpaid blind invoices on the UTXO at `outpoint`, other than the one of the transfer
+    /// with index `exclude_transfer_idx`, with the asset ID of their asset transfer: incoming
+    /// transfers waiting for the counterparty without colorings yet, each reserving the slot of
+    /// the single allocation that pays it (see `unpaid_invoices`).
+    #[cfg(feature = "_online")]
+    pub(crate) fn get_utxo_unpaid_invoices(
+        &self,
+        outpoint: &Outpoint,
+        exclude_transfer_idx: i32,
+    ) -> Result<Vec<(DbTransfer, Option<String>)>, Error> {
+        let waiting: Vec<(DbTransfer, Option<DbAssetTransfer>)> = block_on(
+            Transfer::find()
+                .find_also_related(AssetTransfer)
+                .join(
+                    JoinType::InnerJoin,
+                    asset_transfer::Relation::BatchTransfer.def(),
+                )
+                .filter(batch_transfer::Column::Incoming.eq(true))
+                .filter(batch_transfer::Column::Status.eq(TransferStatus::WaitingCounterparty))
+                .filter(transfer::Column::Idx.ne(exclude_transfer_idx))
+                .all(self.inner()),
+        )?;
+        // the recipient type is stored as JSON, so the UTXO is matched here
+        let on_utxo: Vec<(DbTransfer, Option<String>)> = waiting
+            .into_iter()
+            .filter(|(t, _)| {
+                matches!(&t.recipient_type,
+                    Some(RecipientTypeFull::Blind { unblinded_utxo }) if unblinded_utxo == outpoint)
+            })
+            .map(|(t, at)| (t, at.and_then(|at| at.asset_id)))
+            .collect();
+        if on_utxo.is_empty() {
+            return Ok(vec![]);
+        }
+        let colored: HashSet<i32> = block_on(
+            Coloring::find()
+                .filter(
+                    coloring::Column::AssetTransferIdx
+                        .is_in(on_utxo.iter().map(|(t, _)| t.asset_transfer_idx)),
+                )
+                .all(self.inner()),
+        )?
+        .into_iter()
+        .map(|c| c.asset_transfer_idx)
+        .collect();
+        Ok(on_utxo
+            .into_iter()
+            .filter(|(t, _)| !colored.contains(&t.asset_transfer_idx))
+            .collect())
+    }
+
     pub(crate) fn get_txo(&self, outpoint: &Outpoint) -> Result<Option<DbTxo>, Error> {
         Ok(block_on(
             Txo::find()
@@ -990,61 +1141,15 @@ impl DbTxn {
         Ok(block_on(Media::find().all(self.inner()))?)
     }
 
+    pub(crate) fn iter_invoices(&self) -> Result<Vec<DbInvoice>, Error> {
+        Ok(block_on(Invoice::find().all(self.inner()))?)
+    }
+
     #[cfg(feature = "_online")]
     pub(crate) fn iter_pending_witness_scripts(
         &self,
     ) -> Result<Vec<DbPendingWitnessScript>, Error> {
         Ok(block_on(PendingWitnessScript::find().all(self.inner()))?)
-    }
-
-    /// Count in-flight (non-Settled, non-Failed) witness `batch_transfer`s
-    /// whose associated `transfer.recipient_id` derives back to `script_hex`.
-    ///
-    /// Used by sync paths to decide whether deleting a `pending_witness_script`
-    /// row is safe: the row must stay alive while ≥ 2 in-flight invoices target
-    /// the same pinned script, so later-arriving UTXOs at that script keep
-    /// getting `pending_witness=true` and are excluded from coin selection.
-    #[cfg(feature = "_online")]
-    pub(crate) fn count_in_flight_witness_transfers_for_script(
-        &self,
-        script_hex: &str,
-    ) -> Result<u32, Error> {
-        let batch_transfers = self.iter_batch_transfers()?;
-        let asset_transfers = self.iter_asset_transfers()?;
-        let transfers = self.iter_transfers()?;
-
-        let in_flight_batch_idx: std::collections::HashSet<i32> = batch_transfers
-            .iter()
-            .filter(|bt| !bt.status.settled() && !bt.status.failed())
-            .map(|bt| bt.idx)
-            .collect();
-        let in_flight_asset_transfer_idx: std::collections::HashSet<i32> = asset_transfers
-            .iter()
-            .filter(|at| in_flight_batch_idx.contains(&at.batch_transfer_idx))
-            .map(|at| at.idx)
-            .collect();
-
-        let mut count: u32 = 0;
-        for t in &transfers {
-            if !in_flight_asset_transfer_idx.contains(&t.asset_transfer_idx) {
-                continue;
-            }
-            if !matches!(t.recipient_type, Some(RecipientTypeFull::Witness { .. })) {
-                continue;
-            }
-            let Some(ref recipient_id) = t.recipient_id else {
-                continue;
-            };
-            match crate::utils::script_buf_from_recipient_id(recipient_id.clone()) {
-                Ok(Some(script)) => {
-                    if script.to_hex_string() == script_hex {
-                        count = count.saturating_add(1);
-                    }
-                }
-                _ => continue,
-            }
-        }
-        Ok(count)
     }
 
     #[cfg(feature = "_online")]
@@ -1066,6 +1171,16 @@ impl DbTxn {
 
     pub(crate) fn iter_tokens(&self) -> Result<Vec<DbToken>, Error> {
         Ok(block_on(Token::find().all(self.inner()))?)
+    }
+
+    /// The transfers to a reusable invoice.
+    #[cfg(feature = "_online")]
+    pub(crate) fn get_invoice_transfers(&self, invoice_idx: i32) -> Result<Vec<DbTransfer>, Error> {
+        Ok(block_on(
+            Transfer::find()
+                .filter(transfer::Column::InvoiceIdx.eq(invoice_idx))
+                .all(self.inner()),
+        )?)
     }
 
     pub(crate) fn iter_transfers(&self) -> Result<Vec<DbTransfer>, Error> {
@@ -1256,49 +1371,6 @@ impl DbTxn {
         Ok(txos.into_iter().filter(|t| !t.spent).collect())
     }
 
-    pub(crate) fn get_issuance_link_right_outpoint(
-        &self,
-        asset_id: &str,
-        asset_transfers: Option<Vec<DbAssetTransfer>>,
-        colorings: Option<Vec<DbColoring>>,
-        txos: Option<Vec<DbTxo>>,
-    ) -> Result<Option<Outpoint>, Error> {
-        let asset_transfers = asset_transfers
-            .map(Ok)
-            .unwrap_or_else(|| self.iter_asset_transfers())?;
-        let colorings = colorings.map(Ok).unwrap_or_else(|| self.iter_colorings())?;
-        let txos = txos.map(Ok).unwrap_or_else(|| self.iter_txos())?;
-        let issuance_link_right_coloring = colorings.iter().find(|coloring| {
-            coloring.r#type == ColoringType::Issue
-                && coloring.assignment == Assignment::LinkRight
-                && asset_transfers.iter().any(|asset_transfer| {
-                    asset_transfer.idx == coloring.asset_transfer_idx
-                        && asset_transfer.asset_id.as_deref() == Some(asset_id)
-                })
-        });
-        Ok(issuance_link_right_coloring
-            .and_then(|coloring| txos.iter().find(|txo| txo.idx == coloring.txo_idx))
-            .map(|txo| txo.outpoint()))
-    }
-
-    pub(crate) fn get_unspent_link_right_outpoint(
-        &self,
-        asset_id: &str,
-    ) -> Result<Option<Outpoint>, Error> {
-        let unspent_txos = self.get_unspent_txos(vec![])?;
-        let unspents = self.get_rgb_allocations(unspent_txos, None, None, None, None)?;
-        Ok(unspents
-            .iter()
-            .find(|unspent| {
-                unspent.rgb_allocations.iter().any(|allocation| {
-                    allocation.asset_id.as_deref() == Some(asset_id)
-                        && allocation.assignment == Assignment::LinkRight
-                        && allocation.settled()
-                })
-            })
-            .map(|unspent| unspent.utxo.outpoint()))
-    }
-
     pub(crate) fn get_asset_balance(
         &self,
         asset_id: String,
@@ -1470,19 +1542,31 @@ impl DbTxn {
         let colorings = colorings.map(Ok).unwrap_or_else(|| self.iter_colorings())?;
         let transfers = transfers.map(Ok).unwrap_or_else(|| self.iter_transfers())?;
 
-        let pending_blinded_utxos = transfers
-            .iter()
-            .filter_map(|t| match &t.recipient_type {
-                Some(RecipientTypeFull::Blind { unblinded_utxo }) => {
+        let mut pending_blinded_utxos =
+            unpaid_invoice_utxos(&transfers, &asset_transfers, &batch_transfers, &colorings);
+        // a reusable blind invoice can still receive transfers (each one assigning to its blinded
+        // UTXO) until its deadline, so its UTXO is kept, with room for the transfers it can still
+        // receive
+        let now = now().unix_timestamp();
+        for invoice in self.iter_invoices()?.iter().filter(|i| i.live(now)) {
+            let Some(Some(RecipientTypeFull::Blind { unblinded_utxo })) = transfers
+                .iter()
+                .find(|t| t.invoice_idx == Some(invoice.idx))
+                .map(|t| &t.recipient_type)
+            else {
+                continue;
+            };
+            let received = transfers
+                .iter()
+                .filter(|t| t.invoice_idx == Some(invoice.idx))
+                .filter(|t| {
                     let (_, bt) = t.related_transfers(&asset_transfers, &batch_transfers);
-                    (bt.incoming && bt.status.waiting_counterparty()).then_some(unblinded_utxo)
-                }
-                _ => None,
-            })
-            .fold(HashMap::new(), |mut acc, utxo| {
-                *acc.entry(utxo).or_insert(0) += 1;
-                acc
-            });
+                    !bt.failed()
+                })
+                .count() as u32;
+            *pending_blinded_utxos.entry(unblinded_utxo).or_insert(0) +=
+                invoice.quota.saturating_sub(received);
+        }
 
         utxos
             .iter()

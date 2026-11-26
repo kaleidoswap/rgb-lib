@@ -64,7 +64,7 @@ fn success() {
     let mut updated_at = None;
     let mut recipient_id_set = HashSet::new();
     let mut receive_utxo_set = HashSet::new();
-    let mut change_utxo = None;
+    let mut change_utxos = None;
     let mut inflation_rights_sorted = inflation_rights;
     inflation_rights_sorted.sort();
     let inflation_change = inflation_rights_sorted.iter().take(2).sum::<u64>() - total_inflated;
@@ -100,11 +100,11 @@ fn success() {
         recipient_id_set.insert(&transfer.recipient_id);
         assert!(transfer.receive_utxo.is_some());
         receive_utxo_set.insert(&transfer.receive_utxo);
-        assert!(transfer.change_utxo.is_some());
-        if change_utxo.is_none() {
-            change_utxo = transfer.change_utxo.clone();
+        assert!(!transfer.change_utxos.is_empty());
+        if change_utxos.is_none() {
+            change_utxos = Some(transfer.change_utxos.clone());
         } else {
-            assert_eq!(change_utxo, transfer.change_utxo)
+            assert_eq!(change_utxos.as_ref(), Some(&transfer.change_utxos))
         }
         assert!(transfer.expiration_timestamp.is_none());
         assert!(transfer.transport_endpoints.is_empty());
@@ -253,7 +253,7 @@ fn success() {
     let (transfer_data, _) = party.get_test_transfer_data(&transfer);
     assert_eq!(rcv_transfer_data.status, TransferStatus::Settled);
     assert_eq!(transfer_data.status, TransferStatus::Settled);
-    assert_eq!(transfer_data.change_utxo, None);
+    assert!(transfer_data.change_utxos.is_empty());
 
     let asset_metadata = rcv_party.get_asset_metadata(&asset.asset_id);
     assert_eq!(asset_metadata.initial_supply, initial_supply);
@@ -264,7 +264,7 @@ fn success() {
     );
 
     // check there's no change (sent all)
-    assert!(transfer_data.change_utxo.is_none());
+    assert!(transfer_data.change_utxos.is_empty());
 
     // exhaust all inflation rights by doing a last call to inflate
     party.create_utxos_default();
@@ -441,12 +441,12 @@ fn fail() {
     let keys = generate_keys(bitcoin_network, WitnessVersion::Taproot);
     let mut wallet_nia = Wallet::new(
         WalletData {
-            reuse_addresses: false,
             data_dir: get_test_data_dir_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
+            allow_reckless_schemas: false,
         },
         SinglesigKeys::from_keys(&keys, None),
     )
@@ -486,12 +486,12 @@ fn fail() {
     drop(party_nia);
     let mut wallet_nia = Wallet::new(
         WalletData {
-            reuse_addresses: false,
             data_dir: get_test_data_dir_string(),
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: vec![AssetSchema::Nia],
+            allow_reckless_schemas: false,
         },
         SinglesigKeys::from_keys(&keys, None),
     )
@@ -503,10 +503,11 @@ fn fail() {
     let result = party_nia.inflate_begin_result(&asset_ifa.asset_id, &[1]);
     assert_matches!(result, Err(Error::UnsupportedSchema { asset_schema: _ }));
     // - inflation not supported (the match is exhaustive, so that a new schema has to be sorted)
+    party.create_utxos_default(); // more UTXOs to have free allocation slots for the issuances
     for schema in AssetSchema::iter() {
         match schema {
             AssetSchema::Ifa => continue,
-            AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa => {}
+            AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa | AssetSchema::Bfa => {}
         }
         let asset_id = party.issue_asset_of_schema(schema);
         let result = party.inflate_result(&asset_id, &[200, 42]);
@@ -714,8 +715,7 @@ fn end_after_fail_or_end() {
     let (_, txid, signed_psbt) = begin(&mut party);
     party.inflate_end_result(&signed_psbt).unwrap();
     mine(false);
-    party.wait_for_refresh(None);
-    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+    party.wait_for_transfer_status_sender(None, &txid, TransferStatus::Settled);
     let result = party.inflate_end_result(&signed_psbt);
     assert_matches!(result, Err(Error::CannotEndTransfer { txid: t }) if t == txid);
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
