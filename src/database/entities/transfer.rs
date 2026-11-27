@@ -2,7 +2,7 @@
 
 use sea_orm::entity::prelude::*;
 
-use crate::database::enums::{Assignment, RecipientTypeFull};
+use crate::database::enums::{Assignment, Encryption, RecipientTypeFull};
 
 #[derive(Copy, Clone, Default, Debug, DeriveEntity)]
 pub struct Entity;
@@ -22,6 +22,14 @@ pub struct Model {
     pub recipient_id: Option<String>,
     pub ack: Option<bool>,
     pub invoice_string: Option<String>,
+    pub recipient_pubkey: Option<Vec<u8>>,
+    pub consignment_hash: Option<String>,
+    pub recipient_encryption: Encryption,
+    pub ack_signature: Option<Vec<u8>>,
+    pub proxy_transfer_id: Option<String>,
+    pub invoice_expiration: Option<i64>,
+    pub invoice_idx: Option<i32>,
+    pub receive_dir: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
@@ -33,6 +41,14 @@ pub enum Column {
     RecipientId,
     Ack,
     InvoiceString,
+    RecipientPubkey,
+    ConsignmentHash,
+    RecipientEncryption,
+    AckSignature,
+    ProxyTransferId,
+    InvoiceExpiration,
+    InvoiceIdx,
+    ReceiveDir,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DerivePrimaryKey)]
@@ -64,6 +80,14 @@ impl ColumnTrait for Column {
             Self::RecipientId => ColumnType::String(StringLen::None).def().null(),
             Self::Ack => ColumnType::Boolean.def().null(),
             Self::InvoiceString => ColumnType::String(StringLen::None).def().null(),
+            Self::RecipientPubkey => ColumnType::VarBinary(StringLen::None).def().null(),
+            Self::ConsignmentHash => ColumnType::String(StringLen::None).def().null(),
+            Self::RecipientEncryption => ColumnType::SmallInteger.def(),
+            Self::AckSignature => ColumnType::VarBinary(StringLen::None).def().null(),
+            Self::ProxyTransferId => ColumnType::String(StringLen::None).def().null(),
+            Self::InvoiceExpiration => ColumnType::BigInteger.def().null(),
+            Self::InvoiceIdx => ColumnType::Integer.def().null(),
+            Self::ReceiveDir => ColumnType::String(StringLen::None).def().null(),
         }
     }
 }

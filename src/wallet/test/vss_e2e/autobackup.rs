@@ -92,11 +92,15 @@ fn scenario_3_1_enable_auto_backup_bumps_version_after_each_operation() {
     // 3) receive (state change)
     let _ = wallet_a
         .witness_receive(
+            Some(online_a),
             Some(asset_id.clone()),
             Assignment::Fungible(1),
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
+            None,
+            None,
         )
         .expect("witness_receive");
     let v3 = rt
@@ -110,14 +114,18 @@ fn scenario_3_1_enable_auto_backup_bumps_version_after_each_operation() {
     prev_version = v3;
 
     // 4) send (state change)
-    let (mut wallet_b, _online_b) = get_empty_wallet!();
+    let (mut wallet_b, online_b) = get_empty_wallet!();
     let receive_b = wallet_b
         .witness_receive(
+            Some(online_b),
             None,
             Assignment::Fungible(10),
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
+            None,
+            None,
         )
         .expect("witness_receive receiver");
     let recipient_map = HashMap::from([(
@@ -130,6 +138,9 @@ fn scenario_3_1_enable_auto_backup_bumps_version_after_each_operation() {
             }),
             assignment: Assignment::Fungible(10),
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_b.public_key.clone()),
+            expiration_timestamp: Some(receive_b.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let _ = wallet_a
@@ -140,6 +151,7 @@ fn scenario_3_1_enable_auto_backup_bumps_version_after_each_operation() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .expect("send");
@@ -218,11 +230,15 @@ fn scenario_3_2_disable_auto_backup_prevents_version_bumps() {
 
     let _ = wallet_a
         .witness_receive(
+            Some(online_a),
             Some(asset_id.clone()),
             Assignment::Fungible(1),
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
+            None,
+            None,
         )
         .expect("witness_receive");
     assert_version_unchanged_for(
@@ -233,14 +249,18 @@ fn scenario_3_2_disable_auto_backup_prevents_version_bumps() {
         "witness_receive()",
     );
 
-    let (mut wallet_b, _online_b) = get_empty_wallet!();
+    let (mut wallet_b, online_b) = get_empty_wallet!();
     let receive_b = wallet_b
         .witness_receive(
+            Some(online_b),
             None,
             Assignment::Fungible(10),
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
+            None,
+            None,
         )
         .expect("witness_receive receiver");
     let recipient_map = HashMap::from([(
@@ -253,6 +273,9 @@ fn scenario_3_2_disable_auto_backup_prevents_version_bumps() {
             }),
             assignment: Assignment::Fungible(10),
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_b.public_key.clone()),
+            expiration_timestamp: Some(receive_b.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let _ = wallet_a
@@ -263,6 +286,7 @@ fn scenario_3_2_disable_auto_backup_prevents_version_bumps() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             None,
         )
         .expect("send");
@@ -410,7 +434,7 @@ fn manual_smoke_autobackup_async_restore() {
         .get_asset_metadata(asset_id.clone())
         .expect("metadata");
     let transfers_pre = wallet_a
-        .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+        .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
         .expect("list_transfers");
 
     // Configure auto-backup Async and wait for the backup to complete.
@@ -470,7 +494,7 @@ fn manual_smoke_autobackup_async_restore() {
         .get_asset_metadata(asset_id.clone())
         .expect("metadata");
     let transfers_post = wallet_r
-        .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+        .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
         .expect("list_transfers");
 
     assert_eq!(bal_post, bal_pre, "balance mismatch after restore");

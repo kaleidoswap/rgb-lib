@@ -129,6 +129,14 @@ fn convert_optional_number<T: serde::de::DeserializeOwned>(
     })
 }
 
+fn convert_optional_encryption(ptr: *const c_char) -> Result<Option<Encryption>, Error> {
+    Ok(if let Some(encryption) = convert_optional_string(ptr) {
+        serde_json::from_str(&encryption)?
+    } else {
+        None
+    })
+}
+
 fn convert_online(online: *const c_char) -> Result<Online, Error> {
     Ok(serde_json::from_str(&ptr_to_string(online))?)
 }
@@ -172,61 +180,6 @@ fn string_to_ptr(other: String) -> *mut c_char {
     };
 
     cstr.into_raw()
-}
-
-pub(crate) fn validate_consignment(
-    file_path: *const c_char,
-    indexer_url: *const c_char,
-    bitcoin_network: *const c_char,
-) -> Result<String, Error> {
-    use rgb_lib::{
-        ChainNet, FileContent, RgbTransfer, ValidationConfig, ValidationError,
-        wallet::rust_only::get_resolver,
-    };
-
-    let file_path = ptr_to_string(file_path);
-    let indexer_url = ptr_to_string(indexer_url);
-    let bitcoin_network = BitcoinNetwork::from_str(&ptr_to_string(bitcoin_network))?;
-    let chain_net: ChainNet = bitcoin_network.into();
-
-    let consignment = RgbTransfer::load_file(&file_path).map_err(|e| {
-        Error::RgbLib(RgbLibError::Internal {
-            details: format!("Failed to load consignment: {e}"),
-        })
-    })?;
-
-    let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-    let trusted_typesystem = asset_schema.types();
-
-    let resolver = get_resolver(&indexer_url, bitcoin_network)?;
-
-    let validation_config = ValidationConfig {
-        chain_net,
-        trusted_typesystem,
-        ..Default::default()
-    };
-
-    match consignment.validate(&resolver, &validation_config) {
-        Ok(valid_consignment) => {
-            let status = valid_consignment.validation_status();
-            Ok(serde_json::to_string(&serde_json::json!({
-                "valid": true,
-                "warnings": status.warnings.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
-            }))?)
-        }
-        Err(ValidationError::InvalidConsignment(failure)) => {
-            Ok(serde_json::to_string(&serde_json::json!({
-                "valid": false,
-                "error": "invalid",
-                "details": failure.to_string(),
-            }))?)
-        }
-        Err(ValidationError::ResolverError(e)) => Ok(serde_json::to_string(&serde_json::json!({
-            "valid": false,
-            "error": "resolver",
-            "details": e.to_string(),
-        }))?),
-    }
 }
 
 pub(crate) fn validate_consignment_offchain(
@@ -278,6 +231,7 @@ pub(crate) fn burn(
     online: *const c_char,
     asset_id: *const c_char,
     amount: *const c_char,
+    burn_reason: *const c_char,
     fee_rate: *const c_char,
     min_confirmations: *const c_char,
 ) -> Result<String, Error> {
@@ -285,17 +239,27 @@ pub(crate) fn burn(
     let online = convert_online(online)?;
     let asset_id = ptr_to_string(asset_id);
     let amount = ptr_to_num(amount)?;
+    let burn_reason = convert_optional_string(burn_reason);
     let fee_rate = ptr_to_num(fee_rate)?;
     let min_confirmations = ptr_to_num(min_confirmations)?;
-    let res = wallet.burn(online, asset_id, amount, fee_rate, min_confirmations)?;
+    let res = wallet.burn(
+        online,
+        asset_id,
+        amount,
+        burn_reason,
+        fee_rate,
+        min_confirmations,
+    )?;
     Ok(serde_json::to_string(&res)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn burn_begin(
     wallet: &COpaqueStruct,
     online: *const c_char,
     asset_id: *const c_char,
     amount: *const c_char,
+    burn_reason: *const c_char,
     fee_rate: *const c_char,
     min_confirmations: *const c_char,
     dry_run: bool,
@@ -304,12 +268,14 @@ pub(crate) fn burn_begin(
     let online = convert_online(online)?;
     let asset_id = ptr_to_string(asset_id);
     let amount = ptr_to_num(amount)?;
+    let burn_reason = convert_optional_string(burn_reason);
     let fee_rate = ptr_to_num(fee_rate)?;
     let min_confirmations = ptr_to_num(min_confirmations)?;
     let res = wallet.burn_begin(
         online,
         asset_id,
         amount,
+        burn_reason,
         fee_rate,
         min_confirmations,
         dry_run,
@@ -329,28 +295,54 @@ pub(crate) fn burn_end(
     Ok(serde_json::to_string(&res)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn blind_receive(
     wallet: &COpaqueStruct,
+    online: *const c_char,
     asset_id: *const c_char,
     assignment: *const c_char,
     expiration_timestamp: *const c_char,
     transport_endpoints: *const c_char,
     min_confirmations: *const c_char,
+    encryption: *const c_char,
+    quota: *const c_char,
 ) -> Result<String, Error> {
     let wallet = Wallet::from_opaque(wallet)?;
+    let online = convert_optional_online(online)?;
     let transport_endpoints: Vec<String> =
         serde_json::from_str(&ptr_to_string(transport_endpoints))?;
     let asset_id = convert_optional_string(asset_id);
     let assignment: Assignment = serde_json::from_str(&ptr_to_string(assignment))?;
     let expiration_timestamp = ptr_to_num(expiration_timestamp)?;
     let min_confirmations = ptr_to_num(min_confirmations)?;
+    let encryption = convert_optional_encryption(encryption)?;
+    let quota = convert_optional_number(quota)?;
     let res = wallet.blind_receive(
+        online,
         asset_id,
         assignment,
         expiration_timestamp,
         transport_endpoints,
         min_confirmations,
+        encryption,
+        quota,
     )?;
+    Ok(serde_json::to_string(&res)?)
+}
+
+pub(crate) fn check_indexer_url(
+    indexer_url: *const c_char,
+    bitcoind_auth: *const c_char,
+    bitcoin_network: *const c_char,
+) -> Result<String, Error> {
+    let indexer_url = ptr_to_string(indexer_url);
+    let bitcoind_auth: Option<BitcoindAuth> = match convert_optional_string(bitcoind_auth) {
+        Some(json) => Some(serde_json::from_str(&json)?),
+        None => None,
+    };
+    let bitcoin_network = BitcoinNetwork::from_str(&ptr_to_string(bitcoin_network))?;
+    let res =
+        rgb_lib::wallet::check_indexer_url(&indexer_url, bitcoind_auth.as_ref(), bitcoin_network)?;
     Ok(serde_json::to_string(&res)?)
 }
 
@@ -442,6 +434,17 @@ pub(crate) fn drain_to_end(
     Ok(res)
 }
 
+pub(crate) fn export_contract(
+    wallet: &COpaqueStruct,
+    asset_id: *const c_char,
+    destination_dir: *const c_char,
+) -> Result<String, Error> {
+    let wallet = Wallet::from_opaque(wallet)?;
+    let asset_id = ptr_to_string(asset_id);
+    let destination_dir = ptr_to_string(destination_dir);
+    Ok(wallet.export_contract(asset_id, destination_dir)?)
+}
+
 pub(crate) fn fail_transfers(
     wallet: &COpaqueStruct,
     online: *const c_char,
@@ -498,16 +501,6 @@ pub(crate) fn get_address(wallet: &COpaqueStruct) -> Result<String, Error> {
     Ok(wallet.get_address()?)
 }
 
-pub(crate) fn rotate_vanilla_address(wallet: &COpaqueStruct) -> Result<String, Error> {
-    let wallet = Wallet::from_opaque(wallet)?;
-    Ok(wallet.rotate_address(rgb_lib::bdk_wallet::KeychainKind::Internal)?)
-}
-
-pub(crate) fn rotate_colored_address(wallet: &COpaqueStruct) -> Result<String, Error> {
-    let wallet = Wallet::from_opaque(wallet)?;
-    Ok(wallet.rotate_address(rgb_lib::bdk_wallet::KeychainKind::External)?)
-}
-
 pub(crate) fn get_asset_balance(
     wallet: &COpaqueStruct,
     asset_id: *const c_char,
@@ -551,6 +544,16 @@ pub(crate) fn get_fee_estimation(
     Ok(serde_json::to_string(&res)?)
 }
 
+pub(crate) fn get_received_mint(
+    wallet: &COpaqueStruct,
+    recipient_id: *const c_char,
+) -> Result<String, Error> {
+    let wallet = Wallet::from_opaque(wallet)?;
+    let recipient_id = ptr_to_string(recipient_id);
+    let res = wallet.get_received_mint(recipient_id)?;
+    Ok(serde_json::to_string(&res)?)
+}
+
 pub(crate) fn go_online(
     wallet: &COpaqueStruct,
     online_options: *const c_char,
@@ -559,6 +562,18 @@ pub(crate) fn go_online(
     let online_options: OnlineOptions = serde_json::from_str(&ptr_to_string(online_options))?;
     let res = wallet.go_online(online_options)?;
     Ok(serde_json::to_string(&res)?)
+}
+
+pub(crate) fn import_contract(
+    wallet: &COpaqueStruct,
+    contract_path: *const c_char,
+    media_file_paths: *const c_char,
+) -> Result<(), Error> {
+    let wallet = Wallet::from_opaque(wallet)?;
+    let contract_path = ptr_to_string(contract_path);
+    let media_file_paths: Vec<String> = serde_json::from_str(&ptr_to_string(media_file_paths))?;
+    wallet.import_contract(contract_path, media_file_paths)?;
+    Ok(())
 }
 
 pub(crate) fn inflate(
@@ -624,10 +639,80 @@ pub(crate) fn inflate_end(
     Ok(serde_json::to_string(&res)?)
 }
 
+pub(crate) fn inspect_consignment(
+    consignment_path: *const c_char,
+    bundle_filter: *const c_char,
+) -> Result<String, Error> {
+    let consignment_path = ptr_to_string(consignment_path);
+    let bundle_filter: BundleFilter = serde_json::from_str(&ptr_to_string(bundle_filter))?;
+    let res = rgb_lib::no_wallet::inspect_consignment(consignment_path, bundle_filter)?;
+    Ok(serde_json::to_string(&res)?)
+}
+
+pub(crate) fn inspect_fascia(
+    psbt: *const c_char,
+    fascia_path: *const c_char,
+    entropy: *const c_char,
+    max_fascia_size: *const c_char,
+    max_bundles: *const c_char,
+    bitcoin_network: *const c_char,
+) -> Result<String, Error> {
+    let psbt = ptr_to_string(psbt);
+    let fascia_path = ptr_to_string(fascia_path);
+    let entropy = convert_optional_number(entropy)?;
+    let max_fascia_size = ptr_to_num(max_fascia_size)?;
+    let max_bundles = ptr_to_num(max_bundles)?;
+    let bitcoin_network = BitcoinNetwork::from_str(&ptr_to_string(bitcoin_network))?;
+    let res = rgb_lib::no_wallet::inspect_fascia(
+        psbt,
+        fascia_path,
+        entropy,
+        max_fascia_size,
+        max_bundles,
+        bitcoin_network,
+    )?;
+    Ok(serde_json::to_string(&res)?)
+}
+
 pub(crate) fn invoice_data(invoice_string: *const c_char) -> Result<String, Error> {
     let invoice_string = ptr_to_string(invoice_string);
     let invoice = rgb_lib::wallet::Invoice::new(invoice_string)?;
     Ok(serde_json::to_string(&invoice.invoice_data())?)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn issue_asset_bfa(
+    wallet: &COpaqueStruct,
+    ticker: *const c_char,
+    name: *const c_char,
+    precision: *const c_char,
+    mint_rights: *const c_char,
+    chain_id: *const c_char,
+    contract_address: *const c_char,
+    reject_list_address: *const c_char,
+    link_right: bool,
+    linked_from_contract: *const c_char,
+    skip_contract_checks: bool,
+) -> Result<String, Error> {
+    let wallet = Wallet::from_opaque(wallet)?;
+    let precision = ptr_to_num(precision)?;
+    let mint_rights = ptr_to_num(mint_rights)?;
+    let chain_id = ptr_to_num(chain_id)?;
+    let reject_list_address = convert_optional_string(reject_list_address);
+    let linked_from_contract = convert_optional_string(linked_from_contract);
+    let res = wallet.issue_asset_bfa(
+        ptr_to_string(ticker),
+        ptr_to_string(name),
+        precision,
+        mint_rights,
+        chain_id,
+        ptr_to_string(contract_address),
+        reject_list_address,
+        link_right,
+        linked_from_contract,
+        skip_contract_checks,
+    )?;
+    Ok(serde_json::to_string(&res)?)
 }
 
 pub(crate) fn issue_asset_cfa(
@@ -657,12 +742,16 @@ pub(crate) fn issue_asset_ifa(
     amounts: *const c_char,
     inflation_amounts: *const c_char,
     reject_list_url: *const c_char,
+    link_right: bool,
+    linked_from_contract: *const c_char,
+    skip_contract_checks: bool,
 ) -> Result<String, Error> {
     let wallet = Wallet::from_opaque(wallet)?;
     let precision = ptr_to_num(precision)?;
     let amounts = convert_strings_array(amounts)?;
     let inflation_amounts = convert_strings_array(inflation_amounts)?;
     let reject_list_url = convert_optional_string(reject_list_url);
+    let linked_from_contract = convert_optional_string(linked_from_contract);
     let res = wallet.issue_asset_ifa(
         ptr_to_string(ticker),
         ptr_to_string(name),
@@ -670,7 +759,9 @@ pub(crate) fn issue_asset_ifa(
         amounts,
         inflation_amounts,
         reject_list_url,
-        None,
+        link_right,
+        linked_from_contract,
+        skip_contract_checks,
     )?;
     Ok(serde_json::to_string(&res)?)
 }
@@ -721,6 +812,73 @@ pub(crate) fn issue_asset_uda(
     Ok(serde_json::to_string(&res)?)
 }
 
+pub(crate) fn link(
+    wallet: &COpaqueStruct,
+    online: *const c_char,
+    asset_id: *const c_char,
+    linked_to_contract: *const c_char,
+    fee_rate: *const c_char,
+    min_confirmations: *const c_char,
+    skip_contract_checks: bool,
+) -> Result<String, Error> {
+    let wallet = Wallet::from_opaque(wallet)?;
+    let online = convert_online(online)?;
+    let asset_id = ptr_to_string(asset_id);
+    let linked_to_contract = ptr_to_string(linked_to_contract);
+    let fee_rate = ptr_to_num(fee_rate)?;
+    let min_confirmations = ptr_to_num(min_confirmations)?;
+    let res = wallet.link(
+        online,
+        asset_id,
+        linked_to_contract,
+        fee_rate,
+        min_confirmations,
+        skip_contract_checks,
+    )?;
+    Ok(serde_json::to_string(&res)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn link_begin(
+    wallet: &COpaqueStruct,
+    online: *const c_char,
+    asset_id: *const c_char,
+    linked_to_contract: *const c_char,
+    fee_rate: *const c_char,
+    min_confirmations: *const c_char,
+    skip_contract_checks: bool,
+    dry_run: bool,
+) -> Result<String, Error> {
+    let wallet = Wallet::from_opaque(wallet)?;
+    let online = convert_online(online)?;
+    let asset_id = ptr_to_string(asset_id);
+    let linked_to_contract = ptr_to_string(linked_to_contract);
+    let fee_rate = ptr_to_num(fee_rate)?;
+    let min_confirmations = ptr_to_num(min_confirmations)?;
+    let res = wallet.link_begin(
+        online,
+        asset_id,
+        linked_to_contract,
+        fee_rate,
+        min_confirmations,
+        skip_contract_checks,
+        dry_run,
+    )?;
+    Ok(serde_json::to_string(&res)?)
+}
+
+pub(crate) fn link_end(
+    wallet: &COpaqueStruct,
+    online: *const c_char,
+    signed_psbt: *const c_char,
+) -> Result<String, Error> {
+    let wallet = Wallet::from_opaque(wallet)?;
+    let online = convert_online(online)?;
+    let signed_psbt = ptr_to_string(signed_psbt);
+    let res = wallet.link_end(online, signed_psbt)?;
+    Ok(serde_json::to_string(&res)?)
+}
+
 pub(crate) fn list_assets(
     wallet: &COpaqueStruct,
     filter_asset_schemas: *const c_char,
@@ -746,12 +904,16 @@ pub(crate) fn list_transactions(
 pub(crate) fn list_transfers(
     wallet: &COpaqueStruct,
     asset_filter: *const c_char,
-    txid: *const c_char,
+    scope: *const c_char,
 ) -> Result<String, Error> {
     let wallet = Wallet::from_opaque(wallet)?;
     let asset_filter: AssetFilter = serde_json::from_str(&ptr_to_string(asset_filter))?;
-    let txid = convert_optional_string(txid);
-    let res = wallet.list_transfers(asset_filter, txid)?;
+    // a NULL scope lists all transfers
+    let scope: TransferScope = match convert_optional_string(scope) {
+        Some(scope) => serde_json::from_str(&scope)?,
+        None => TransferScope::All,
+    };
+    let res = wallet.list_transfers(asset_filter, scope)?;
     Ok(serde_json::to_string(&res)?)
 }
 
@@ -776,6 +938,49 @@ pub(crate) fn load_wallet(
     let master_fingerprint = ptr_to_string(master_fingerprint);
     let mnemonic = convert_optional_string(mnemonic);
     Ok(Wallet::load(&data_dir, &master_fingerprint, mnemonic)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mint_begin(
+    wallet: &COpaqueStruct,
+    online: *const c_char,
+    asset_id: *const c_char,
+    recipient: *const c_char,
+    before_block: *const c_char,
+    fee_rate: *const c_char,
+    min_confirmations: *const c_char,
+    sender_transport_endpoint: *const c_char,
+) -> Result<String, Error> {
+    let wallet = Wallet::from_opaque(wallet)?;
+    let online = convert_online(online)?;
+    let asset_id = ptr_to_string(asset_id);
+    let recipient: Recipient = serde_json::from_str(&ptr_to_string(recipient))?;
+    let before_block = ptr_to_num(before_block)?;
+    let fee_rate = ptr_to_num(fee_rate)?;
+    let min_confirmations = ptr_to_num(min_confirmations)?;
+    let sender_transport_endpoint = ptr_to_string(sender_transport_endpoint);
+    let res = wallet.mint_begin(
+        online,
+        asset_id,
+        recipient,
+        before_block,
+        fee_rate,
+        min_confirmations,
+        sender_transport_endpoint,
+    )?;
+    Ok(serde_json::to_string(&res)?)
+}
+
+pub(crate) fn mint_end(
+    wallet: &COpaqueStruct,
+    online: *const c_char,
+    signed_psbt: *const c_char,
+) -> Result<String, Error> {
+    let wallet = Wallet::from_opaque(wallet)?;
+    let online = convert_online(online)?;
+    let signed_psbt = ptr_to_string(signed_psbt);
+    let res = wallet.mint_end(online, signed_psbt)?;
+    Ok(serde_json::to_string(&res)?)
 }
 
 pub(crate) fn new_wallet(wallet_data: *const c_char, keys: *const c_char) -> Result<Wallet, Error> {
@@ -832,6 +1037,7 @@ pub(crate) fn send(
     fee_rate: *const c_char,
     min_confirmations: *const c_char,
     expiration_timestamp: *const c_char,
+    sender_transport_endpoint: *const c_char,
 ) -> Result<String, Error> {
     let wallet = Wallet::from_opaque(wallet)?;
     let online = convert_online(online)?;
@@ -840,6 +1046,7 @@ pub(crate) fn send(
     let fee_rate = ptr_to_num(fee_rate)?;
     let min_confirmations = ptr_to_num(min_confirmations)?;
     let expiration_timestamp = ptr_to_num(expiration_timestamp)?;
+    let sender_transport_endpoint = convert_optional_string(sender_transport_endpoint);
     let res = wallet.send(
         online,
         recipient_map,
@@ -847,6 +1054,7 @@ pub(crate) fn send(
         fee_rate,
         min_confirmations,
         expiration_timestamp,
+        sender_transport_endpoint,
         None,
     )?;
     Ok(serde_json::to_string(&res)?)
@@ -861,6 +1069,7 @@ pub(crate) fn send_begin(
     fee_rate: *const c_char,
     min_confirmations: *const c_char,
     expiration_timestamp: *const c_char,
+    sender_transport_endpoint: *const c_char,
     dry_run: bool,
 ) -> Result<String, Error> {
     let wallet = Wallet::from_opaque(wallet)?;
@@ -870,6 +1079,7 @@ pub(crate) fn send_begin(
     let fee_rate = ptr_to_num(fee_rate)?;
     let min_confirmations = ptr_to_num(min_confirmations)?;
     let expiration_timestamp = ptr_to_num(expiration_timestamp)?;
+    let sender_transport_endpoint = convert_optional_string(sender_transport_endpoint);
     let res = wallet.send_begin(
         online,
         recipient_map,
@@ -877,6 +1087,7 @@ pub(crate) fn send_begin(
         fee_rate,
         min_confirmations,
         expiration_timestamp,
+        sender_transport_endpoint,
         dry_run,
         None,
     )?;
@@ -963,27 +1174,62 @@ pub(crate) fn sync(
     Ok(())
 }
 
+pub(crate) fn validate_consignment(
+    consignment_path: *const c_char,
+    indexer_config: *const c_char,
+    evm_rpc_urls: *const c_char,
+    min_confirmations: *const c_char,
+    options: *const c_char,
+) -> Result<String, Error> {
+    let consignment_path = ptr_to_string(consignment_path);
+    let indexer_config: IndexerConfig = serde_json::from_str(&ptr_to_string(indexer_config))?;
+    let evm_rpc_urls: HashMap<u64, String> = serde_json::from_str(&ptr_to_string(evm_rpc_urls))?;
+    let min_confirmations = convert_optional_number(min_confirmations)?;
+    let options: ValidationOptions = serde_json::from_str(&ptr_to_string(options))?;
+    let res = rgb_lib::no_wallet::validate_consignment(
+        &consignment_path,
+        &indexer_config,
+        &evm_rpc_urls,
+        min_confirmations,
+        &options,
+    )?;
+    Ok(serde_json::to_string(&res)?)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn witness_receive(
     wallet: &COpaqueStruct,
+    online: *const c_char,
     asset_id: *const c_char,
     assignment: *const c_char,
     expiration_timestamp: *const c_char,
     transport_endpoints: *const c_char,
     min_confirmations: *const c_char,
+    encryption: *const c_char,
+    quota: *const c_char,
+    address: *const c_char,
 ) -> Result<String, Error> {
     let wallet = Wallet::from_opaque(wallet)?;
+    let online = convert_optional_online(online)?;
     let transport_endpoints: Vec<String> =
         serde_json::from_str(&ptr_to_string(transport_endpoints))?;
     let asset_id = convert_optional_string(asset_id);
     let assignment: Assignment = serde_json::from_str(&ptr_to_string(assignment))?;
     let expiration_timestamp = ptr_to_num(expiration_timestamp)?;
     let min_confirmations = ptr_to_num(min_confirmations)?;
+    let encryption = convert_optional_encryption(encryption)?;
+    let quota = convert_optional_number(quota)?;
+    let address = convert_optional_string(address);
     let res = wallet.witness_receive(
+        online,
         asset_id,
         assignment,
         expiration_timestamp,
         transport_endpoints,
         min_confirmations,
+        encryption,
+        quota,
+        address,
     )?;
     Ok(serde_json::to_string(&res)?)
 }

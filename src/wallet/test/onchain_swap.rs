@@ -5,8 +5,6 @@ use base64::{Engine as _, engine::general_purpose};
 use bdk_wallet::bitcoin::psbt::Psbt;
 
 #[cfg(feature = "electrum")]
-use crate::api::proxy::ProxyClient;
-
 use super::*;
 use crate::wallet::offline::{
     SWAP_OUTGOING_FILE, SwapOutgoingState, swap_build_input, swap_save_state, swap_state_path,
@@ -48,35 +46,6 @@ fn rgb(asset_id: &str, amount: u64) -> OnchainSwapLeg {
 
 #[test]
 #[parallel]
-fn swap_offer_requires_proxy_url() {
-    initialize();
-
-    let (mut maker, maker_online) = get_funded_noutxo_wallet(true, None);
-    let asset_id = issue_swap_asset(
-        &mut maker,
-        maker_online,
-        "SNOP",
-        "Swap No Proxy",
-        SWAP_RGB_AMOUNT,
-    );
-
-    let result = maker.create_swap_offer(
-        rgb(&asset_id, SWAP_RGB_AMOUNT),
-        btc(SWAP_BTC_PRICE),
-        SWAP_FEE,
-        None,
-        None,
-        vec![],
-    );
-
-    assert!(matches!(
-        result,
-        Err(Error::InvalidTransportEndpoints { .. })
-    ));
-}
-
-#[test]
-#[parallel]
 fn maker_taker_rgb_for_btc_balances() {
     initialize();
 
@@ -100,7 +69,6 @@ fn maker_taker_rgb_for_btc_balances() {
         taker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
 
     assert_btc_delta(
@@ -147,7 +115,6 @@ fn swap_refuses_counterparty_inputs_that_belong_to_this_wallet() {
             btc(SWAP_BTC_PRICE),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -205,7 +172,6 @@ fn taker_refuses_undeclared_own_coins_as_maker_inputs() {
             rgb(&asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -298,7 +264,6 @@ fn refresh_after_swap_settles_transfers_without_panicking() {
         taker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
 
     // Before the fix, the batch transfer `swap_record_outgoing`/`swap_record_incoming` create for
@@ -356,7 +321,6 @@ fn taker_funded_extra_output() {
         taker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
         vec![OnchainSwapExtraOutput {
             address: fee_recipient,
             amount_sat: PLATFORM_FEE,
@@ -419,7 +383,6 @@ fn maker_taker_btc_for_rgb_balances() {
         taker_online,
         btc(SWAP_BTC_PRICE),
         rgb(&asset_id, SWAP_RGB_AMOUNT),
-        PROXY_URL,
     );
 
     assert_btc_delta(
@@ -477,7 +440,6 @@ fn maker_taker_rgb_for_rgb_balances() {
         taker_online,
         rgb(&maker_asset_id, SWAP_RGB_AMOUNT),
         rgb(&taker_asset_id, SWAP_RGB_AMOUNT),
-        PROXY_URL,
     );
 
     assert_btc_delta(
@@ -537,7 +499,6 @@ fn maker_gives_received_asset_for_btc() {
         taker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
 
     assert_btc_delta(
@@ -571,7 +532,6 @@ fn maker_gives_received_asset_for_btc() {
         maker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
     assert_asset_balances(
         &taker,
@@ -617,7 +577,6 @@ fn maker_and_taker_give_received_assets_rgb_for_rgb() {
         taker_online,
         rgb(&maker_asset_id, SWAP_RGB_AMOUNT),
         rgb(&taker_asset_id, SWAP_RGB_AMOUNT),
-        PROXY_URL,
     );
 
     assert_asset_balances(
@@ -659,7 +618,6 @@ fn maker_rejects_request_with_mutated_offer() {
             btc(SWAP_BTC_PRICE),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -696,7 +654,6 @@ fn taker_refuses_a_maker_input_declared_with_the_wrong_amount() {
             rgb(&asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -745,7 +702,6 @@ fn taker_rejects_proposal_with_mutated_request() {
             btc(SWAP_BTC_PRICE),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -785,7 +741,6 @@ fn maker_rejects_tampered_rgb_consignment_before_signing_btc() {
             rgb(&asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -839,7 +794,6 @@ fn partial_rgb_for_btc_keeps_change_spendable() {
         taker_online,
         rgb(&asset_id, PARTIAL),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
@@ -854,7 +808,6 @@ fn partial_rgb_for_btc_keeps_change_spendable() {
         taker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT - PARTIAL),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
@@ -894,7 +847,6 @@ fn partial_rgb_for_rgb_keeps_change_on_both_sides() {
         taker_online,
         rgb(&maker_asset_id, MAKER_PARTIAL),
         rgb(&taker_asset_id, TAKER_PARTIAL),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
@@ -929,7 +881,6 @@ fn default_utxo_btc_for_rgb_balances() {
             rgb(&asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -964,7 +915,6 @@ fn default_utxo_btc_for_rgb_balances() {
         taker_online,
         btc(SWAP_BTC_PRICE),
         rgb(&asset_id, SWAP_RGB_AMOUNT),
-        PROXY_URL,
     );
 
     assert_btc_delta(
@@ -1014,7 +964,6 @@ fn default_utxo_rgb_for_btc_balances() {
         taker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
 
     assert_btc_delta(
@@ -1071,7 +1020,6 @@ fn default_utxo_rgb_for_rgb_balances() {
         taker_online,
         rgb(&maker_asset_id, SWAP_RGB_AMOUNT),
         rgb(&taker_asset_id, SWAP_RGB_AMOUNT),
-        PROXY_URL,
     );
 
     assert_btc_delta(
@@ -1137,7 +1085,6 @@ fn default_utxo_partial_rgb_for_rgb_keeps_maker_change() {
         taker_online,
         rgb(&maker_asset_id, MAKER_PARTIAL),
         rgb(&taker_asset_id, SWAP_RGB_AMOUNT),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
@@ -1154,7 +1101,6 @@ fn default_utxo_partial_rgb_for_rgb_keeps_maker_change() {
         taker_online,
         rgb(&maker_asset_id, SWAP_RGB_AMOUNT - MAKER_PARTIAL),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
@@ -1189,7 +1135,6 @@ fn default_utxo_full_sale_returns_btc_change_to_vanilla() {
             rgb(&asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -1287,7 +1232,6 @@ fn default_utxo_partial_sale_colors_change_with_smallest_top_up() {
             rgb(&asset_id, PARTIAL),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -1387,7 +1331,6 @@ fn swap_top_up_skips_reserved_coins() {
             rgb(&asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -1463,7 +1406,6 @@ fn swap_btc_leg_skips_reserved_coins() {
             btc(SWAP_BTC_PRICE),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -1544,7 +1486,6 @@ fn second_asset_on_swap_input_survives() {
         taker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
@@ -1582,7 +1523,6 @@ fn swap_received_utxo_is_spendable() {
         taker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
     refresh_settled(&mut taker, taker_online);
     assert_settled_balance(&taker, &asset_id, SWAP_RGB_AMOUNT);
@@ -1618,7 +1558,6 @@ fn cancel_before_broadcast_leaves_state_unchanged() {
             btc(SWAP_BTC_PRICE),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -1661,7 +1600,7 @@ fn cancel_before_broadcast_leaves_state_unchanged() {
     assert_eq!(balance_after.spendable, balance_before.spendable);
     assert!(
         maker
-            .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+            .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
             .unwrap()
             .iter()
             .any(|t| t.status == TransferStatus::Failed)
@@ -1675,7 +1614,6 @@ fn cancel_before_broadcast_leaves_state_unchanged() {
         taker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
@@ -1709,7 +1647,6 @@ fn expired_unbroadcast_swap_is_cancelled() {
             rgb(&asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             Some(expiration as u64),
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -1756,7 +1693,6 @@ fn expired_unbroadcast_swap_is_cancelled() {
         taker_online,
         btc(SWAP_BTC_PRICE),
         rgb(&asset_id, SWAP_RGB_AMOUNT),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
@@ -1793,7 +1729,6 @@ fn exclude_outpoints_and_list_swaps() {
             btc(SWAP_BTC_PRICE),
             SWAP_FEE,
             Some(now().unix_timestamp() as u64 + 3600),
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -1880,7 +1815,6 @@ fn exclude_outpoints_and_list_swaps() {
             rgb(&asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -1968,14 +1902,7 @@ fn swap_to_completion(
     expiration: Option<u64>,
 ) -> OnchainSwapCompletion {
     let offer = maker
-        .create_swap_offer(
-            maker_gives,
-            maker_receives,
-            SWAP_FEE,
-            expiration,
-            Some(PROXY_URL.to_string()),
-            vec![],
-        )
+        .create_swap_offer(maker_gives, maker_receives, SWAP_FEE, expiration, vec![])
         .unwrap();
     let request = taker
         .accept_swap_offer(taker_online, offer, 0, false, vec![])
@@ -2098,7 +2025,6 @@ fn maker_refuses_request_with_spent_taker_input(indexer_url: Option<String>, esp
             btc(SWAP_BTC_PRICE),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -2129,7 +2055,6 @@ fn taker_refuses_proposal_with_spent_maker_input(indexer_url: Option<String>, es
             rgb(&asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -2183,7 +2108,6 @@ fn refused_proposal_is_swept_on_expiry() {
             rgb(&asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             Some(expiration as u64),
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -2203,7 +2127,7 @@ fn refused_proposal_is_swept_on_expiry() {
     assert!(!swap_outgoing_path(&taker, &swap_id).exists());
     // a stale record pointing at an existing batch of another transfer must not be failed
     let other_batch_idx = taker
-        .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+        .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
         .unwrap()
         .first()
         .unwrap()
@@ -2290,7 +2214,6 @@ fn maker_refuses_request_with_wrong_taker_amount(indexer_url: Option<String>) {
             btc(SWAP_BTC_PRICE),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -2341,7 +2264,7 @@ fn write_stale_outgoing(wallet: &Wallet, swap_id: &str, batch_transfer_idx: i32)
 /// The wallet's transfers, unspents, stash and balance for `asset_id`.
 fn rgb_state(wallet: &mut Wallet, online: Online, asset_id: &str) -> Vec<String> {
     let mut state = wallet
-        .list_transfers(AssetFilter::AnyOrNone, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()
         .iter()
         .map(|t| format!("{t:?}"))
@@ -2727,7 +2650,6 @@ fn taker_invalidates_a_withheld_swap() {
         taker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
@@ -2941,7 +2863,6 @@ fn invalidate_swap_rejects_invalid_calls() {
             rgb(&asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -3033,9 +2954,10 @@ fn stash_assignments(
         .collect::<Vec<_>>();
     // read straight from the RGB stash, not from the DB
     let contract_id = ContractId::from_str(asset_id).unwrap();
-    let runtime = wallet.rgb_runtime().unwrap();
+    let txn = wallet.database().begin_transaction().unwrap();
+    let stock = wallet.rgb_stock(&txn).unwrap();
     let mut by_outpoint: HashMap<Outpoint, Vec<Assignment>> = HashMap::new();
-    for (seal, opout_state_map) in runtime
+    for (seal, opout_state_map) in stock
         .contract_assignments_for(
             contract_id,
             outpoints.iter().cloned().map(BdkOutPoint::from),
@@ -3067,6 +2989,9 @@ fn normal_send(sender: &mut SinglesigParty, rcv: &mut SinglesigParty, asset_id: 
             recipient_id: receive_data.recipient_id,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     sender.send(recipient_map, FEE_RATE, None);
@@ -3144,7 +3069,6 @@ fn execute_swap(
     taker_online: Online,
     maker_gives: OnchainSwapLeg,
     maker_receives: OnchainSwapLeg,
-    proxy_url: &str,
 ) -> OnchainSwapCompletion {
     execute_swap_with_extra_outputs(
         maker,
@@ -3153,7 +3077,6 @@ fn execute_swap(
         taker_online,
         maker_gives,
         maker_receives,
-        proxy_url,
         vec![],
     )
 }
@@ -3166,7 +3089,6 @@ fn execute_swap_with_extra_outputs(
     taker_online: Online,
     maker_gives: OnchainSwapLeg,
     maker_receives: OnchainSwapLeg,
-    proxy_url: &str,
     extra_outputs: Vec<OnchainSwapExtraOutput>,
 ) -> OnchainSwapCompletion {
     let maker_receives_rgb = matches!(maker_receives.kind, OnchainSwapLegKind::Rgb);
@@ -3176,14 +3098,7 @@ fn execute_swap_with_extra_outputs(
     let maker_receives_asset_id = maker_receives.asset_id.clone();
 
     let offer = maker
-        .create_swap_offer(
-            maker_gives,
-            maker_receives,
-            SWAP_FEE,
-            None,
-            Some(proxy_url.to_string()),
-            extra_outputs,
-        )
+        .create_swap_offer(maker_gives, maker_receives, SWAP_FEE, None, extra_outputs)
         .unwrap();
     let request = taker
         .accept_swap_offer(taker_online, offer, 0, false, vec![])
@@ -3225,15 +3140,11 @@ fn execute_swap_with_extra_outputs(
             "taker RGB history should be exposed as a high-level history ref"
         );
         assert_asset_history_transport(completion.taker_history.as_ref());
-        let mut missing_history_endpoint = completion.clone();
-        missing_history_endpoint
-            .taker_history
-            .as_mut()
-            .unwrap()
-            .endpoint = None;
+        let mut missing_history = completion.clone();
+        missing_history.taker_history.as_mut().unwrap().consignment = String::new();
         assert!(
             maker
-                .process_swap_completion(maker_online, missing_history_endpoint)
+                .process_swap_completion(maker_online, missing_history)
                 .is_err()
         );
         let mut tampered_completion = completion.clone();
@@ -3259,29 +3170,29 @@ fn execute_swap_with_extra_outputs(
     mine(false);
 
     if taker_receives_rgb {
-        let mut bad_endpoint = completion.clone();
-        bad_endpoint
+        let mut bad_consignment = completion.clone();
+        bad_consignment
             .consignments
             .iter_mut()
             .filter(|c| Some(c.asset_id.as_str()) == maker_gives_asset_id.as_deref())
-            .for_each(|c| c.endpoint = Some(format!("rpc://{PROXY_HOST_MOD_PROTO}")));
+            .for_each(|c| c.consignment = general_purpose::STANDARD.encode(b"not a consignment"));
         assert!(
             taker
-                .accept_swap_transfers(taker_online, bad_endpoint, OnchainSwapRole::Taker, false)
+                .accept_swap_transfers(taker_online, bad_consignment, OnchainSwapRole::Taker, false)
                 .is_err()
         );
 
-        let mut missing_endpoint = completion.clone();
-        missing_endpoint
+        let mut missing_consignment_data = completion.clone();
+        missing_consignment_data
             .consignments
             .iter_mut()
             .filter(|c| Some(c.asset_id.as_str()) == maker_gives_asset_id.as_deref())
-            .for_each(|c| c.endpoint = None);
+            .for_each(|c| c.consignment = String::new());
         assert!(
             taker
                 .accept_swap_transfers(
                     taker_online,
-                    missing_endpoint,
+                    missing_consignment_data,
                     OnchainSwapRole::Taker,
                     false,
                 )
@@ -3326,29 +3237,29 @@ fn execute_swap_with_extra_outputs(
         assert!(!receive_result.assignments.is_empty());
     }
     if maker_receives_rgb {
-        let mut bad_endpoint = completion.clone();
-        bad_endpoint
+        let mut bad_consignment = completion.clone();
+        bad_consignment
             .consignments
             .iter_mut()
             .filter(|c| Some(c.asset_id.as_str()) == maker_receives_asset_id.as_deref())
-            .for_each(|c| c.endpoint = Some(format!("rpc://{PROXY_HOST_MOD_PROTO}")));
+            .for_each(|c| c.consignment = general_purpose::STANDARD.encode(b"not a consignment"));
         assert!(
             maker
-                .accept_swap_transfers(maker_online, bad_endpoint, OnchainSwapRole::Maker, false)
+                .accept_swap_transfers(maker_online, bad_consignment, OnchainSwapRole::Maker, false)
                 .is_err()
         );
 
-        let mut missing_endpoint = completion.clone();
-        missing_endpoint
+        let mut missing_consignment_data = completion.clone();
+        missing_consignment_data
             .consignments
             .iter_mut()
             .filter(|c| Some(c.asset_id.as_str()) == maker_receives_asset_id.as_deref())
-            .for_each(|c| c.endpoint = None);
+            .for_each(|c| c.consignment = String::new());
         assert!(
             maker
                 .accept_swap_transfers(
                     maker_online,
-                    missing_endpoint,
+                    missing_consignment_data,
                     OnchainSwapRole::Maker,
                     false,
                 )
@@ -3429,14 +3340,8 @@ fn assert_consignment_transport(consignments: &[OnchainSwapConsignment]) {
         return;
     }
     for consignment in consignments {
-        assert_eq!(
-            consignment.endpoint.as_deref(),
-            Some(PROXY_ENDPOINT.as_str())
-        );
-        assert!(
-            consignment.path.is_empty(),
-            "proxy-mode consignments must not expose sender-local paths"
-        );
+        RgbTransfer::load(&consignment_bytes(&consignment.consignment)[..])
+            .expect("swap consignments travel in-band");
     }
 }
 
@@ -3444,11 +3349,8 @@ fn assert_asset_history_transport(history: Option<&OnchainSwapAssetHistory>) {
     let Some(history) = history else {
         return;
     };
-    assert_eq!(history.endpoint.as_deref(), Some(PROXY_ENDPOINT.as_str()));
-    assert!(
-        history.path.is_empty(),
-        "proxy-mode asset histories must not expose sender-local paths"
-    );
+    RgbTransfer::load(&consignment_bytes(&history.consignment)[..])
+        .expect("swap asset histories travel in-band");
 }
 
 fn signature_count(psbt: &str) -> usize {
@@ -3558,9 +3460,8 @@ fn assert_asset_balances(
 }
 
 /// A maker selling RGB hands the taker a bad consignment for it. Each one is refused before the
-/// taker signs, and leaves the taker's wallet as it was. The taker fetches the consignment from
-/// the endpoint the maker put in the proposal, so a maker can serve any bytes it likes: a mock
-/// proxy plays that part.
+/// taker signs, and leaves the taker's wallet as it was. The consignment travels inside the
+/// proposal, so a maker can put any bytes it likes there.
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
@@ -3585,12 +3486,11 @@ fn taker_refuses_a_bad_maker_consignment_before_signing() {
         taker_online,
         rgb(&asset_id, SWAP_RGB_AMOUNT),
         btc(SWAP_BTC_PRICE),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
     let earlier_consignment = earlier.consignments[0].clone();
-    let earlier_bytes = proxy_consignment_bytes(&earlier_consignment.recipient_id);
+    let earlier_bytes = consignment_bytes(&earlier_consignment.consignment);
 
     let offer = maker
         .create_swap_offer(
@@ -3598,7 +3498,6 @@ fn taker_refuses_a_bad_maker_consignment_before_signing() {
             btc(SWAP_BTC_PRICE),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -3611,17 +3510,13 @@ fn taker_refuses_a_bad_maker_consignment_before_signing() {
         .unwrap();
     assert_eq!(proposal.consignments.len(), 1);
     let honest = proposal.consignments[0].clone();
-    let honest_bytes = proxy_consignment_bytes(&honest.recipient_id);
+    let honest_bytes = consignment_bytes(&honest.consignment);
     let with_consignment = |consignment: OnchainSwapConsignment| {
         let mut bad = proposal.clone();
         bad.consignments = vec![consignment];
         bad
     };
 
-    let (_replay_server, _replay_mock, replay_endpoint) =
-        hostile_proxy(&earlier_bytes, &earlier.txid);
-    let (_truncated_server, _truncated_mock, truncated_endpoint) =
-        hostile_proxy(&honest_bytes[..honest_bytes.len() / 2], &proposal.txid);
     let mut bad_proposals = vec![];
     let mut consignment = honest.clone();
     consignment.blinding += 1;
@@ -3640,14 +3535,15 @@ fn taker_refuses_a_bad_maker_consignment_before_signing() {
     ));
     // every field matches this swap, the bytes are the earlier swap's
     let mut consignment = honest.clone();
-    consignment.endpoint = Some(replay_endpoint);
+    consignment.consignment = general_purpose::STANDARD.encode(&earlier_bytes);
     bad_proposals.push((
         "replayed bytes",
         with_consignment(consignment),
         "does not include the expected witness transaction",
     ));
     let mut consignment = honest.clone();
-    consignment.endpoint = Some(truncated_endpoint);
+    consignment.consignment =
+        general_purpose::STANDARD.encode(&honest_bytes[..honest_bytes.len() / 2]);
     bad_proposals.push((
         "truncated bytes",
         with_consignment(consignment),
@@ -3699,7 +3595,6 @@ fn taker_refuses_a_truncated_maker_history_before_signing() {
             rgb(&taker_asset_id, SWAP_RGB_AMOUNT),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -3711,11 +3606,10 @@ fn taker_refuses_a_truncated_maker_history_before_signing() {
         .accept_swap_request(maker_online, request, 0, false, vec![])
         .unwrap();
     let history = proposal.maker_history.clone().unwrap();
-    let history_bytes = proxy_consignment_bytes(&history.recipient_id);
-    let (_server, _mock, endpoint) =
-        hostile_proxy(&history_bytes[..history_bytes.len() / 2], &proposal.txid);
+    let history_bytes = consignment_bytes(&history.consignment);
     let mut bad_proposal = proposal.clone();
-    bad_proposal.maker_history.as_mut().unwrap().endpoint = Some(endpoint);
+    bad_proposal.maker_history.as_mut().unwrap().consignment =
+        general_purpose::STANDARD.encode(&history_bytes[..history_bytes.len() / 2]);
 
     let before = wallet_snapshot(&mut taker, taker_online, &[&taker_asset_id]);
     let err = taker
@@ -3761,7 +3655,6 @@ fn btc_for_rgb_received_asset_survives_two_hops() {
         taker_online,
         btc(SWAP_BTC_PRICE),
         rgb(&asset_id, SWAP_RGB_AMOUNT),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
@@ -3811,7 +3704,6 @@ fn rgb_for_rgb_received_assets_survive_two_hops() {
         taker_online,
         rgb(&maker_asset_id, SWAP_RGB_AMOUNT),
         rgb(&taker_asset_id, SWAP_RGB_AMOUNT),
-        PROXY_URL,
     );
     refresh_settled(&mut maker, maker_online);
     refresh_settled(&mut taker, taker_online);
@@ -3885,7 +3777,6 @@ fn taker_refuses_a_proposal_whose_maker_rgb_input_was_spent() {
             btc(SWAP_BTC_PRICE),
             SWAP_FEE,
             None,
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -3958,7 +3849,6 @@ fn taker_refuses_an_expired_offer() {
             btc(SWAP_BTC_PRICE),
             SWAP_FEE,
             Some(expiration),
-            Some(PROXY_URL.to_string()),
             vec![],
         )
         .unwrap();
@@ -4031,7 +3921,6 @@ fn swap_db_invariants_hold_after_refresh() {
             taker_online,
             maker_gives,
             maker_receives,
-            PROXY_URL,
         );
         refresh_settled(&mut maker, maker_online);
         refresh_settled(&mut taker, taker_online);
@@ -4150,7 +4039,7 @@ fn settle_swap(
 /// `asset_ids`, and the row count of every DB table.
 fn wallet_snapshot(wallet: &mut Wallet, online: Online, asset_ids: &[&str]) -> Vec<String> {
     let mut snapshot = wallet
-        .list_transfers(AssetFilter::AnyOrNone, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()
         .iter()
         .map(|t| format!("{t:?}"))
@@ -4195,38 +4084,6 @@ fn assert_refused_before_signing(
     assert_eq!(wallet_snapshot(taker, taker_online, asset_ids), before);
 }
 
-#[cfg(feature = "electrum")]
-fn proxy_consignment_bytes(recipient_id: &str) -> Vec<u8> {
-    let res = ProxyClient::new(PROXY_URL)
-        .unwrap()
-        .get_consignment(recipient_id)
-        .unwrap();
-    general_purpose::STANDARD
-        .decode(res.result.unwrap().consignment)
-        .unwrap()
-}
-
-/// A proxy that answers every consignment request with `consignment`. The returned server and
-/// mock must be kept alive while it is used.
-#[cfg(feature = "electrum")]
-fn hostile_proxy(consignment: &[u8], txid: &str) -> (mockito::ServerGuard, mockito::Mock, String) {
-    let mut server = mockito::Server::new();
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": null,
-        "result": {
-            "consignment": general_purpose::STANDARD.encode(consignment),
-            "txid": txid,
-            "vout": null,
-        },
-    });
-    let mock = server
-        .mock("POST", "/")
-        .match_body(mockito::Matcher::Regex("consignment\\.get".to_string()))
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(body.to_string())
-        .create();
-    let endpoint = format!("rpc://{}", server.url().trim_start_matches("http://"));
-    (server, mock, endpoint)
+fn consignment_bytes(consignment: &str) -> Vec<u8> {
+    general_purpose::STANDARD.decode(consignment).unwrap()
 }

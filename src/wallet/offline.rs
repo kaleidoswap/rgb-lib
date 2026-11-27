@@ -4,38 +4,40 @@
 
 use super::*;
 
-const TRANSFERS_DIR: &str = "transfers";
-
-const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
+pub(crate) const TRANSFERS_DIR: &str = "transfers";
 
 const CONSIGNMENT_RCV_META_FILE: &str = "rcv_compose.meta.json";
+/// File holding the details of a received mint, saved once the wallet has checked it
+pub(crate) const MINT_RCV_FILE: &str = "rcv_mint.json";
+pub(crate) static CONSIGNMENT_RCV_FILE: LazyLock<String> =
+    LazyLock::new(|| format!("rcv_compose.{RGB_BIN_EXTENSION}"));
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_OFFER_FILE: &str = "offer.json";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_REQUEST_FILE: &str = "request.json";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_PROPOSAL_FILE: &str = "proposal.json";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_OUTGOING_FILE: &str = "outgoing.json";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_BROADCAST_FILE: &str = "broadcast.json";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_ACCEPTED_FILE: &str = "accepted.json";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_COMPLETION_FILE: &str = "completion.json";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_INVALIDATION_FILE: &str = "invalidation.json";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_SEED_FILE: &str = "seed.json";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 /// How far past its own chain tip the taker accepts the lock time the maker set, to allow for
 /// indexers that lag behind each other.
 pub(crate) const SWAP_LOCK_TIME_MAX_AHEAD: u32 = 3;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_CANCELLED_EXTENSION: &str = "cancelled";
 
-const ASSET_ID_PREFIX: &str = "rgb:";
+pub(crate) const ASSET_ID_PREFIX: &str = "rgb:";
 
 pub(crate) const UDA_FIXED_INDEX: u32 = 0;
 
@@ -44,6 +46,43 @@ pub(crate) const MAX_ATTACHMENTS: usize = 20;
 pub(crate) const MAX_TRANSPORT_ENDPOINTS: usize = 3;
 
 pub(crate) const TRANSFER_DATA_FILE: &str = "transfer_data.txt";
+
+/// The maximum length of a confined collection, given an accessor returning it from a bundle.
+const fn bundle_confinement_max<
+    C: amplify::confinement::Collection,
+    const MIN: usize,
+    const MAX: usize,
+>(
+    _: fn(&TransitionBundle) -> &Confined<C, MIN, MAX>,
+) -> usize {
+    MAX
+}
+
+/// Maximum number of allocations of an asset a UTXO can hold and still be spent: spending it moves
+/// all of them as inputs of the bundle of the asset, which spends at most as many opouts as its
+/// input map can hold (all assignment types together)
+pub(crate) const MAX_UTXO_ASSET_ALLOCATIONS: usize =
+    bundle_confinement_max(|b: &TransitionBundle| &b.input_map);
+
+/// Maximum number of allocations of an asset a UTXO can hold (see [`MAX_UTXO_ASSET_ALLOCATIONS`]).
+pub(crate) fn max_utxo_asset_allocations() -> usize {
+    #[cfg(all(test, feature = "_online"))]
+    if let Some(max_allocations) = mock_max_utxo_asset_allocations() {
+        return max_allocations;
+    }
+    MAX_UTXO_ASSET_ALLOCATIONS
+}
+
+/// The ID of the contract a contract `link` (e.g. [`LinkableSchemaWrapper::link_from`]) points
+/// to, if any.
+pub(crate) fn contract_link(
+    link: Result<Option<ContractId>, LinkError>,
+) -> Result<Option<String>, Error> {
+    link.map(|contract_id| contract_id.map(|c| c.to_string()))
+        .map_err(|e| Error::Internal {
+            details: format!("invalid contract link: {e}"),
+        })
+}
 
 pub trait WalletOffline: WalletBackup {
     fn bitcoin_network(&self) -> BitcoinNetwork {
@@ -54,8 +93,15 @@ pub trait WalletOffline: WalletBackup {
         self.bitcoin_network().into()
     }
 
-    fn rgb_runtime(&self) -> Result<RgbRuntime, Error> {
-        load_rgb_runtime(self.wallet_dir().clone())
+    /// The address of the given script on the wallet's network, if the script has one.
+    fn script_address(&self, script: &ScriptBuf) -> Option<String> {
+        BdkAddress::from_script(script, BdkNetwork::from(self.bitcoin_network()))
+            .ok()
+            .map(|a| a.to_string())
+    }
+
+    fn rgb_stock<'txn>(&self, db_txn: &'txn DbTxn) -> Result<RgbStock<'txn>, Error> {
+        Ok(RgbStock::new(db_txn))
     }
 
     fn media_dir(&self) -> PathBuf {
@@ -87,6 +133,61 @@ pub trait WalletOffline: WalletBackup {
         if !self.supports_schema(asset_schema) {
             return Err(Error::UnsupportedSchema {
                 asset_schema: *asset_schema,
+            });
+        }
+        Ok(())
+    }
+
+    /// Return the contract that is linked from or to, which the wallet needs to know to check
+    /// the link: a contract it knows has been validated, against its network as well, and the
+    /// wallet has the data needed by the checks.
+    fn check_linked_contract_known(
+        &self,
+        txn: &DbTxn,
+        contract_id: &ContractId,
+    ) -> Result<DbAsset, Error> {
+        txn.get_asset(contract_id.to_string())?
+            .ok_or_else(|| Error::UnknownLinkedContract {
+                contract_id: contract_id.to_string(),
+            })
+    }
+
+    /// Check the contract is linked from at issuance time: its schema needs to support links
+    /// and it needs to be unlinked, otherwise it can never link to the contract being issued.
+    fn check_linked_from_contract(
+        &self,
+        txn: &DbTxn,
+        linked_from_contract: &ContractId,
+    ) -> Result<(), Error> {
+        let asset = self.check_linked_contract_known(txn, linked_from_contract)?;
+        if !asset.schema.supports_link() {
+            return Err(Error::InvalidLinkedContract {
+                contract_id: asset.id,
+                details: format!("schema {} doesn't support links", asset.schema),
+            });
+        }
+        if let Some(linked_to_contract) = asset.linked_to_contract {
+            return Err(Error::InvalidLinkedContract {
+                contract_id: asset.id,
+                details: format!("it's already linked to contract {linked_to_contract}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Check the contract that is being linked to: it needs to have been issued linked from the
+    /// linking contract, so that the two contracts point at each other.
+    fn check_linked_to_contract(
+        &self,
+        txn: &DbTxn,
+        linked_to_contract: &ContractId,
+        asset_id: &str,
+    ) -> Result<(), Error> {
+        let asset = self.check_linked_contract_known(txn, linked_to_contract)?;
+        if asset.linked_from_contract.as_deref() != Some(asset_id) {
+            return Err(Error::InvalidLinkedContract {
+                contract_id: asset.id,
+                details: format!("it has not been issued linked from contract {asset_id}"),
             });
         }
         Ok(())
@@ -125,6 +226,15 @@ pub trait WalletOffline: WalletBackup {
             .filter(move |u| u.keychain == keychain)
     }
 
+    /// The number of allocations a UTXO can be given: no more than it can hold and still be spent,
+    /// whatever the setting (counting them all, an upper bound for the ones of each asset).
+    fn max_utxo_allocations(&self) -> u32 {
+        Ord::min(
+            self.max_allocations_per_utxo(),
+            u32::try_from(max_utxo_asset_allocations()).unwrap_or(u32::MAX),
+        )
+    }
+
     fn get_available_allocations<T>(
         &self,
         unspents: T,
@@ -140,7 +250,7 @@ pub trait WalletOffline: WalletBackup {
             .for_each(|u| u.rgb_allocations.retain(|a| !a.status.failed()));
         let max_allocs = max_allocations.unwrap_or_else(|| {
             // guaranteed > 0; guard here too to avoid future regression
-            self.max_allocations_per_utxo()
+            self.max_utxo_allocations()
                 .checked_sub(1)
                 .expect("max allocations per UTXO must be greater than 0")
         });
@@ -183,8 +293,11 @@ pub trait WalletOffline: WalletBackup {
             None => rgb_allocations.as_deref().unwrap(),
         };
 
+        // exclude UTXOs reserved to be spent by a pending operation
+        let mut exclude_utxos = exclude_utxos.to_vec();
+        exclude_utxos.extend(self.get_reserved_colored_outpoints(txn)?);
         let mut allocatable =
-            self.get_available_allocations(unspents, exclude_utxos, max_allocations)?;
+            self.get_available_allocations(unspents, &exclude_utxos, max_allocations)?;
         allocatable.sort_by_key(|t| t.rgb_allocations.len() + t.pending_blinded as usize);
         match allocatable.first() {
             Some(mut selected) => {
@@ -236,6 +349,62 @@ pub trait WalletOffline: WalletBackup {
         Ok(())
     }
 
+    /// Persist the sender's own proxy endpoint for a transfer (the target for the recipient's ACK and
+    /// the signed-TX release), tagged with the [`TransportEndpointKind::SenderProxy`] role.
+    fn save_sender_transport_endpoint(
+        &self,
+        txn: &DbTxn,
+        transfer_idx: i32,
+        endpoint: &str,
+    ) -> Result<(), Error> {
+        let transport_endpoint_idx = match txn.get_transport_endpoint(endpoint.to_string())? {
+            Some(ce) => ce.idx,
+            None => txn.set_transport_endpoint(DbTransportEndpointActMod {
+                transport_type: ActiveValue::Set(TransportType::JsonRpc),
+                endpoint: ActiveValue::Set(endpoint.to_string()),
+                ..Default::default()
+            })?,
+        };
+        // `used` hard-coded to false, so it never pops up in lookups not filtering for kind
+        txn.set_transfer_transport_endpoint(DbTransferTransportEndpointActMod {
+            transfer_idx: ActiveValue::Set(transfer_idx),
+            transport_endpoint_idx: ActiveValue::Set(transport_endpoint_idx),
+            used: ActiveValue::Set(false),
+            kind: ActiveValue::Set(TransportEndpointKind::SenderProxy),
+            ..Default::default()
+        })?;
+        Ok(())
+    }
+
+    fn check_burn_reason(&self, burn_reason: String) -> Result<BurnReason, Error> {
+        let bytes = hex::decode(burn_reason).map_err(|e| Error::InvalidBurnReason {
+            details: format!("not a hex string: {e}"),
+        })?;
+        let bytes: [u8; 32] =
+            bytes
+                .try_into()
+                .map_err(|bytes: Vec<u8>| Error::InvalidBurnReason {
+                    details: format!("expected 32 bytes, got {}", bytes.len()),
+                })?;
+        Ok(BurnReason::from(Bytes32::from(bytes)))
+    }
+
+    fn check_contract_address(&self, contract_address: String) -> Result<EvmAddress, Error> {
+        let hex_part = contract_address.strip_prefix("0x").ok_or_else(|| {
+            Error::InvalidEvmContractAddress {
+                details: s!("address must start with 0x"),
+            }
+        })?;
+        if hex_part.len() != 40 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::InvalidEvmContractAddress {
+                details: s!("address must be 20 hex-encoded bytes"),
+            });
+        }
+        EvmAddress::from_str(hex_part).map_err(|e| Error::InvalidEvmContractAddress {
+            details: e.to_string(),
+        })
+    }
+
     fn check_details(&self, details: String) -> Result<Details, Error> {
         if details.is_empty() {
             return Err(Error::InvalidDetails {
@@ -272,6 +441,12 @@ pub trait WalletOffline: WalletBackup {
             });
         }
         Ticker::try_from(ticker).map_err(|e| Error::InvalidTicker {
+            details: e.to_string(),
+        })
+    }
+
+    fn check_unicode_ticker(&self, ticker: String) -> Result<UnicodeTicker, Error> {
+        UnicodeTicker::try_from(ticker).map_err(|e| Error::InvalidTicker {
             details: e.to_string(),
         })
     }
@@ -377,16 +552,18 @@ pub trait WalletOffline: WalletBackup {
     }
 
     fn get_issue_consignment_path(&self, asset_id: &str) -> PathBuf {
-        self.wallet_dir().join(ASSETS_DIR).join(asset_id)
+        self.wallet_dir()
+            .join(ASSETS_DIR)
+            .join(format!("{asset_id}.{RGB_BIN_EXTENSION}"))
     }
 
     fn import_and_save_contract(
         &self,
         txn: &DbTxn,
         issue_data: &IssueData,
-        runtime: &mut RgbRuntime,
+        stock: &mut RgbStock<'_>,
     ) -> Result<DbAsset, Error> {
-        runtime
+        stock
             .import_contract(issue_data.valid_contract.clone(), &DumbResolver)
             .expect("failure importing issued contract");
 
@@ -484,9 +661,7 @@ pub trait WalletOffline: WalletBackup {
 
         let mut builder = ContractBuilder::with(
             Identity::default(),
-            NonInflatableAsset::schema(),
-            NonInflatableAsset::types(),
-            NonInflatableAsset::scripts(),
+            NonInflatableAsset::schema_rules(),
             self.chain_net(),
         )
         .add_global_state("spec", spec.clone())
@@ -526,7 +701,9 @@ pub trait WalletOffline: WalletBackup {
             initial_supply: settled,
             max_supply: None,
             known_circulating_supply: None,
-            reject_list_url: None,
+            bridge_location: None,
+            reject_list: None,
+            linked_from_contract: None,
             token: None,
             timestamp: valid_contract.genesis.timestamp,
             added_at: created_at,
@@ -535,10 +712,9 @@ pub trait WalletOffline: WalletBackup {
         Ok(IssueData {
             asset_data,
             valid_contract,
-            #[cfg(any(feature = "electrum", feature = "esplora"))]
+            #[cfg(feature = "_online")]
             contract_path: _contract_path,
             issue_utxos,
-            link_right_outpoint: None,
         })
     }
 
@@ -641,9 +817,7 @@ pub trait WalletOffline: WalletBackup {
 
         let builder = ContractBuilder::with(
             Identity::default(),
-            UniqueDigitalAsset::schema(),
-            UniqueDigitalAsset::types(),
-            UniqueDigitalAsset::scripts(),
+            UniqueDigitalAsset::schema_rules(),
             self.chain_net(),
         )
         .add_global_state("spec", spec)
@@ -674,7 +848,9 @@ pub trait WalletOffline: WalletBackup {
             initial_supply: 1,
             max_supply: None,
             known_circulating_supply: None,
-            reject_list_url: None,
+            bridge_location: None,
+            reject_list: None,
+            linked_from_contract: None,
             token: Some(Token::from_token_data(&token_data, self.media_dir())),
             timestamp: valid_contract.genesis.timestamp,
             added_at: created_at,
@@ -683,10 +859,9 @@ pub trait WalletOffline: WalletBackup {
         Ok(IssueData {
             asset_data,
             valid_contract,
-            #[cfg(any(feature = "electrum", feature = "esplora"))]
+            #[cfg(feature = "_online")]
             contract_path: _contract_path,
             issue_utxos,
-            link_right_outpoint: None,
         })
     }
 
@@ -736,9 +911,7 @@ pub trait WalletOffline: WalletBackup {
 
         let mut builder = ContractBuilder::with(
             Identity::default(),
-            CollectibleFungibleAsset::schema(),
-            CollectibleFungibleAsset::types(),
-            CollectibleFungibleAsset::scripts(),
+            CollectibleFungibleAsset::schema_rules(),
             self.chain_net(),
         )
         .add_global_state("name", name_state)
@@ -786,7 +959,9 @@ pub trait WalletOffline: WalletBackup {
             initial_supply: settled,
             max_supply: None,
             known_circulating_supply: None,
-            reject_list_url: None,
+            bridge_location: None,
+            reject_list: None,
+            linked_from_contract: None,
             token: None,
             timestamp: valid_contract.genesis.timestamp,
             added_at: created_at,
@@ -795,10 +970,9 @@ pub trait WalletOffline: WalletBackup {
         Ok(IssueData {
             asset_data,
             valid_contract,
-            #[cfg(any(feature = "electrum", feature = "esplora"))]
+            #[cfg(feature = "_online")]
             contract_path: _contract_path,
             issue_utxos,
-            link_right_outpoint: None,
         })
     }
 
@@ -811,12 +985,25 @@ pub trait WalletOffline: WalletBackup {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
-        linked_from_contract_id: Option<ContractId>,
-        create_link_right: bool,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
     ) -> Result<IssueData, Error> {
         let asset_schema = &AssetSchema::Ifa;
 
         self.check_schema_support(asset_schema)?;
+
+        let linked_from_contract = linked_from_contract
+            .map(|contract_id| {
+                ContractId::from_str(&contract_id)
+                    .map_err(|_| Error::InvalidContractId { contract_id })
+            })
+            .transpose()?;
+        if let Some(linked_from_contract) = &linked_from_contract
+            && !skip_contract_checks
+        {
+            self.check_linked_from_contract(txn, linked_from_contract)?;
+        }
 
         let settled = self.get_total_issue_amount(&amounts, true)?;
         let inflation_amt = self.get_total_inflation_amount(&inflation_amounts, settled)?;
@@ -857,9 +1044,7 @@ pub trait WalletOffline: WalletBackup {
 
         let mut builder = ContractBuilder::with(
             Identity::default(),
-            InflatableFungibleAsset::schema(),
-            InflatableFungibleAsset::types(),
-            InflatableFungibleAsset::scripts(),
+            InflatableFungibleAsset::schema_rules(),
             self.chain_net(),
         )
         .add_global_state("spec", spec.clone())
@@ -877,11 +1062,6 @@ pub trait WalletOffline: WalletBackup {
                     self.check_reject_list_url(reject_list_url.clone())?,
                 )
                 .expect("invalid rejectListUrl");
-        }
-        if let Some(linked_from_contract_id) = linked_from_contract_id {
-            builder = builder
-                .add_global_state(RGB_GLOBAL_LINKED_FROM_CONTRACT, linked_from_contract_id)
-                .expect("invalid linkedFromContract");
         }
 
         let mut issue_utxos: HashMap<i32, Vec<Assignment>> = HashMap::new();
@@ -916,23 +1096,29 @@ pub trait WalletOffline: WalletBackup {
                 .expect("invalid global state data");
         }
 
-        let link_right_outpoint = if create_link_right {
-            let utxo_with_no_prior_rgb_allocations =
-                self.get_utxo(txn, &exclude_outpoints, Some(&unspents), false, Some(0))?;
+        if link_right {
+            let utxo = self.get_utxo(txn, &exclude_outpoints, Some(&unspents), false, Some(0))?;
+            exclude_outpoints.push(utxo.outpoint());
             issue_utxos
-                .entry(utxo_with_no_prior_rgb_allocations.idx)
+                .entry(utxo.idx)
                 .or_default()
                 .push(Assignment::LinkRight);
             builder = builder
-                .add_rights_raw(
-                    OS_LINK,
-                    self.get_builder_seal(utxo_with_no_prior_rgb_allocations.clone()),
-                )
-                .expect("invalid link right state");
-            Some(utxo_with_no_prior_rgb_allocations.outpoint())
-        } else {
-            None
-        };
+                .add_rights(RGB_STATE_LINK_RIGHT, self.get_builder_seal(utxo))
+                .expect("invalid link right");
+        }
+        if let Some(linked_from_contract) = &linked_from_contract {
+            builder = builder
+                .add_global_state(RGB_GLOBAL_LINKED_FROM_CONTRACT, *linked_from_contract)
+                .expect("invalid global state data");
+        }
+
+        #[cfg(test)]
+        if let Some(seal) = mock_ifa_link_right() {
+            builder = builder
+                .add_rights(RGB_STATE_LINK_RIGHT, seal)
+                .expect("invalid link right");
+        }
 
         debug!(self.logger(), "Issuing: {issue_utxos:?}");
 
@@ -949,7 +1135,9 @@ pub trait WalletOffline: WalletBackup {
             initial_supply: settled,
             max_supply: Some(max_supply),
             known_circulating_supply: Some(settled),
-            reject_list_url,
+            bridge_location: None,
+            reject_list: reject_list_url.map(RgbRejectListInfo::Url),
+            linked_from_contract: linked_from_contract.map(|c| c.to_string()),
             token: None,
             timestamp: valid_contract.genesis.timestamp,
             added_at: created_at,
@@ -958,11 +1146,183 @@ pub trait WalletOffline: WalletBackup {
         Ok(IssueData {
             asset_data,
             valid_contract,
-            #[cfg(any(feature = "electrum", feature = "esplora"))]
+            #[cfg(feature = "_online")]
             contract_path: _contract_path,
             issue_utxos,
-            link_right_outpoint,
         })
+    }
+
+    fn create_bfa_contract(
+        &self,
+        txn: &DbTxn,
+        ticker: String,
+        name: String,
+        precision: u8,
+        mint_rights: u8,
+        chain_id: u64,
+        contract_address: String,
+        reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
+    ) -> Result<IssueData, Error> {
+        let asset_schema = &AssetSchema::Bfa;
+
+        self.check_schema_support(asset_schema)?;
+
+        let linked_from_contract = linked_from_contract
+            .map(|contract_id| {
+                ContractId::from_str(&contract_id)
+                    .map_err(|_| Error::InvalidContractId { contract_id })
+            })
+            .transpose()?;
+        if let Some(linked_from_contract) = &linked_from_contract
+            && !skip_contract_checks
+        {
+            self.check_linked_from_contract(txn, linked_from_contract)?;
+        }
+
+        if mint_rights == 0 {
+            return Err(Error::NoMintRights);
+        }
+
+        let db_data = txn.get_db_data(false)?;
+
+        let mut unspents: Vec<LocalUnspent> = txn.get_rgb_allocations(
+            txn.get_unspent_txos(db_data.txos.clone())?,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        unspents.retain(|u| {
+            !(u.rgb_allocations
+                .iter()
+                .any(|a| !a.incoming && a.status.waiting_counterparty()))
+        });
+
+        let created_at = now().unix_timestamp();
+        let text = RicardianContract::default();
+        #[cfg(test)]
+        let terms = mock_asset_terms(self, text, None);
+        #[cfg(not(test))]
+        let terms = self.new_asset_terms(text, None);
+        #[cfg(test)]
+        let details = mock_contract_details(self);
+        #[cfg(not(test))]
+        let details: Option<Details> = None;
+        let bfa_ticker = self.check_unicode_ticker(ticker.clone())?;
+
+        let bridge_location = BridgeLocation::Evm(EvmContract {
+            chain_id,
+            address: self.check_contract_address(contract_address)?,
+        });
+
+        let mut builder = ContractBuilder::with(
+            Identity::default(),
+            BridgedFungibleAsset::schema_rules(),
+            self.chain_net(),
+        )
+        .add_global_state("ticker", bfa_ticker)
+        .expect("invalid ticker")
+        .add_global_state("name", self.check_name(name.clone())?)
+        .expect("invalid name")
+        .add_global_state("precision", self.check_precision(precision)?)
+        .expect("invalid precision")
+        .add_global_state("terms", terms)
+        .expect("invalid terms")
+        .add_global_state(RGB_GLOBAL_BRIDGE_LOCATION, bridge_location.clone())
+        .expect("invalid bridgeLocation");
+        if let Some(details) = &details {
+            builder = builder
+                .add_global_state("details", details.clone())
+                .expect("invalid details");
+        }
+        let reject_list = reject_list_address
+            .map(|address| {
+                Ok::<_, Error>(RejectListLocation::Evm(EvmContract {
+                    chain_id,
+                    address: self.check_contract_address(address)?,
+                }))
+            })
+            .transpose()?;
+        if let Some(reject_list) = reject_list.clone() {
+            builder = builder
+                .add_global_state(RGB_GLOBAL_REJECT_LIST, reject_list)
+                .expect("invalid rejectList");
+        }
+
+        let mut issue_utxos: HashMap<i32, Vec<Assignment>> = HashMap::new();
+        let mut exclude_outpoints: Vec<Outpoint> = vec![];
+        for _ in 0..mint_rights {
+            let utxo = self.get_utxo(txn, &exclude_outpoints, Some(&unspents), false, Some(0))?;
+            exclude_outpoints.push(utxo.outpoint());
+            issue_utxos
+                .entry(utxo.idx)
+                .or_default()
+                .push(Assignment::MintRight);
+
+            builder = builder
+                .add_rights(RGB_STATE_MINT_RIGHT, self.get_builder_seal(utxo))
+                .expect("invalid global state data");
+        }
+        if link_right {
+            let utxo = self.get_utxo(txn, &exclude_outpoints, Some(&unspents), false, Some(0))?;
+            exclude_outpoints.push(utxo.outpoint());
+            issue_utxos
+                .entry(utxo.idx)
+                .or_default()
+                .push(Assignment::LinkRight);
+            builder = builder
+                .add_rights(RGB_STATE_LINK_RIGHT, self.get_builder_seal(utxo))
+                .expect("invalid link right");
+        }
+        if let Some(linked_from_contract) = &linked_from_contract {
+            builder = builder
+                .add_global_state(RGB_GLOBAL_LINKED_FROM_CONTRACT, *linked_from_contract)
+                .expect("invalid global state data");
+        }
+
+        debug!(self.logger(), "Issuing: {issue_utxos:?}");
+
+        let (asset_id, _contract_path, valid_contract) = self.issue_contract(builder)?;
+
+        let asset_data = LocalAssetData {
+            asset_id: asset_id.clone(),
+            name,
+            asset_schema: *asset_schema,
+            precision,
+            ticker: Some(ticker),
+            details: details.map(|d| d.to_string()),
+            media: None,
+            initial_supply: 0,
+            max_supply: None,
+            known_circulating_supply: None,
+            bridge_location: Some(bridge_location.into()),
+            reject_list: reject_list.map(RgbRejectListInfo::from),
+            linked_from_contract: linked_from_contract.map(|c| c.to_string()),
+            token: None,
+            timestamp: valid_contract.genesis.timestamp,
+            added_at: created_at,
+        };
+
+        Ok(IssueData {
+            asset_data,
+            valid_contract,
+            #[cfg(feature = "_online")]
+            contract_path: _contract_path,
+            issue_utxos,
+        })
+    }
+
+    /// Convert a single `RgbTransport`-format endpoint (e.g. `rpc://host`) to its HTTP(S) URL, as
+    /// needed to build a [`ProxyClient`].
+    fn convert_transport_endpoint_url(&self, endpoint: &str) -> Result<String, Error> {
+        self.convert_transport_endpoints(std::slice::from_ref(&endpoint.to_string()))?
+            .pop()
+            .ok_or_else(|| Error::InvalidTransportEndpoint {
+                details: s!("empty transport endpoint"),
+            })
     }
 
     // convert from RgbTransport format to TransportEndpoint format
@@ -992,15 +1352,72 @@ pub trait WalletOffline: WalletBackup {
         Ok(endpoints)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_receive_data(
         &mut self,
         txn: &DbTxn,
+        #[cfg_attr(not(feature = "_online"), allow(unused_variables))] online: Option<Online>,
         asset_id: Option<String>,
         assignment: Assignment,
         expiration_timestamp: i64,
         transport_endpoints: Vec<String>,
         recipient_type: RecipientType,
+        encryption: Option<Encryption>,
+        quota: u32,
+        // for a witness receive, the address to reuse (see check_reused_address)
+        address: Option<String>,
     ) -> Result<ReceiveDataInternal, Error> {
+        let encryption = encryption.unwrap_or(Encryption::Required);
+
+        // no need to be online if an out-of-band exchange is requested
+        let out_of_band = transport_endpoints.is_empty();
+
+        // a reusable invoice relies on the recipient proxies to keep its transfers apart and on the
+        // seal blinding derived from the keys of both parties to tell which outputs pay each
+        // transfer, so the out-of-band exchange cannot be used
+        if quota == 0 {
+            return Err(Error::InvalidQuota {
+                details: s!("must be at least 1"),
+            });
+        }
+        if out_of_band && quota > 1 {
+            return Err(Error::InvalidQuota {
+                details: s!("a reusable invoice requires transport endpoints"),
+            });
+        }
+        // the same goes for a witness receive reusing an address, as the address is paid by the
+        // transfers to every invoice using it, so a unique seal per operation is needed
+        let reused_address = address.is_some();
+        if reused_address && recipient_type != RecipientType::Witness {
+            return Err(Error::UnsupportedAddressReuse {
+                details: s!("only witness receives can reuse an address"),
+            });
+        }
+        if out_of_band && reused_address {
+            return Err(Error::UnsupportedAddressReuse {
+                details: s!("a witness receive reusing an address requires transport endpoints"),
+            });
+        }
+        // the blinded UTXO needs room for an allocation per transfer the invoice can receive
+        if recipient_type == RecipientType::Blind && quota > self.max_utxo_allocations() {
+            return Err(Error::InvalidQuota {
+                details: format!(
+                    "a blind invoice can receive at most {} transfers",
+                    self.max_utxo_allocations()
+                ),
+            });
+        }
+        #[cfg(not(feature = "_online"))]
+        if !out_of_band {
+            return Err(Error::Offline);
+        }
+        #[cfg(feature = "_online")]
+        if let Some(online) = online {
+            self.check_online(online)?;
+        } else if !out_of_band {
+            return Err(Error::OnlineNeeded);
+        }
+
         let (beneficiary, recipient_type_full, blind_seal, script_pubkey) = match recipient_type {
             RecipientType::Blind => {
                 let mut unspents: Vec<LocalUnspent> =
@@ -1010,7 +1427,23 @@ pub trait WalletOffline: WalletBackup {
                         .iter()
                         .any(|a| !a.incoming && a.status.waiting_counterparty()))
                 });
-                let utxo = self.get_utxo(txn, &[], Some(&unspents), true, None)?;
+                // a UTXO holds at most one mint right of an asset (a payment that would add
+                // another one gets refused): exclude the ones holding or due to receive one
+                if let (Assignment::MintRight, Some(aid)) = (&assignment, &asset_id) {
+                    let invoiced = txn.get_mint_right_invoice_utxos(aid)?;
+                    unspents.retain(|u| {
+                        !invoiced.contains(&u.utxo.outpoint())
+                            && !u.rgb_allocations.iter().any(|a| {
+                                a.held()
+                                    && a.asset_id.as_ref() == Some(aid)
+                                    && a.assignment == Assignment::MintRight
+                            })
+                    });
+                }
+                // the blinded UTXO needs room for an allocation per transfer the invoice can
+                // receive
+                let max_allocations = self.max_utxo_allocations() - quota;
+                let utxo = self.get_utxo(txn, &[], Some(&unspents), true, Some(max_allocations))?;
                 let unblinded_utxo = utxo.outpoint();
                 debug!(
                     self.logger(),
@@ -1023,25 +1456,21 @@ pub trait WalletOffline: WalletBackup {
                 (beneficiary, recipient_type_full, Some(blind_seal), None)
             }
             RecipientType::Witness => {
-                let script_pubkey = self.get_new_address()?.script_pubkey();
+                let script_pubkey = match &address {
+                    Some(address) => self.check_reused_address(address)?,
+                    None => self.get_new_address()?,
+                }
+                .script_pubkey();
                 let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
-                // Per-invoice nonce is only needed when address reuse is on:
-                // without reuse, each witness_receive draws a fresh script, so
-                // the script-derived recipient_id is already unique per call.
-                let recipient_nonce = if self.wallet_data().reuse_addresses {
-                    let mut buf = [0u8; 16];
-                    rand::Rng::fill_bytes(&mut rand::rng(), &mut buf);
-                    buf.to_vec()
-                } else {
-                    vec![]
-                };
-                let recipient_type_full = RecipientTypeFull::Witness {
-                    vout: None,
-                    recipient_nonce,
-                };
+                let recipient_type_full = RecipientTypeFull::Witness { vout: None };
                 (beneficiary, recipient_type_full, None, Some(script_pubkey))
             }
         };
+
+        // the address a witness receive pays, which can be passed to a later one to reuse it
+        let witness_address = script_pubkey
+            .as_ref()
+            .and_then(|script| self.script_address(script));
 
         #[cfg(test)]
         let network = mock_chain_net(self);
@@ -1051,6 +1480,15 @@ pub trait WalletOffline: WalletBackup {
         let beneficiary = XChainNet::with(network, beneficiary);
         let recipient_id = beneficiary.to_string();
         debug!(self.logger(), "Recipient ID: {recipient_id}");
+        // without online features any transport endpoint is refused, so an address can't be reused
+        #[cfg(feature = "_online")]
+        let earlier_receives_to_share = if reused_address {
+            self.earlier_witness_receives_to_share(txn, &recipient_id)?
+        } else {
+            vec![]
+        };
+        #[cfg(not(feature = "_online"))]
+        let earlier_receives_to_share = vec![];
         let (schema, contract_id) = if let Some(aid) = asset_id.clone() {
             let asset = txn.check_asset_exists(aid.clone())?;
             let contract_id = ContractId::from_str(&aid).expect("invalid contract ID");
@@ -1059,7 +1497,6 @@ pub trait WalletOffline: WalletBackup {
             (None, None)
         };
 
-        let out_of_band = transport_endpoints.is_empty();
         let endpoints = if out_of_band {
             vec![]
         } else {
@@ -1083,59 +1520,140 @@ pub trait WalletOffline: WalletBackup {
             invoice_builder = invoice_builder.set_contract(contract_id);
         }
         if !out_of_band {
-            let nonce_for_invoice: &[u8] = match &recipient_type_full {
-                RecipientTypeFull::Witness {
-                    recipient_nonce, ..
-                } => recipient_nonce.as_slice(),
-                RecipientTypeFull::Blind { .. } => &[],
-            };
-            let decorated_transports: Vec<String> = transport_endpoints
-                .iter()
-                .map(|ep| {
-                    if nonce_for_invoice.is_empty() {
-                        ep.clone()
-                    } else {
-                        crate::utils::append_recipient_nonce(ep, nonce_for_invoice)
-                    }
-                })
-                .collect();
-            let transports: Vec<&str> = decorated_transports.iter().map(AsRef::as_ref).collect();
+            let transports: Vec<&str> = transport_endpoints.iter().map(AsRef::as_ref).collect();
             invoice_builder = invoice_builder.add_transports(transports).unwrap();
         }
         let detected_assignment = match (&assignment, schema) {
-            (
-                Assignment::Fungible(amt),
-                Some(AssetSchema::Nia) | Some(AssetSchema::Cfa) | Some(AssetSchema::Ifa) | None,
-            ) => {
-                invoice_builder = invoice_builder.set_amount_raw(*amt);
-                invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_ASSET_OWNER);
-                assignment
+            (Assignment::Any, Some(schema)) => schema.any_assignment(),
+            (Assignment::Any, None) => Assignment::Any,
+            (_, Some(schema)) if !schema.supports_assignment(&assignment) => {
+                return Err(Error::InvalidAssignment);
             }
-            (Assignment::Any, Some(AssetSchema::Nia) | Some(AssetSchema::Cfa)) => {
-                invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_ASSET_OWNER);
-                Assignment::Fungible(0)
-            }
-            (Assignment::NonFungible | Assignment::Any, Some(AssetSchema::Uda)) => {
-                invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_ASSET_OWNER);
-                Assignment::NonFungible
-            }
-            (Assignment::InflationRight(amt), Some(AssetSchema::Ifa)) => {
-                invoice_builder = invoice_builder.set_amount_raw(*amt);
-                invoice_builder =
-                    invoice_builder.set_assignment_name(RGB_STATE_INFLATION_ALLOWANCE);
-                assignment
-            }
-            (Assignment::Any, _) => Assignment::Any,
-            _ => return Err(Error::InvalidAssignment),
+            (_, Some(_)) | (Assignment::Fungible(_), None) => assignment.clone(),
+            // without a schema only an amount can be requested
+            (_, None) => return Err(Error::InvalidAssignment),
         };
+        // the amount comes from the request, so it's left open when narrowing down "any"
+        match &assignment {
+            Assignment::Fungible(amt) | Assignment::InflationRight(amt) => {
+                invoice_builder = invoice_builder.set_amount_raw(*amt);
+            }
+            Assignment::LinkRight => invoice_builder = invoice_builder.set_void(),
+            Assignment::MintRight => invoice_builder = invoice_builder.set_void(),
+            Assignment::NonFungible | Assignment::Any => {}
+        }
+        if let Some(state_name) = detected_assignment.state_name() {
+            invoice_builder = invoice_builder.set_assignment_name(state_name);
+        }
         let created_at = now().unix_timestamp();
-        if expiration_timestamp < created_at {
+        if expiration_timestamp < created_at
+            || expiration_timestamp > created_at + i64::from(MAX_EXPIRATION_SECS)
+        {
             return Err(Error::InvalidExpiration);
         }
         invoice_builder = invoice_builder.set_expiry_timestamp(expiration_timestamp);
+
+        // generate the per-operation Ed25519 key and embed the public key + encryption preference
+        let recipient_sk = gen_ed25519();
+        let recipient_vk = recipient_sk.verifying_key();
+        // the invoice carries the recipient's public key as a 64-char hex string
+        invoice_builder = invoice_builder.set_public_key(recipient_vk.to_bytes());
+        invoice_builder = invoice_builder.set_encryption(encryption.into());
+
         let invoice = invoice_builder.finish();
         let invoice_string = invoice.to_string();
 
+        // for a blind receive reserved on proxies, the invoice expiration plus the longest retention
+        // grace among them, until which a transfer to the invoice can still be downloaded
+        #[allow(unused_mut)]
+        let mut retention_deadline = None;
+        // for an invoice reserved on proxies, the invoice expiration plus the longest retention
+        // grace among them, whatever the recipient type
+        #[cfg(feature = "_online")]
+        let mut proxies_retention_deadline: Option<i64> = None;
+
+        // reserve the invoice on the proxy/proxies; skipped for the out-of-band exchange
+        #[cfg(feature = "_online")]
+        if !out_of_band {
+            let recipient_pk = hex::encode(recipient_vk.to_bytes());
+            let invoice_id = invoice_id(&recipient_id, &recipient_pk);
+            let reservation_expiration = expiration_timestamp.to_string();
+            let mut reserved = false;
+            // whether a proxy refused the reservation as it is draining
+            let mut draining = false;
+            for endpoint in &endpoints {
+                // skip endpoints that are unreachable or run an unsupported protocol version
+                let Ok(info) = check_proxy(endpoint) else {
+                    continue;
+                };
+                let proxy_client = ProxyClient::new(endpoint)?;
+                // only needed by proxies with proxy-level authentication enabled
+                let signature = self.online_data().as_ref().and_then(|online_data| {
+                    online_data.proxy_auth_signature(
+                        endpoint,
+                        &prepare_invoice_auth_message(
+                            &invoice_id,
+                            &reservation_expiration,
+                            &recipient_pk,
+                            quota,
+                        ),
+                    )
+                });
+                match proxy_client.prepare_invoice(
+                    &invoice_id,
+                    &reservation_expiration,
+                    &recipient_pk,
+                    quota,
+                    signature,
+                ) {
+                    Ok(res) if res.error.is_none() => {
+                        reserved = true;
+                        let deadline = expiration_timestamp
+                            .saturating_add(i64::from(proxy_retention_grace(&info)));
+                        proxies_retention_deadline = Some(max(
+                            proxies_retention_deadline.unwrap_or(deadline),
+                            deadline,
+                        ));
+                    }
+                    Ok(res) => match map_proxy_error(res.error.unwrap()) {
+                        // a draining proxy, the invoice can be reserved on the other ones
+                        Error::ProxyDraining => draining = true,
+                        // a definite proxy-side rejection (e.g. invoice already reserved) is fatal
+                        e => return Err(e),
+                    },
+                    Err(_) => continue,
+                }
+            }
+            if !reserved {
+                return Err(if draining {
+                    Error::ProxyDraining
+                } else {
+                    Error::NoValidTransportEndpoint
+                });
+            }
+            if matches!(recipient_type_full, RecipientTypeFull::Blind { .. }) {
+                retention_deadline = proxies_retention_deadline;
+            }
+        }
+        // a transfer to a reusable invoice can be discovered until the retention deadline has
+        // passed on the proxies' clocks too
+        #[cfg(feature = "_online")]
+        let invoice_deadline = proxies_retention_deadline
+            .filter(|_| quota > 1)
+            .map(|d| d.saturating_add(i64::from(clock_skew_margin())));
+        #[cfg(not(feature = "_online"))]
+        let invoice_deadline = None;
+
+        // the recipient ID of a reusable invoice or of a reused address is shared by several
+        // transfers, so the data of each transfer is kept in a directory of its own, named after the
+        // (unique) invoice key (the earlier receives on a reused address keep theirs)
+        let receive_dir = (quota > 1 || reused_address).then(|| {
+            format!(
+                "{}_{}",
+                self.normalize_recipient_id(&recipient_id),
+                hex::encode(&recipient_vk.to_bytes()[..8])
+            )
+        });
         Ok(ReceiveDataInternal {
             asset_id,
             detected_assignment,
@@ -1147,7 +1665,79 @@ pub trait WalletOffline: WalletBackup {
             recipient_type_full,
             blind_seal,
             script_pubkey,
+            operation_secret_key: recipient_sk.to_bytes().to_vec(),
+            recipient_pubkey: recipient_vk.to_bytes().to_vec(),
+            encryption,
+            retention_deadline,
+            quota,
+            invoice_deadline,
+            receive_dir,
+            address: witness_address,
+            earlier_receives_to_share,
         })
+    }
+
+    /// The address passed to a witness receive to reuse it, refused with an
+    /// [`Error::CannotReuseAddress`] if it isn't a revealed address of the colored keychain.
+    fn check_reused_address(&self, address: &str) -> Result<BdkAddress, Error> {
+        let address = parse_address_str(address, self.bitcoin_network()).map_err(|e| {
+            Error::CannotReuseAddress {
+                details: match e {
+                    Error::InvalidAddress { details } => format!("invalid address: {details}"),
+                    e => e.to_string(),
+                },
+            }
+        })?;
+        let spk_index = self.bdk_wallet().spk_index();
+        let Some((KeychainKind::External, index)) =
+            spk_index.index_of_spk(address.script_pubkey()).copied()
+        else {
+            return Err(Error::CannotReuseAddress {
+                details: s!("not an address of the wallet's colored keychain"),
+            });
+        };
+        if spk_index
+            .last_revealed_index(KeychainKind::External)
+            .is_none_or(|last| index > last)
+        {
+            return Err(Error::CannotReuseAddress {
+                details: s!("not revealed yet"),
+            });
+        }
+        Ok(address)
+    }
+
+    #[cfg(feature = "_online")]
+    /// The earlier witness receives on the recipient ID of an address to reuse that don't share
+    /// its data directory yet, refusing the address with an [`Error::CannotReuseAddress`] if one
+    /// of them used the out-of-band exchange, which doesn't tell apart the transfers paying the
+    /// address (see the `address` parameter of `witness_receive`).
+    fn earlier_witness_receives_to_share(
+        &self,
+        txn: &DbTxn,
+        recipient_id: &str,
+    ) -> Result<Vec<DbTransfer>, Error> {
+        let mut to_share = vec![];
+        for transfer in txn.get_incoming_transfers_by_recipient_id(recipient_id)? {
+            if !matches!(
+                transfer.recipient_type,
+                Some(RecipientTypeFull::Witness { .. })
+            ) {
+                continue;
+            }
+            if txn
+                .get_transfer_transport_endpoints_data(transfer.idx)?
+                .is_empty()
+            {
+                return Err(Error::CannotReuseAddress {
+                    details: s!("an earlier witness receive on it used the out-of-band exchange"),
+                });
+            }
+            if transfer.receive_dir.is_none() {
+                to_share.push(transfer);
+            }
+        }
+        Ok(to_share)
     }
 
     fn store_receive_transfer(
@@ -1162,6 +1752,10 @@ pub trait WalletOffline: WalletBackup {
             created_at: ActiveValue::Set(receive_data_internal.created_at),
             min_confirmations: ActiveValue::Set(min_confirmations),
             incoming: ActiveValue::Set(true),
+            operation_secret_key: ActiveValue::Set(Some(
+                receive_data_internal.operation_secret_key.clone(),
+            )),
+            retention_deadline: ActiveValue::Set(receive_data_internal.retention_deadline),
             ..Default::default()
         };
         let batch_transfer_idx = txn.set_batch_transfer(batch_transfer)?;
@@ -1172,7 +1766,30 @@ pub trait WalletOffline: WalletBackup {
             ..Default::default()
         };
         let asset_transfer_idx = txn.set_asset_transfer(asset_transfer)?;
+        // the earlier witness receives on a reused address now share its recipient ID: they keep
+        // their data where it is, in the directory named after the recipient ID, which is recorded
+        // to mark them as shared
+        #[cfg(feature = "_online")]
+        for transfer in &receive_data_internal.earlier_receives_to_share {
+            let mut updated_transfer: DbTransferActMod = transfer.clone().into();
+            updated_transfer.receive_dir = ActiveValue::Set(Some(
+                self.normalize_recipient_id(&receive_data_internal.recipient_id),
+            ));
+            txn.update_transfer(&mut updated_transfer)?;
+        }
+        // a reusable invoice keeps receiving transfers after this first one, until it expires
+        let invoice_idx = match receive_data_internal.invoice_deadline {
+            Some(deadline) => Some(txn.set_invoice(DbInvoiceActMod {
+                quota: ActiveValue::Set(receive_data_internal.quota),
+                asset_id: ActiveValue::Set(receive_data_internal.asset_id.clone()),
+                deadline: ActiveValue::Set(deadline),
+                ..Default::default()
+            })?),
+            None => None,
+        };
         let transfer = DbTransferActMod {
+            invoice_idx: ActiveValue::Set(invoice_idx),
+            receive_dir: ActiveValue::Set(receive_data_internal.receive_dir.clone()),
             asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
             requested_assignment: ActiveValue::Set(Some(
                 receive_data_internal.detected_assignment.clone(),
@@ -1182,6 +1799,10 @@ pub trait WalletOffline: WalletBackup {
                 receive_data_internal.recipient_type_full.clone(),
             )),
             invoice_string: ActiveValue::Set(Some(receive_data_internal.invoice_string.clone())),
+            recipient_pubkey: ActiveValue::Set(Some(
+                receive_data_internal.recipient_pubkey.clone(),
+            )),
+            recipient_encryption: ActiveValue::Set(receive_data_internal.encryption),
             ..Default::default()
         };
         let transfer_idx = txn.set_transfer(transfer)?;
@@ -1199,7 +1820,7 @@ pub trait WalletOffline: WalletBackup {
         }
 
         if let Some(secret_seal) = receive_data_internal.blind_seal {
-            self.rgb_runtime()?.store_secret_seal(secret_seal)?;
+            self.rgb_stock(txn)?.store_secret_seal(secret_seal)?;
         }
 
         if let Some(script_pubkey) = &receive_data_internal.script_pubkey {
@@ -1248,6 +1869,23 @@ pub trait WalletOffline: WalletBackup {
                     }
                 });
         }
+        // the outputs of the batch TX registered before broadcasting it, like its bitcoin change
+        // even when it gets no RGB change, never came to exist, unless another transfer colors
+        // them (e.g. a receive of the same wallet)
+        if let Some(txid) = &batch_transfer.txid {
+            let asset_transfer_idxs: HashSet<i32> =
+                asset_transfers.iter().map(|at| at.idx).collect();
+            txos.iter()
+                .filter(|t| !t.exists && &t.txid == txid)
+                .filter(|t| {
+                    !colorings.iter().any(|c| {
+                        c.txo_idx == t.idx && !asset_transfer_idxs.contains(&c.asset_transfer_idx)
+                    })
+                })
+                .for_each(|t| {
+                    txos_to_delete.insert(t.idx);
+                });
+        }
         for txo in txos_to_delete {
             txn.del_txo(txo)?;
         }
@@ -1263,6 +1901,32 @@ pub trait WalletOffline: WalletBackup {
         let db_data = txn.get_db_data(true)?;
         let mut transfers_changed = false;
 
+        // the transfers to a reusable invoice are what its data is reached through (e.g. its
+        // blinded UTXO or script and its recipient proxies), and the failed ones are deleted from
+        // the proxies until they stop listing them: they are kept while the invoice can still
+        // receive transfers (see DbInvoice::live), as deleting them would silently stop it
+        let now = now().unix_timestamp();
+        let live_invoices: HashSet<i32> = txn
+            .iter_invoices()?
+            .into_iter()
+            .filter(|i| i.live(now))
+            .map(|i| i.idx)
+            .collect();
+        let live_invoice_asset_transfers: HashSet<i32> = if live_invoices.is_empty() {
+            HashSet::new()
+        } else {
+            txn.iter_transfers()?
+                .into_iter()
+                .filter(|t| t.invoice_idx.is_some_and(|i| live_invoices.contains(&i)))
+                .map(|t| t.asset_transfer_idx)
+                .collect()
+        };
+        let of_live_invoice = |asset_transfers: &[DbAssetTransfer]| {
+            asset_transfers
+                .iter()
+                .any(|at| live_invoice_asset_transfers.contains(&at.idx))
+        };
+
         if let Some(batch_transfer_idx) = batch_transfer_idx {
             let batch_transfer =
                 txn.get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
@@ -1272,6 +1936,10 @@ pub trait WalletOffline: WalletBackup {
             }
 
             let asset_transfers = batch_transfer.get_asset_transfers(&db_data.asset_transfers);
+
+            if of_live_invoice(&asset_transfers) {
+                return Err(Error::CannotDeleteBatchTransfer);
+            }
 
             if no_asset_only {
                 let connected_assets = asset_transfers.iter().any(|t| t.asset_id.is_some());
@@ -1298,6 +1966,9 @@ pub trait WalletOffline: WalletBackup {
                 .collect();
             for batch_transfer in batch_transfers.iter_mut() {
                 let asset_transfers = batch_transfer.get_asset_transfers(&db_data.asset_transfers);
+                if of_live_invoice(&asset_transfers) {
+                    continue;
+                }
                 if no_asset_only {
                     let connected_assets = asset_transfers.iter().any(|t| t.asset_id.is_some());
                     if connected_assets {
@@ -1323,24 +1994,34 @@ pub trait WalletOffline: WalletBackup {
         keychain: KeychainKind,
         _count: u32,
     ) -> Result<BdkAddress, Error> {
-        if self.wallet_data().reuse_addresses {
-            let index = self
-                .internals()
-                .reuse_address_index
-                .get(&keychain)
-                .copied()
-                .unwrap_or(0);
-            let address = self.bdk_wallet().peek_address(keychain, index).address;
-            self.bdk_wallet_mut()
-                .reveal_addresses_to(keychain, index)
-                .for_each(drop);
-            return Ok(address);
+        // the first address is kept for the outputs the wallet creates for itself, so it's revealed
+        // first, as it's only revealed when first used
+        if self.reuses_address(keychain) {
+            self.get_first_address(keychain);
         }
         Ok(self.bdk_wallet_mut().reveal_next_address(keychain).address)
     }
 
     fn get_new_address(&mut self) -> Result<BdkAddress, Error> {
         self.get_new_addresses(KeychainKind::External, 1)
+    }
+
+    /// The first address of the keychain, which a wallet reusing addresses uses for every output
+    /// it creates for itself. It is revealed, so the BDK wallet keeps track of it.
+    fn get_first_address(&mut self, keychain: KeychainKind) -> BdkAddress {
+        let bdk_wallet = self.bdk_wallet_mut();
+        let _ = bdk_wallet.reveal_addresses_to(keychain, 0);
+        bdk_wallet.peek_address(keychain, 0).address
+    }
+
+    /// The address for an output the wallet creates for itself on the keychain: the reused one if
+    /// the wallet reuses the keychain address, a new one otherwise.
+    fn get_output_address(&mut self, keychain: KeychainKind) -> Result<BdkAddress, Error> {
+        if self.reuses_address(keychain) {
+            Ok(self.get_first_address(keychain))
+        } else {
+            self.get_new_addresses(keychain, 1)
+        }
     }
 
     fn get_asset_balance_impl(&self, txn: &DbTxn, asset_id: String) -> Result<Balance, Error> {
@@ -1350,21 +2031,6 @@ pub trait WalletOffline: WalletBackup {
 
     fn get_asset_metadata_impl(&self, txn: &DbTxn, asset_id: String) -> Result<Metadata, Error> {
         let asset = txn.check_asset_exists(asset_id.clone())?;
-
-        let (linked_from_asset_id, linked_to_asset_id, unspent_link_right_outpoint) =
-            if asset.schema == AssetSchema::Ifa {
-                let (linked_from_asset_id, linked_to_asset_id) =
-                    self.asset_link_ifa_data(&asset_id)?;
-                let unspent_link_right_outpoint = txn.get_unspent_link_right_outpoint(&asset_id)?;
-
-                (
-                    linked_from_asset_id,
-                    linked_to_asset_id,
-                    unspent_link_right_outpoint,
-                )
-            } else {
-                (None, None, None)
-            };
 
         let initial_supply = asset.initial_supply.parse::<u64>().unwrap();
         let max_supply = if let Some(max_supply) = asset.max_supply {
@@ -1378,38 +2044,40 @@ pub trait WalletOffline: WalletBackup {
             } else {
                 initial_supply
             };
-        let token = if matches!(asset.schema, AssetSchema::Uda) {
-            let medias = txn.iter_media()?;
-            let tokens = txn.iter_tokens()?;
-            let token_medias = txn.iter_token_medias()?;
-            if let Some(token_light) =
-                self.get_asset_token(asset.idx, &medias, &tokens, &token_medias)
-            {
-                let mut token = Token {
-                    index: token_light.index,
-                    ticker: token_light.ticker,
-                    name: token_light.name,
-                    details: token_light.details,
-                    embedded_media: None,
-                    media: token_light.media,
-                    attachments: token_light.attachments,
-                    reserves: None,
-                };
-                if token_light.embedded_media || token_light.reserves {
-                    let runtime = self.rgb_runtime()?;
-                    let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
-                    let contract = runtime.contract_wrapper::<UniqueDigitalAsset>(contract_id)?;
-                    let uda_token =
-                        Token::from_token_data(&contract.token_data(), self.media_dir());
-                    token.embedded_media = uda_token.embedded_media;
-                    token.reserves = uda_token.reserves;
+        let token = match asset.schema {
+            AssetSchema::Uda => {
+                let medias = txn.iter_media()?;
+                let tokens = txn.iter_tokens()?;
+                let token_medias = txn.iter_token_medias()?;
+                if let Some(token_light) =
+                    self.get_asset_token(asset.idx, &medias, &tokens, &token_medias)
+                {
+                    let mut token = Token {
+                        index: token_light.index,
+                        ticker: token_light.ticker,
+                        name: token_light.name,
+                        details: token_light.details,
+                        embedded_media: None,
+                        media: token_light.media,
+                        attachments: token_light.attachments,
+                        reserves: None,
+                    };
+                    if token_light.embedded_media || token_light.reserves {
+                        let stock = self.rgb_stock(txn)?;
+                        let contract_id =
+                            ContractId::from_str(&asset_id).expect("invalid contract ID");
+                        let contract = stock.contract_wrapper::<UniqueDigitalAsset>(contract_id)?;
+                        let uda_token =
+                            Token::from_token_data(&contract.token_data(), self.media_dir());
+                        token.embedded_media = uda_token.embedded_media;
+                        token.reserves = uda_token.reserves;
+                    }
+                    Some(token)
+                } else {
+                    None
                 }
-                Some(token)
-            } else {
-                None
             }
-        } else {
-            None
+            AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa | AssetSchema::Bfa => None,
         };
 
         Ok(Metadata {
@@ -1423,10 +2091,10 @@ pub trait WalletOffline: WalletBackup {
             ticker: asset.ticker,
             details: asset.details,
             token,
-            reject_list_url: asset.reject_list_url,
-            linked_from_asset_id,
-            linked_to_asset_id,
-            unspent_link_right_outpoint,
+            bridge_location: asset.bridge_location,
+            reject_list: asset.reject_list,
+            linked_from_contract: asset.linked_from_contract,
+            linked_to_contract: asset.linked_to_contract,
         })
     }
 
@@ -1472,7 +2140,10 @@ pub trait WalletOffline: WalletBackup {
             precision: ActiveValue::Set(asset_data.precision),
             ticker: ActiveValue::Set(asset_data.ticker.clone()),
             timestamp: ActiveValue::Set(asset_data.timestamp),
-            reject_list_url: ActiveValue::Set(asset_data.reject_list_url.clone()),
+            bridge_location: ActiveValue::Set(asset_data.bridge_location.clone()),
+            reject_list: ActiveValue::Set(asset_data.reject_list.clone()),
+            linked_from_contract: ActiveValue::Set(asset_data.linked_from_contract.clone()),
+            linked_to_contract: ActiveValue::Set(None),
         };
         let idx = txn.set_asset(db_asset.clone())?;
         db_asset.idx = ActiveValue::Set(idx);
@@ -1608,10 +2279,9 @@ pub trait WalletOffline: WalletBackup {
         let mut vanilla = self.get_btc_balance_for_keychain(KeychainKind::Internal)?;
         let colored = self.get_btc_balance_for_keychain(KeychainKind::External)?;
 
-        let reserved: HashSet<BdkOutPoint> = txn
-            .iter_reserved_txos()?
+        let reserved: HashSet<BdkOutPoint> = self
+            .get_reserved_vanilla_outpoints(txn)?
             .into_iter()
-            .map(BdkOutPoint::from)
             .collect();
         if !reserved.is_empty() {
             let reserved_sum: u64 = self
@@ -1625,9 +2295,135 @@ pub trait WalletOffline: WalletBackup {
         Ok(BtcBalance { vanilla, colored })
     }
 
+    fn extract_attachments(
+        &self,
+        stock: &RgbStock<'_>,
+        valid_contract: &ValidContract,
+        asset_schema: AssetSchema,
+    ) -> Result<Vec<Attachment>, Error> {
+        let mut attachments = vec![];
+        let contract_data = stock.consignment_data(valid_contract)?;
+        match asset_schema {
+            AssetSchema::Nia => {
+                let contract = NiaWrapper::with(contract_data);
+                if let Some(attachment) = contract.contract_terms().media {
+                    attachments.push(attachment)
+                }
+            }
+            AssetSchema::Uda => {
+                let contract = UdaWrapper::with(contract_data);
+                if let Some(attachment) = contract.contract_terms().media {
+                    attachments.push(attachment)
+                }
+                let token_data = contract.token_data();
+                if let Some(media) = token_data.media {
+                    attachments.push(media)
+                }
+                attachments.extend(
+                    token_data
+                        .attachments
+                        .to_unconfined()
+                        .values()
+                        .cloned()
+                        .collect::<Vec<Attachment>>(),
+                )
+            }
+            AssetSchema::Cfa => {
+                let contract = CfaWrapper::with(contract_data);
+                if let Some(attachment) = contract.contract_terms().media {
+                    attachments.push(attachment)
+                }
+            }
+            AssetSchema::Ifa => {
+                let contract = IfaWrapper::with(contract_data);
+                if let Some(attachment) = contract.contract_terms().media {
+                    attachments.push(attachment)
+                }
+            }
+            AssetSchema::Bfa => {
+                let contract = BfaWrapper::with(contract_data);
+                if let Some(attachment) = contract.contract_terms().media {
+                    attachments.push(attachment)
+                }
+            }
+        };
+        Ok(attachments)
+    }
+
+    /// Remove the given media files, saved by an operation that then failed. Failing to remove one
+    /// is only logged, as the failure of the operation is what gets reported.
+    fn discard_media_files(&self, paths: &[PathBuf]) {
+        for path in paths {
+            if let Err(e) = fs::remove_file(path) {
+                error!(self.logger(), "Cannot remove media file {path:?}: {e}");
+            }
+        }
+    }
+
+    /// Save media files with `save`, which pushes the path of each file it saves to the given list
+    /// and returns false if some media is missing.
+    ///
+    /// Returns the paths of the saved files, or None if some media is missing. The saved files are
+    /// removed if some media is missing or `save` fails, so that no partial media is left behind.
+    fn save_media_files(
+        &self,
+        save: impl FnOnce(&mut Vec<PathBuf>) -> Result<bool, Error>,
+    ) -> Result<Option<Vec<PathBuf>>, Error> {
+        let mut saved_media_paths = vec![];
+        match save(&mut saved_media_paths) {
+            Ok(true) => Ok(Some(saved_media_paths)),
+            Ok(false) => {
+                self.discard_media_files(&saved_media_paths);
+                Ok(None)
+            }
+            Err(e) => {
+                self.discard_media_files(&saved_media_paths);
+                Err(e)
+            }
+        }
+    }
+
+    /// Save into the media directory the given attachments that aren't there yet, taking them
+    /// from the provided media files (matched by their content hash).
+    ///
+    /// Returns the paths of the saved files, or None, leaving the media directory as it was, if
+    /// any attachment is missing from both the media directory and the provided media files.
+    fn save_provided_attachments(
+        &self,
+        attachments: Vec<Attachment>,
+        media_file_paths: &[String],
+    ) -> Result<Option<Vec<PathBuf>>, Error> {
+        let mut provided_map = HashMap::new();
+        for path in media_file_paths {
+            provided_map.insert(hash_file(Path::new(path))?, path);
+        }
+
+        self.save_media_files(|saved_media_paths| {
+            for attachment in attachments {
+                let digest = hex::encode(attachment.digest);
+                let media_path = self.media_dir().join(&digest);
+                if media_path.exists() {
+                    continue;
+                }
+                match provided_map.get(&digest) {
+                    Some(path) => atomic_write_with(&media_path, |tmp| {
+                        fs::copy(path, tmp)?;
+                        Ok(())
+                    })?,
+                    None => {
+                        error!(self.logger(), "Media for digest {digest} was not provided");
+                        return Ok(false);
+                    }
+                }
+                saved_media_paths.push(media_path);
+            }
+            Ok(true)
+        })
+    }
+
     fn extract_asset_data(
         &self,
-        runtime: &RgbRuntime,
+        stock: &RgbStock<'_>,
         contract_id: ContractId,
         asset_schema: AssetSchema,
         valid_contract: ValidContract,
@@ -1638,7 +2434,7 @@ pub trait WalletOffline: WalletBackup {
         let media_dir = self.media_dir();
         Ok(match &asset_schema {
             AssetSchema::Nia => {
-                let contract = runtime.contract_wrapper::<NonInflatableAsset>(contract_id)?;
+                let contract = stock.contract_wrapper::<NonInflatableAsset>(contract_id)?;
                 let spec = contract.spec();
                 let ticker = spec.ticker().to_string();
                 let name = spec.name().to_string();
@@ -1660,14 +2456,16 @@ pub trait WalletOffline: WalletBackup {
                     initial_supply,
                     max_supply: None,
                     known_circulating_supply: None,
-                    reject_list_url: None,
+                    bridge_location: None,
+                    reject_list: None,
+                    linked_from_contract: None,
                     token: None,
                     timestamp,
                     added_at,
                 }
             }
             AssetSchema::Uda => {
-                let contract = runtime.contract_wrapper::<UniqueDigitalAsset>(contract_id)?;
+                let contract = stock.contract_wrapper::<UniqueDigitalAsset>(contract_id)?;
                 let spec = contract.spec();
                 let ticker = spec.ticker().to_string();
                 let name = spec.name().to_string();
@@ -1690,14 +2488,16 @@ pub trait WalletOffline: WalletBackup {
                     initial_supply,
                     max_supply: None,
                     known_circulating_supply: None,
-                    reject_list_url: None,
+                    bridge_location: None,
+                    reject_list: None,
+                    linked_from_contract: None,
                     token: Some(token_full),
                     timestamp,
                     added_at,
                 }
             }
             AssetSchema::Cfa => {
-                let contract = runtime.contract_wrapper::<CollectibleFungibleAsset>(contract_id)?;
+                let contract = stock.contract_wrapper::<CollectibleFungibleAsset>(contract_id)?;
                 let name = contract.name().to_string();
                 let details = contract.details().map(|d| d.to_string());
                 let precision = contract.precision().into();
@@ -1717,14 +2517,16 @@ pub trait WalletOffline: WalletBackup {
                     initial_supply,
                     max_supply: None,
                     known_circulating_supply: None,
-                    reject_list_url: None,
+                    bridge_location: None,
+                    reject_list: None,
+                    linked_from_contract: None,
                     token: None,
                     timestamp,
                     added_at,
                 }
             }
             AssetSchema::Ifa => {
-                let contract = runtime.contract_wrapper::<InflatableFungibleAsset>(contract_id)?;
+                let contract = stock.contract_wrapper::<InflatableFungibleAsset>(contract_id)?;
                 let spec = contract.spec();
                 let ticker = spec.ticker().to_string();
                 let name = spec.name().to_string();
@@ -1737,13 +2539,16 @@ pub trait WalletOffline: WalletBackup {
                     .map(|a| Media::from_attachment(&a, media_dir));
                 let max_supply = contract.max_supply().into();
                 let known_circulating_supply = if let Some(valid_transfer) = valid_transfer {
-                    IfaWrapper::with(valid_transfer.contract_data())
+                    IfaWrapper::with(stock.consignment_data(&valid_transfer)?)
                         .total_issued_supply()
                         .into()
                 } else {
                     initial_supply
                 };
-                let reject_list_url = contract.reject_list_url().map(|u| u.to_string());
+                let reject_list = contract
+                    .reject_list_url()
+                    .map(|u| RgbRejectListInfo::Url(u.to_string()));
+                let linked_from_contract = contract_link(contract.link_from())?;
                 LocalAssetData {
                     asset_id: contract_id.to_string(),
                     name,
@@ -1755,7 +2560,41 @@ pub trait WalletOffline: WalletBackup {
                     initial_supply,
                     max_supply: Some(max_supply),
                     known_circulating_supply: Some(known_circulating_supply),
-                    reject_list_url,
+                    bridge_location: None,
+                    reject_list,
+                    linked_from_contract,
+                    token: None,
+                    timestamp,
+                    added_at,
+                }
+            }
+            AssetSchema::Bfa => {
+                let contract = stock.contract_wrapper::<BridgedFungibleAsset>(contract_id)?;
+                let ticker = contract.ticker().to_string();
+                let name = contract.name().to_string();
+                let details = contract.details().map(|d| d.to_string());
+                let precision = contract.precision().into();
+                let media = contract
+                    .contract_terms()
+                    .media
+                    .map(|a| Media::from_attachment(&a, media_dir));
+                let bridge_location = contract.bridge_location().into();
+                let reject_list = contract.reject_list().map(RgbRejectListInfo::from);
+                let linked_from_contract = contract_link(contract.link_from())?;
+                LocalAssetData {
+                    asset_id: contract_id.to_string(),
+                    name,
+                    asset_schema,
+                    precision,
+                    ticker: Some(ticker),
+                    details,
+                    media,
+                    initial_supply: 0,
+                    max_supply: None,
+                    known_circulating_supply: None,
+                    bridge_location: Some(bridge_location),
+                    reject_list,
+                    linked_from_contract,
                     token: None,
                     timestamp,
                     added_at,
@@ -1764,17 +2603,22 @@ pub trait WalletOffline: WalletBackup {
         })
     }
 
+    /// Import the given contract into the RGB stock (a no-op if it's already there) and save it
+    /// into the DB.
     fn save_new_asset_internal(
         &self,
         txn: &DbTxn,
-        runtime: &RgbRuntime,
-        contract_id: ContractId,
+        stock: &mut RgbStock<'_>,
         asset_schema: AssetSchema,
         valid_contract: ValidContract,
         valid_transfer: Option<ValidTransfer>,
     ) -> Result<LocalAssetData, Error> {
+        // a contract has no witnesses to resolve
+        stock.import_contract(valid_contract.clone(), &DumbResolver)?;
+
+        let contract_id = valid_contract.contract_id();
         let local_asset_data = self.extract_asset_data(
-            runtime,
+            stock,
             contract_id,
             asset_schema,
             valid_contract,
@@ -1790,7 +2634,17 @@ pub trait WalletOffline: WalletBackup {
         Ok(txn
             .iter_reserved_txos()?
             .into_iter()
+            .filter(|r| r.reserved_for_vanilla.is_some())
             .map(BdkOutPoint::from)
+            .collect())
+    }
+
+    fn get_reserved_colored_outpoints(&self, txn: &DbTxn) -> Result<Vec<Outpoint>, Error> {
+        Ok(txn
+            .iter_reserved_txos()?
+            .into_iter()
+            .filter(|r| r.reserved_for_colored.is_some())
+            .map(Outpoint::from)
             .collect())
     }
 
@@ -1829,6 +2683,7 @@ pub trait WalletOffline: WalletBackup {
         let mut uda = None;
         let mut cfa = None;
         let mut ifa = None;
+        let mut bfa = None;
         for schema in filter_asset_schemas {
             match schema {
                 AssetSchema::Nia => {
@@ -1908,7 +2763,7 @@ pub trait WalletOffline: WalletBackup {
                             .iter()
                             .filter(|a| a.schema == schema)
                             .map(|a| {
-                                let mut asset = AssetIFA::get_asset_details(
+                                AssetIFA::get_asset_details(
                                     txn,
                                     self,
                                     a,
@@ -1918,45 +2773,55 @@ pub trait WalletOffline: WalletBackup {
                                     colorings.clone(),
                                     txos.clone(),
                                     medias.clone(),
-                                )?;
-                                let (linked_from_asset_id, linked_to_asset_id) =
-                                    self.asset_link_ifa_data(&asset.asset_id)?;
-                                asset.linked_from_asset_id = linked_from_asset_id;
-                                asset.linked_to_asset_id = linked_to_asset_id;
-                                Ok(asset)
+                                )
                             })
                             .collect::<Result<Vec<AssetIFA>, Error>>()?,
+                    );
+                }
+                AssetSchema::Bfa => {
+                    bfa = Some(
+                        assets
+                            .iter()
+                            .filter(|a| a.schema == schema)
+                            .map(|a| {
+                                AssetBFA::get_asset_details(
+                                    txn,
+                                    self,
+                                    a,
+                                    transfers.clone(),
+                                    asset_transfers.clone(),
+                                    batch_transfers.clone(),
+                                    colorings.clone(),
+                                    txos.clone(),
+                                    medias.clone(),
+                                )
+                            })
+                            .collect::<Result<Vec<AssetBFA>, Error>>()?,
                     );
                 }
             }
         }
 
-        Ok(Assets { nia, uda, cfa, ifa })
+        Ok(Assets {
+            nia,
+            uda,
+            cfa,
+            ifa,
+            bfa,
+        })
     }
 
     fn sync_if_requested(
         &mut self,
-        #[cfg_attr(
-            not(any(feature = "electrum", feature = "esplora")),
-            allow(unused_variables)
-        )]
-        txn: &DbTxn,
-        #[cfg_attr(
-            not(any(feature = "electrum", feature = "esplora")),
-            allow(unused_variables)
-        )]
-        online: Option<Online>,
+        #[cfg_attr(not(feature = "_online"), allow(unused_variables))] txn: &DbTxn,
+        #[cfg_attr(not(feature = "_online"), allow(unused_variables))] online: Option<Online>,
         skip_sync: bool,
-        #[cfg_attr(
-            not(any(feature = "electrum", feature = "esplora")),
-            allow(unused_variables)
-        )]
-        keychain: KeychainKind,
+        #[cfg_attr(not(feature = "_online"), allow(unused_variables))] keychain: KeychainKind,
     ) -> Result<(), Error> {
         if !skip_sync {
-            #[cfg(not(any(feature = "electrum", feature = "esplora")))]
+            #[cfg(not(feature = "_online"))]
             return Err(Error::Offline);
-            #[cfg(any(feature = "electrum", feature = "esplora"))]
+            #[cfg(feature = "_online")]
             {
                 if let Some(online) = online {
                     self.check_online(online)?;
@@ -2049,26 +2914,95 @@ pub trait WalletOffline: WalletBackup {
         recipient_id.replace(":", "_")
     }
 
-    fn get_receive_consignment_path(&self, recipient_id: &str) -> PathBuf {
-        self.get_transfers_dir()
-            .join(self.normalize_recipient_id(recipient_id))
-            .join(CONSIGNMENT_RCV_FILE)
+    /// Directory holding the data of an incoming transfer: named after its recipient ID, unless
+    /// the recipient ID is shared with other transfers (reusable invoice or reused address).
+    fn get_receive_dir(&self, transfer: &DbTransfer) -> PathBuf {
+        let dir = transfer.receive_dir.clone().unwrap_or_else(|| {
+            self.normalize_recipient_id(
+                transfer
+                    .recipient_id
+                    .as_ref()
+                    .expect("transfer should have a recipient ID"),
+            )
+        });
+        self.get_transfers_dir().join(dir)
     }
 
-    fn get_receive_consignment_meta_path(&self, recipient_id: &str) -> PathBuf {
-        self.get_transfers_dir()
-            .join(self.normalize_recipient_id(recipient_id))
+    fn get_received_mint_path(&self, transfer: &DbTransfer) -> PathBuf {
+        self.get_receive_dir(transfer).join(MINT_RCV_FILE)
+    }
+
+    /// The details of the mint received by `transfer`, saved once the wallet has checked it.
+    fn read_received_mint(&self, transfer: &DbTransfer) -> Result<Option<ReceivedMint>, Error> {
+        let path = self.get_received_mint_path(transfer);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let received_mint =
+            serde_json::from_str(&fs::read_to_string(path)?).map_err(InternalError::from)?;
+        Ok(Some(received_mint))
+    }
+
+    fn get_received_mint_impl(
+        &self,
+        txn: &DbTxn,
+        recipient_id: &str,
+    ) -> Result<Vec<ReceivedMint>, Error> {
+        // the recipient ID can be shared by the transfers to a reused invoice, each receiving its
+        // own mint, and by the outgoing one of a mint to self, while a failed receive has nothing
+        // left to lock for
+        let db_data = txn.get_db_data(false)?;
+        let mut received_mints = vec![];
+        for transfer in db_data
+            .transfers
+            .iter()
+            .filter(|t| t.recipient_id.as_deref() == Some(recipient_id))
+        {
+            let receiving = db_data
+                .asset_transfers
+                .iter()
+                .find(|at| at.idx == transfer.asset_transfer_idx)
+                .and_then(|at| {
+                    db_data
+                        .batch_transfers
+                        .iter()
+                        .find(|bt| bt.idx == at.batch_transfer_idx)
+                })
+                .is_some_and(|bt| bt.incoming && bt.status != TransferStatus::Failed);
+            if !receiving {
+                continue;
+            }
+            if let Some(received_mint) = self.read_received_mint(transfer)? {
+                received_mints.push(received_mint);
+            }
+        }
+        Ok(received_mints)
+    }
+
+    fn get_receive_consignment_path(&self, transfer: &DbTransfer) -> PathBuf {
+        Self::receive_consignment_path_in(&self.get_receive_dir(transfer))
+    }
+
+    /// Path of the received consignment in the given receive dir (see [`Self::get_receive_dir`])
+    fn receive_consignment_path_in(receive_dir: &Path) -> PathBuf {
+        receive_dir.join(CONSIGNMENT_RCV_FILE.as_str())
+    }
+
+    fn get_receive_consignment_meta_path(&self, transfer: &DbTransfer) -> PathBuf {
+        self.get_receive_dir(transfer)
             .join(CONSIGNMENT_RCV_META_FILE)
     }
 
+    /// Path of the validated copy of a received consignment, kept only while the transfer is
+    /// pending
     fn get_receive_valid_consignment_path(&self, consignment_path: &Path) -> PathBuf {
-        consignment_path.with_extension("valid.rgbc")
+        consignment_path.with_extension(format!("valid.{RGB_BIN_EXTENSION}"))
     }
 
     fn send_consignment_path(&self, asset_id: &str, transfer_id: &str) -> PathBuf {
         let transfer_dir = self.get_transfer_dir(transfer_id);
         let asset_transfer_dir = self.get_asset_transfer_dir(transfer_dir, asset_id);
-        asset_transfer_dir.join(CONSIGNMENT_FILE)
+        asset_transfer_dir.join(CONSIGNMENT_FILE.as_str())
     }
 
     fn get_transfer_data(
@@ -2076,26 +3010,10 @@ pub trait WalletOffline: WalletBackup {
         transfer: &DbTransfer,
         asset_transfer: &DbAssetTransfer,
         batch_transfer: &DbBatchTransfer,
-        txos: &[DbTxo],
-        colorings: &[DbColoring],
+        coloring_info: &AssetTransferColoringInfo,
     ) -> Result<TransferData, Error> {
-        let filtered_coloring = colorings
-            .iter()
-            .filter(|&c| c.asset_transfer_idx == asset_transfer.idx)
-            .cloned();
-
-        let assignments = filtered_coloring
-            .clone()
-            .filter(|c| c.r#type != ColoringType::Input)
-            .map(|c| c.assignment)
-            .collect();
-
         let kind = if batch_transfer.incoming {
-            if filtered_coloring.clone().count() > 0
-                && filtered_coloring
-                    .clone()
-                    .all(|c| c.r#type == ColoringType::Issue)
-            {
+            if coloring_info.all_issue {
                 TransferKind::Issuance
             } else {
                 match transfer.recipient_type.as_ref().unwrap() {
@@ -2103,106 +3021,73 @@ pub trait WalletOffline: WalletBackup {
                     RecipientTypeFull::Witness { .. } => TransferKind::ReceiveWitness,
                 }
             }
-        } else if transfer.recipient_id.is_none()
-            && transfer.requested_assignment == Some(Assignment::LinkRight)
-        {
-            TransferKind::Link
-        } else if transfer.recipient_id.is_none() {
-            TransferKind::Burn
-        } else if filtered_coloring
-            .clone()
-            .any(|c| c.r#type == ColoringType::Issue)
-        {
-            // inflation transfer is outgoing and connected to issue colorings
-            TransferKind::Inflation
         } else {
-            TransferKind::Send
+            match asset_transfer
+                .transition_type
+                .expect("outgoing asset transfers record their transition")
+            {
+                // the recorded type is the one of the operation's MainTransition, which is never a
+                // transfer of rights (rights are moved by side transitions, and an operation moving
+                // only rights is recorded as a Transfer), so they map to sends
+                TypeOfTransition::Transfer
+                | TypeOfTransition::TransferInflation
+                | TypeOfTransition::TransferLink
+                | TypeOfTransition::Propagate => TransferKind::Send,
+                TypeOfTransition::Inflate => TransferKind::Inflation,
+                TypeOfTransition::Burn => TransferKind::Burn,
+                TypeOfTransition::Link => TransferKind::Link,
+                TypeOfTransition::Mint => TransferKind::Mint,
+            }
         };
 
-        let txo_ids: Vec<i32> = filtered_coloring.clone().map(|c| c.txo_idx).collect();
-        let transfer_txos: Vec<DbTxo> = txos
-            .iter()
-            .filter(|&t| txo_ids.contains(&t.idx))
-            .cloned()
-            .collect();
         let receive_utxo = match &transfer.recipient_type {
             Some(RecipientTypeFull::Blind { unblinded_utxo }) => Some(unblinded_utxo.clone()),
-            Some(RecipientTypeFull::Witness { vout, .. }) => {
-                let received_txo_idx: Vec<i32> = filtered_coloring
-                    .clone()
-                    // issue coloring from inflation is considered as received
-                    .filter(|c| [ColoringType::Receive, ColoringType::Issue].contains(&c.r#type))
-                    .map(|c| c.txo_idx)
-                    .collect();
-                transfer_txos
-                    .clone()
-                    .into_iter()
-                    .filter(|t| received_txo_idx.contains(&t.idx) && t.vout == vout.unwrap())
-                    .map(|t| t.outpoint())
-                    .collect::<Vec<Outpoint>>()
-                    .first()
-                    .cloned()
-            }
+            Some(RecipientTypeFull::Witness { vout, .. }) => coloring_info
+                .receive_candidates
+                .iter()
+                .filter(|t| t.vout == vout.unwrap())
+                .min_by_key(|t| t.idx)
+                .map(|t| t.outpoint()),
             _ => None,
         };
-        let change_utxo = match kind {
-            TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => None,
+        let change_utxos = match kind {
+            TransferKind::ReceiveBlind | TransferKind::ReceiveWitness | TransferKind::Issuance => {
+                vec![]
+            }
             TransferKind::Send
             | TransferKind::Inflation
             | TransferKind::Burn
-            | TransferKind::Link => {
-                let change_txo_idx: Vec<i32> = filtered_coloring
-                    .filter(|c| c.r#type == ColoringType::Change)
-                    .map(|c| c.txo_idx)
-                    .collect();
-                transfer_txos
-                    .into_iter()
-                    .filter(|t| change_txo_idx.contains(&t.idx))
-                    .map(|t| t.outpoint())
-                    .collect::<Vec<Outpoint>>()
-                    .first()
-                    .cloned()
-            }
-            TransferKind::Issuance => None,
+            | TransferKind::Link
+            | TransferKind::Mint => coloring_info.change_utxos.clone(),
         };
 
-        let consignment_path = match (&kind, batch_transfer.status) {
-            (
-                TransferKind::Send
-                | TransferKind::Inflation
-                | TransferKind::Burn
-                | TransferKind::Link,
-                _,
-            ) => Some(self.send_consignment_path(
-                &asset_transfer.asset_id.clone().unwrap(),
-                &batch_transfer.txid.clone().unwrap(),
-            )),
-            (
-                TransferKind::ReceiveBlind | TransferKind::ReceiveWitness,
-                TransferStatus::WaitingCounterparty,
-            ) => None,
-            (TransferKind::ReceiveBlind | TransferKind::ReceiveWitness, _) => {
-                let recipient_id = transfer.recipient_id.clone().unwrap();
-                let nonce: &[u8] = match transfer.recipient_type.as_ref() {
-                    Some(RecipientTypeFull::Witness {
-                        recipient_nonce, ..
-                    }) => recipient_nonce.as_slice(),
-                    _ => &[],
-                };
-                let proxy_rid = crate::utils::derive_proxy_recipient_id(&recipient_id, nonce);
-                Some(self.get_receive_consignment_path(&proxy_rid))
+        let consignment_path = match &kind {
+            TransferKind::Send | TransferKind::Burn | TransferKind::Link | TransferKind::Mint => {
+                Some(self.send_consignment_path(
+                    &asset_transfer.asset_id.clone().unwrap(),
+                    &batch_transfer.txid.clone().unwrap(),
+                ))
             }
-            (TransferKind::Issuance, _) => {
+            // no consignment is produced for an inflation, which has no counterparty
+            TransferKind::Inflation => None,
+            TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => {
+                Some(self.get_receive_consignment_path(transfer))
+            }
+            TransferKind::Issuance => {
                 Some(self.get_issue_consignment_path(&asset_transfer.asset_id.clone().unwrap()))
             }
         }
+        // a consignment is only reported if it's on disk, as the PSBT is: a transfer still waiting
+        // for the counterparty has received none yet, and one that failed before that never will
+        .filter(|p| p.exists())
         .map(|p| p.to_string_lossy().to_string());
 
         let psbt_path = match &kind {
             TransferKind::Send
             | TransferKind::Inflation
             | TransferKind::Burn
-            | TransferKind::Link => batch_transfer
+            | TransferKind::Link
+            | TransferKind::Mint => batch_transfer
                 .txid
                 .as_ref()
                 .map(|txid| self.get_transfer_dir(txid).join(UNSIGNED_PSBT_FILE))
@@ -2217,10 +3102,10 @@ pub trait WalletOffline: WalletBackup {
             kind,
             status: batch_transfer.status,
             batch_transfer_idx: batch_transfer.idx,
-            assignments,
+            assignments: coloring_info.assignments.clone(),
             txid: batch_transfer.txid.clone(),
             receive_utxo,
-            change_utxo,
+            change_utxos,
             created_at: batch_transfer.created_at,
             updated_at: batch_transfer.updated_at,
             expiration_timestamp: batch_transfer.expiration,
@@ -2229,59 +3114,97 @@ pub trait WalletOffline: WalletBackup {
         })
     }
 
+    /// Build the [`Transfer`]s for the given DB rows, sorted by transfer index. Transfers whose
+    /// asset transfer is not in `db_data` are skipped.
+    fn build_transfers(
+        &self,
+        db_data: DbData,
+        mut tte_data: TransportEndpointsByTransfer,
+    ) -> Result<Vec<Transfer>, Error> {
+        let DbData {
+            batch_transfers,
+            asset_transfers,
+            mut transfers,
+            colorings,
+            txos,
+        } = db_data;
+        let asset_transfers: HashMap<i32, DbAssetTransfer> =
+            asset_transfers.into_iter().map(|a| (a.idx, a)).collect();
+        let batch_transfers: HashMap<i32, DbBatchTransfer> =
+            batch_transfers.into_iter().map(|b| (b.idx, b)).collect();
+        let colorings_by_asset_transfer = group_colorings_by_asset_transfer(colorings);
+        let txos: HashMap<i32, DbTxo> = txos.into_iter().map(|t| (t.idx, t)).collect();
+        let coloring_infos: HashMap<i32, AssetTransferColoringInfo> = asset_transfers
+            .values()
+            .map(|asset_transfer| {
+                let colorings = colorings_by_asset_transfer
+                    .get(&asset_transfer.idx)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                (
+                    asset_transfer.idx,
+                    AssetTransferColoringInfo::new(colorings, &txos),
+                )
+            })
+            .collect();
+
+        transfers.sort_by_key(|t| t.idx);
+        transfers
+            .into_iter()
+            .filter_map(|t| {
+                asset_transfers
+                    .get(&t.asset_transfer_idx)
+                    .map(|asset_transfer| (t, asset_transfer))
+            })
+            .map(|(t, asset_transfer)| {
+                let batch_transfer = batch_transfers
+                    .get(&asset_transfer.batch_transfer_idx)
+                    .expect("asset transfer should be connected to a batch transfer");
+                let coloring_info = coloring_infos
+                    .get(&asset_transfer.idx)
+                    .expect("asset transfer should have coloring info");
+                let td =
+                    self.get_transfer_data(&t, asset_transfer, batch_transfer, coloring_info)?;
+                let tte_data = tte_data.remove(&t.idx).unwrap_or_default();
+                // recipient transport endpoints
+                let transport_endpoints = tte_data
+                    .iter()
+                    .filter(|(tte, _)| tte.kind == TransportEndpointKind::RecipientProxy)
+                    .map(|(tte, ce)| ce.to_transfer_transport_endpoint(tte))
+                    .collect();
+                // sender transport endpoint
+                let sender_transport_endpoint = tte_data
+                    .iter()
+                    .find(|(tte, _)| tte.kind == TransportEndpointKind::SenderProxy)
+                    .map(|(_, ce)| ce.endpoint.clone());
+                Ok(t.to_transfer(td, transport_endpoints, sender_transport_endpoint))
+            })
+            .collect()
+    }
+
     fn list_transfers_impl(
         &self,
         txn: &DbTxn,
         asset_filter: AssetFilter,
-        txid: Option<String>,
+        scope: TransferScope,
     ) -> Result<Vec<Transfer>, Error> {
-        let db_data = txn.get_db_data(false)?;
-        let batch_transfer_idxs: Option<HashSet<i32>> = txid.map(|txid| {
-            db_data
-                .batch_transfers
-                .iter()
-                .filter(|b| b.txid.as_deref() == Some(txid.as_str()))
-                .map(|b| b.idx)
-                .collect()
-        });
-        let asset_transfer_ids: Vec<i32> = db_data
-            .asset_transfers
-            .iter()
-            .filter(|t| match &asset_filter {
-                AssetFilter::AnyOrNone => true,
-                AssetFilter::None => t.asset_id.is_none(),
-                AssetFilter::Id(asset_id) => t.asset_id.as_ref() == Some(asset_id),
-            })
-            .filter(|t| {
-                batch_transfer_idxs
-                    .as_ref()
-                    .is_none_or(|idxs| idxs.contains(&t.batch_transfer_idx))
-            })
-            .filter(|t| t.user_driven)
-            .map(|t| t.idx)
-            .collect();
-        db_data
-            .transfers
-            .into_iter()
-            .filter(|t| asset_transfer_ids.contains(&t.asset_transfer_idx))
-            .map(|t| {
-                let (asset_transfer, batch_transfer) =
-                    t.related_transfers(&db_data.asset_transfers, &db_data.batch_transfers);
-                let td = self.get_transfer_data(
-                    &t,
-                    &asset_transfer,
-                    &batch_transfer,
-                    &db_data.txos,
-                    &db_data.colorings,
-                )?;
-                let tte_data = txn.get_transfer_transport_endpoints_data(t.idx)?;
-                let transport_endpoints = tte_data
-                    .iter()
-                    .map(|(tte, ce)| ce.to_transfer_transport_endpoint(tte))
-                    .collect();
-                Ok(t.to_transfer(td, transport_endpoints))
-            })
-            .collect()
+        let batch_transfer_idxs = match scope {
+            TransferScope::All => None,
+            TransferScope::Txid(txid) => Some(
+                txn.get_batch_transfers_by_txid(&txid)?
+                    .into_iter()
+                    .map(|b| b.idx)
+                    .collect(),
+            ),
+            TransferScope::BatchTransfer(idx) => {
+                txn.get_batch_transfer(idx)?
+                    .ok_or(Error::BatchTransferNotFound { idx })?;
+                Some(vec![idx])
+            }
+        };
+        let (db_data, tte_data) =
+            txn.get_transfers_db_data(batch_transfer_idxs.as_deref(), &asset_filter)?;
+        self.build_transfers(db_data, tte_data)
     }
 
     fn list_unspents_impl(
@@ -2454,38 +3377,18 @@ pub trait WalletOffline: WalletBackup {
         })
     }
 
-    fn inspect_rgb_transfer_impl(
+    fn inspect_fascia_impl(
         &self,
         txn: &DbTxn,
         psbt: String,
         fascia_path: String,
-        entropy: u64,
+        entropy: Option<u64>,
+        max_fascia_size: u64,
+        max_bundles: u32,
     ) -> Result<RgbInspection, Error> {
         // check request data validity
         let psbt = Psbt::from_str(&psbt)?;
-        if !PathBuf::from(&fascia_path).exists() {
-            return Err(Error::InvalidFilePath {
-                file_path: fascia_path,
-            });
-        }
-        let fascia_str = fs::read_to_string(&fascia_path)?;
-        let fascia: Fascia =
-            serde_json::from_str(&fascia_str).map_err(|_| Error::InvalidFilePath {
-                file_path: fascia_path,
-            })?;
-
-        // verify the fascia's witness ID matches our PSBT's transaction ID
-        let fascia_witness_id = fascia.seal_witness().public.txid();
-        let witness_id =
-            RgbTxid::from_str(&psbt.unsigned_tx.compute_txid().to_string()).expect("valid TXID");
-        if fascia_witness_id != witness_id {
-            return Err(Error::RgbInspection {
-                details: format!(
-                    "fascia witness ID {} does not match PSBT TXID {}",
-                    fascia_witness_id, witness_id
-                ),
-            });
-        }
+        let fascia = fascia_from_file(&fascia_path, max_fascia_size)?;
 
         // verify all PSBT inputs belong to this wallet
         for psbt_input in psbt.inputs.iter() {
@@ -2504,10 +3407,7 @@ pub trait WalletOffline: WalletBackup {
             }
         }
 
-        // inspect fascia bundles and collect operations and commitment messages
-        let mut messages = BTreeMap::new();
-        let mut operations = Vec::new();
-        let mut runtime = self.rgb_runtime()?;
+        let mut stock = self.rgb_stock(txn)?;
         let prev_outputs: Vec<_> = psbt
             .unsigned_tx
             .input
@@ -2529,219 +3429,74 @@ pub trait WalletOffline: WalletBackup {
                 txn.get_txo(&outpoint).unwrap_or(None).is_some()
             }
         };
-        for (contract_id, bundle) in fascia.bundles() {
-            // collect RGB inputs from stash
-            let mut opout_to_input_info: HashMap<Opout, RgbInputInfo> = HashMap::new();
-            let mut stash_input_opouts = HashSet::new();
-            if let Ok(ass_map) =
-                runtime.contract_assignments_for(*contract_id, prev_outputs.iter().copied())
-            {
-                for (explicit_seal, opout_state_map) in ass_map {
-                    let outpoint = explicit_seal.to_outpoint();
-                    if let Some((vin, _)) =
-                        psbt.unsigned_tx
-                            .input
-                            .iter()
-                            .enumerate()
-                            .find(|(_, input)| {
-                                input.previous_output.txid == outpoint.txid
-                                    && input.previous_output.vout == outpoint.vout
-                            })
-                    {
+        fascia_inspection(
+            &psbt,
+            &fascia,
+            entropy,
+            max_bundles,
+            |contract_id, bundle, witness_tx| {
+                // collect the RGB inputs allocated in stock to the spent outputs
+                let mut stock_inputs = HashMap::new();
+                if let Ok(ass_map) =
+                    stock.contract_assignments_for(contract_id, prev_outputs.iter().copied())
+                {
+                    for (explicit_seal, opout_state_map) in ass_map {
+                        let outpoint = explicit_seal.to_outpoint();
                         for (opout, state) in opout_state_map {
-                            stash_input_opouts.insert(opout);
                             let assignment = Assignment::from_opout_and_state(opout, &state);
-                            opout_to_input_info.insert(
-                                opout,
-                                RgbInputInfo {
-                                    vin: vin as u32,
-                                    assignment,
-                                },
-                            );
+                            stock_inputs.insert(opout, (outpoint, assignment));
                         }
                     }
                 }
-            }
 
-            // collect RGB inputs from bundle transitions
-            let bundle_input_opouts: HashSet<_> = bundle
-                .known_transitions
-                .iter()
-                .flat_map(|KnownTransition { transition, .. }| transition.inputs())
-                .collect();
-
-            // safety check: ensure the stash opouts match the bundle inputs exactly
-            // catches inconsistencies that could indicate an outdated stash or malformed transfer
-            if stash_input_opouts != bundle_input_opouts {
-                let missing_in_stash: Vec<_> = bundle_input_opouts
-                    .difference(&stash_input_opouts)
+                // safety check: ensure the bundle spends all the stock inputs, as the ones it
+                // doesn't spend would be lost (inputs missing in stock are detected when
+                // inspecting the bundle)
+                let bundle_input_opouts: HashSet<_> = bundle
+                    .known_transitions
+                    .iter()
+                    .flat_map(|KnownTransition { transition, .. }| transition.inputs())
                     .collect();
-                let extra_in_stash: Vec<_> = stash_input_opouts
-                    .difference(&bundle_input_opouts)
+                let extra_in_stock: Vec<_> = stock_inputs
+                    .keys()
+                    .filter(|opout| !bundle_input_opouts.contains(opout))
                     .collect();
-                let mut error_details = String::new();
-                if !missing_in_stash.is_empty() {
-                    error_details.push_str(&format!(
-                        "bundle declares {} input(s) not found in stash (outdated stash?): {:?}. ",
-                        missing_in_stash.len(),
-                        missing_in_stash
-                    ));
+                if !extra_in_stock.is_empty() {
+                    return Err(Error::RgbInspection {
+                        details: format!(
+                            "bundle for contract {contract_id}: stock contains {} input(s) not declared in bundle (malformed transfer?): {extra_in_stock:?}",
+                            extra_in_stock.len(),
+                        ),
+                    });
                 }
-                if !extra_in_stash.is_empty() {
-                    error_details.push_str(&format!(
-                        "stash contains {} input(s) not declared in bundle (malformed transfer?): {:?}",
-                        extra_in_stash.len(),
-                        extra_in_stash
-                    ));
-                }
-                return Err(Error::RgbInspection {
-                    details: format!(
-                        "bundle for contract {}: input mismatch between stash and bundle. {}",
-                        contract_id, error_details
-                    ),
-                });
-            }
 
-            // inspect bundle transitions
-            let mut transitions = Vec::new();
-            for KnownTransition { transition, .. } in bundle.known_transitions.iter() {
-                // get transition kind
-                let kind = match transition.transition_type {
-                    TS_TRANSFER => TypeOfTransition::Transfer,
-                    TS_INFLATION => TypeOfTransition::Inflate,
-                    TS_BURN => TypeOfTransition::Burn,
-                    TS_LINK => TypeOfTransition::Link,
-                    _ => {
-                        return Err(Error::RgbInspection {
-                            details: format!(
-                                "bundle for contract {}: unknown transition type: {}",
-                                contract_id, transition.transition_type
-                            ),
-                        });
-                    }
+                // inspect bundle transitions
+                let chain_net = stock.genesis(contract_id)?.chain_net;
+                let asset_schema = AssetSchema::get_from_contract_id(contract_id, &stock)?;
+                let is_ours = |seal: &BuilderSeal<GraphSeal>| {
+                    Some(match seal {
+                        BuilderSeal::Revealed(seal) => {
+                            is_revealed_seal_ours(seal.txid, seal.vout.into_u32())
+                        }
+                        BuilderSeal::Concealed(seal) => {
+                            stock.seal_of_secret(*seal).unwrap_or(None).is_some()
+                        }
+                    })
                 };
-
-                // collect transition inputs
-                let mut transition_inputs = Vec::new();
-                for input_opout in transition.inputs() {
-                    if let Some(input_info) = opout_to_input_info.get(&input_opout) {
-                        transition_inputs.push(input_info.clone());
-                    }
-                }
-
-                // collect transition outputs
-                let mut transition_outputs = Vec::new();
-                for (ass_type, typed_assigns) in transition.assignments.iter() {
-                    for fungible_assignment in typed_assigns.as_fungible().iter() {
-                        let (vout, amount, is_concealed, is_ours) = match fungible_assignment {
-                            Assign::Revealed { seal, state, .. } => {
-                                let vout = seal.vout.into_u32();
-                                let is_ours = is_revealed_seal_ours(seal.txid, vout);
-                                let amount = state.as_u64();
-                                (Some(vout), amount, false, is_ours)
-                            }
-                            Assign::ConfidentialSeal { seal, state, .. } => {
-                                let is_ours = runtime.seal_secret(*seal).unwrap_or(None).is_some();
-                                let amount = state.as_u64();
-                                (None, amount, true, is_ours)
-                            }
-                        };
-                        let Some(assignment) = Assignment::fungible(*ass_type, amount) else {
-                            continue;
-                        };
-                        transition_outputs.push(RgbOutputInfo {
-                            vout,
-                            assignment,
-                            is_concealed,
-                            is_ours,
-                        });
-                    }
-                    for structured_assignment in typed_assigns.as_structured().iter() {
-                        let (vout, is_concealed, is_ours) = match structured_assignment {
-                            Assign::Revealed { seal, .. } => {
-                                let vout = seal.vout.into_u32();
-                                let is_ours = is_revealed_seal_ours(seal.txid, vout);
-                                (Some(vout), false, is_ours)
-                            }
-                            Assign::ConfidentialSeal { seal, .. } => {
-                                let is_ours = runtime.seal_secret(*seal).unwrap_or(None).is_some();
-                                (None, true, is_ours)
-                            }
-                        };
-                        transition_outputs.push(RgbOutputInfo {
-                            vout,
-                            assignment: Assignment::NonFungible,
-                            is_concealed,
-                            is_ours,
-                        });
-                    }
-                }
-                transitions.push(RgbTransitionInfo {
-                    r#type: kind,
-                    inputs: transition_inputs,
-                    outputs: transition_outputs,
-                });
-            }
-
-            operations.push(RgbOperationInfo {
-                asset_id: contract_id.to_string(),
-                transitions,
-            });
-
-            messages.insert(
-                ProtocolId::from(*contract_id),
-                Message::from(bundle.bundle_id()),
-            );
-        }
-
-        // extract RGB commitment and determine close method
-        let tx = psbt
-            .clone()
-            .extract_tx()
-            .map_err(|e| Error::RgbInspection {
-                details: format!("failed to extract transaction: {e}"),
-            })?;
-        let commitment_output = tx
-            .output
-            .iter()
-            .find(|o| o.script_pubkey.is_p2tr() || o.script_pubkey.is_op_return())
-            .ok_or_else(|| Error::RgbInspection {
-                details: s!("no commitment output found"),
-            })?;
-        let close_method = if commitment_output.script_pubkey.is_op_return() {
-            CloseMethod::OpretFirst
-        } else {
-            CloseMethod::TapretFirst
-        };
-        let commitment_bytes = {
-            let script_bytes = commitment_output.script_pubkey.as_bytes();
-            if script_bytes.len() == 34 {
-                &script_bytes[2..]
-            } else {
-                return Err(Error::RgbInspection {
-                    details: s!("invalid commitment script length"),
-                });
-            }
-        };
-        let commitment_in_psbt = Commitment::copy_from_slice(commitment_bytes).unwrap();
-        let commitment_hex = hex::encode(commitment_bytes);
-
-        // verify commitment matches the one reconstructed from the fascia
-        let mut source = MultiSource::with_static_entropy(entropy);
-        source.messages = MediumOrdMap::from_checked(messages);
-        let merkle_tree = MerkleTree::try_commit(&source).expect("commit should succeed");
-        let commitment = merkle_tree.commit_id();
-        if commitment != commitment_in_psbt {
-            return Err(Error::RgbInspection {
-                details: s!("commitment mismatch"),
-            });
-        }
-
-        Ok(RgbInspection {
-            close_method,
-            commitment_hex,
-            operations,
-        })
+                bundle_info(
+                    contract_id,
+                    Some(asset_schema),
+                    chain_net,
+                    bundle,
+                    witness_tx,
+                    true,
+                    true,
+                    |opout| stock_inputs.get(&opout).cloned(),
+                    is_ours,
+                    |_| None,
+                )
+            },
+        )
     }
 
     fn get_transfer_end_data(&self, psbt: &Psbt) -> Result<TransferEndData, Error> {
@@ -2750,6 +3505,10 @@ pub trait WalletOffline: WalletBackup {
         // lets the completion path run on a combined-but-not-finalized PSBT
         // (e.g. when the operation's transaction is already on-chain).
         let txid = psbt.unsigned_tx.compute_txid().to_string();
+        self.get_transfer_end_data_by_txid(txid)
+    }
+
+    fn get_transfer_end_data_by_txid(&self, txid: String) -> Result<TransferEndData, Error> {
         let transfer_dir = self.get_transfer_dir(&txid);
         if !transfer_dir.exists() {
             return Err(Error::UnknownTransfer { txid });
@@ -2760,31 +3519,34 @@ pub trait WalletOffline: WalletBackup {
         let info_contents: InfoBatchTransfer =
             serde_json::from_str(&serialized_info).map_err(InternalError::from)?;
 
-        let fascia_path = transfer_dir.join(FASCIA_FILE);
-        let fascia_str = fs::read_to_string(fascia_path)?;
-        let fascia: Fascia = serde_json::from_str(&fascia_str).map_err(InternalError::from)?;
+        let fascia = read_fascia(&transfer_dir.join(FASCIA_FILE))?;
 
         Ok((txid, transfer_dir, info_contents, fascia))
     }
 
     fn get_send_consignment_path_impl<P: AsRef<Path>>(&self, asset_transfer_dir: P) -> PathBuf {
-        asset_transfer_dir.as_ref().join(CONSIGNMENT_FILE)
+        asset_transfer_dir.as_ref().join(CONSIGNMENT_FILE.as_str())
     }
 
     fn gen_consignments(
         &self,
+        txn: &DbTxn,
         fascia: &Fascia,
         transfer_info_map: &BTreeMap<String, InfoAssetTransfer>,
         transfer_dir: &PathBuf,
     ) -> Result<(), Error> {
-        let runtime = self.rgb_runtime()?;
+        let mut stock = self.rgb_stock(txn)?;
         for (asset_id, transfer_info) in transfer_info_map {
-            let consignment = runtime.transfer_from_fascia(
-                transfer_info.asset_info.contract_id,
+            let contract_id = transfer_info.asset_info.contract_id;
+            let (consignment, spv_proofs) = stock.transfer_from_fascia(
+                contract_id,
                 transfer_info.beneficiaries_witness.clone(),
                 transfer_info.beneficiaries_blinded.clone(),
+                transfer_info.requested_opids(fascia),
                 fascia,
+                self.spv_resolver(),
             )?;
+            stock.store_spv_proofs(spv_proofs)?;
             let asset_transfer_dir = self.get_asset_transfer_dir(transfer_dir, asset_id);
             fs::create_dir_all(&asset_transfer_dir)?;
             let consignment_path = self.get_send_consignment_path_impl(asset_transfer_dir);
@@ -2793,33 +3555,9 @@ pub trait WalletOffline: WalletBackup {
         Ok(())
     }
 
-    fn asset_link_ifa_data(
-        &self,
-        asset_id: &str,
-    ) -> Result<(Option<String>, Option<String>), Error> {
-        let contract_id = ContractId::from_str(asset_id).map_err(|e| Error::Internal {
-            details: e.to_string(),
-        })?;
-        let runtime = self.rgb_runtime()?;
-        let contract = runtime.contract_wrapper::<InflatableFungibleAsset>(contract_id)?;
-        let linked_from_asset_id = contract
-            .link_from()
-            .map_err(|e| Error::Internal {
-                details: e.to_string(),
-            })?
-            .map(|contract_id| contract_id.to_string());
-        let linked_to_asset_id = contract
-            .link_to()
-            .map_err(|e| Error::Internal {
-                details: e.to_string(),
-            })?
-            .map(|contract_id| contract_id.to_string());
-        Ok((linked_from_asset_id, linked_to_asset_id))
-    }
-
     // ─── On-chain swap ─────────────────────────────────────────────────────────
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     fn create_swap_offer_impl(
         &mut self,
         _txn: &DbTxn,
@@ -2827,11 +3565,9 @@ pub trait WalletOffline: WalletBackup {
         maker_receives: OnchainSwapLeg,
         network_fee_sat: u64,
         expiration_timestamp: Option<u64>,
-        proxy_url: Option<String>,
         extra_outputs: Vec<OnchainSwapExtraOutput>,
     ) -> Result<OnchainSwapOffer, Error> {
         swap_validate_legs(&maker_gives, &maker_receives)?;
-        swap_validate_proxy_url(&proxy_url)?;
         swap_validate_extra_outputs(&extra_outputs, self.bitcoin_network())?;
         let (
             maker_btc_address,
@@ -2868,7 +3604,6 @@ pub trait WalletOffline: WalletBackup {
             maker_rgb_recipient_id,
             maker_rgb_script_pubkey_hex,
             maker_rgb_blinding,
-            proxy_url,
             extra_outputs,
         })
     }
@@ -2876,11 +3611,11 @@ pub trait WalletOffline: WalletBackup {
 
 // ─── On-chain swap: free helper functions (offline-safe) ──────────────────────
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_DEFAULT_RGB_OUTPUT_SAT: u64 = 1_000;
 
 /// The Initiated batch recording this wallet's RGB leg of a swap, applied after broadcast.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct SwapOutgoingState {
     pub(crate) txid: String,
@@ -2889,14 +3624,14 @@ pub(crate) struct SwapOutgoingState {
 
 /// The transaction the taker broadcast to spend one of its swap inputs, invalidating the swap
 /// transaction it signed. Kept until either transaction confirms.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct SwapInvalidationState {
     pub(crate) txid: String,
     pub(crate) tx_hex: String,
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum SwapDirection {
     RgbForBtc,
@@ -2904,14 +3639,14 @@ pub(crate) enum SwapDirection {
     RgbForRgb,
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_invalid(details: impl Into<String>) -> Error {
     Error::InvalidDetails {
         details: details.into(),
     }
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_random_id() -> String {
     rand::rng()
         .sample_iter(&Alphanumeric)
@@ -2920,7 +3655,7 @@ pub(crate) fn swap_random_id() -> String {
         .collect()
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_random_blinding() -> u64 {
     rand::rng().random_range(1..=u64::MAX)
 }
@@ -2931,7 +3666,7 @@ pub(crate) fn swap_random_blinding() -> u64 {
 /// counterparty nor anyone who saw the offer can recompute it (the swap ID and the blindings are
 /// known to them). A retried step derives the same value. Nobody else needs it: the entropy
 /// travels in the PSBT.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_mpc_entropy(wallet_dir: &Path, swap_id: &str) -> Result<u64, Error> {
     let seed: String = if swap_state_path(wallet_dir, swap_id, SWAP_SEED_FILE).exists() {
         swap_load_state(wallet_dir, swap_id, SWAP_SEED_FILE)?
@@ -2953,7 +3688,7 @@ pub(crate) fn swap_mpc_entropy(wallet_dir: &Path, swap_id: &str) -> Result<u64, 
 /// The lock time the maker set must be a block height no further than
 /// [`SWAP_LOCK_TIME_MAX_AHEAD`] past `tip`: one in the future would keep the signed transaction
 /// from confirming until then.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_ensure_lock_time_current(
     proposal: &OnchainSwapProposal,
     tip: u32,
@@ -2970,7 +3705,7 @@ pub(crate) fn swap_ensure_lock_time_current(
 /// The most BTC the swap may take from `role`'s wallet, net of what it pays back to it: the BTC it
 /// gives, the extra outputs it funds and, for the taker, the network fee, less the BTC it
 /// receives. Negative when the side receives BTC.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_max_net_btc_outflow(
     proposal: &OnchainSwapProposal,
     role: OnchainSwapRole,
@@ -2994,7 +3729,7 @@ pub(crate) fn swap_max_net_btc_outflow(
 /// in (`own_in`, from its own view of its coins) less what the transaction pays to its scripts
 /// (`own_out`) must not exceed [`swap_max_net_btc_outflow`], plus change too small to be an output
 /// of `role`'s change script, which goes to the fee.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_ensure_net_btc_outflow(
     proposal: &OnchainSwapProposal,
     role: OnchainSwapRole,
@@ -3019,7 +3754,7 @@ pub(crate) fn swap_ensure_net_btc_outflow(
     Ok(())
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_ensure_not_expired(offer: &OnchainSwapOffer) -> Result<(), Error> {
     if let Some(expiration_timestamp) = offer.expiration_timestamp {
         let current_timestamp = u64::try_from(now().unix_timestamp()).unwrap_or_default();
@@ -3030,7 +3765,7 @@ pub(crate) fn swap_ensure_not_expired(offer: &OnchainSwapOffer) -> Result<(), Er
     Ok(())
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_validate_leg(leg: &OnchainSwapLeg) -> Result<(), Error> {
     if leg.amount == 0 {
         return Err(Error::InvalidAmountZero);
@@ -3053,10 +3788,10 @@ pub(crate) fn swap_validate_leg(leg: &OnchainSwapLeg) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) const SWAP_MAX_EXTRA_OUTPUTS: usize = 8;
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_validate_extra_outputs(
     extra_outputs: &[OnchainSwapExtraOutput],
     network: BitcoinNetwork,
@@ -3074,7 +3809,7 @@ pub(crate) fn swap_validate_extra_outputs(
 }
 
 /// The sats the given side funds on top of its swap legs: the extra outputs it pays for.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_extra_funded_by(
     extra_outputs: &[OnchainSwapExtraOutput],
     role: OnchainSwapRole,
@@ -3086,7 +3821,7 @@ pub(crate) fn swap_extra_funded_by(
         .ok_or_else(|| swap_invalid("swap amounts overflow"))
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_validate_legs(
     gives: &OnchainSwapLeg,
     receives: &OnchainSwapLeg,
@@ -3117,17 +3852,17 @@ pub(crate) fn swap_validate_legs(
     })
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_parse_script(script_hex: &str) -> Result<ScriptBuf, Error> {
     ScriptBuf::from_hex(script_hex).map_err(|e| swap_invalid(format!("invalid script: {e}")))
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_input_to_outpoint(input: &OnchainSwapInput) -> BdkOutPoint {
     BdkOutPoint::from(input.outpoint.clone())
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_input_txout(input: &OnchainSwapInput) -> Result<TxOut, Error> {
     Ok(TxOut {
         value: BdkAmount::from_sat(input.amount_sat),
@@ -3135,7 +3870,7 @@ pub(crate) fn swap_input_txout(input: &OnchainSwapInput) -> Result<TxOut, Error>
     })
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_build_input(local_output: &LocalOutput) -> OnchainSwapInput {
     OnchainSwapInput {
         outpoint: local_output.outpoint.into(),
@@ -3144,12 +3879,12 @@ pub(crate) fn swap_build_input(local_output: &LocalOutput) -> OnchainSwapInput {
     }
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_selected_inputs_total(inputs: &[OnchainSwapInput]) -> u64 {
     inputs.iter().map(|i| i.amount_sat).sum()
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_require_rgb_destination(
     leg: &OnchainSwapLeg,
     script_hex: &Option<String>,
@@ -3161,17 +3896,17 @@ pub(crate) fn swap_require_rgb_destination(
     Ok(())
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_consignment_dir(wallet_dir: &Path, swap_id: &str) -> PathBuf {
     wallet_dir.join("transfers").join(format!("swap-{swap_id}"))
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_state_path(wallet_dir: &Path, swap_id: &str, file_name: &str) -> PathBuf {
     swap_consignment_dir(wallet_dir, swap_id).join(file_name)
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_save_state<T: Serialize>(
     wallet_dir: &Path,
     swap_id: &str,
@@ -3187,7 +3922,7 @@ pub(crate) fn swap_save_state<T: Serialize>(
     Ok(())
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_load_state<T: serde::de::DeserializeOwned>(
     wallet_dir: &Path,
     swap_id: &str,
@@ -3206,7 +3941,7 @@ pub(crate) fn swap_load_state<T: serde::de::DeserializeOwned>(
         .map_err(Error::from)
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_ensure_state_matches<T: PartialEq>(
     expected: &T,
     actual: &T,
@@ -3220,19 +3955,19 @@ pub(crate) fn swap_ensure_state_matches<T: PartialEq>(
     Ok(())
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_consignment_path(base_dir: &Path, asset_id: &str) -> PathBuf {
     swap_asset_file_path(base_dir, "consignment", asset_id)
 }
 
 /// Path of the asset history a swap giver exports, kept apart from the transfer consignment of
 /// the same asset, which shares the swap directory.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_history_path(base_dir: &Path, asset_id: &str) -> PathBuf {
     swap_asset_file_path(base_dir, "history", asset_id)
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 fn swap_asset_file_path(base_dir: &Path, prefix: &str, asset_id: &str) -> PathBuf {
     let sanitized = asset_id
         .chars()
@@ -3248,41 +3983,16 @@ fn swap_asset_file_path(base_dir: &Path, prefix: &str, asset_id: &str) -> PathBu
     base_dir.join(format!("{prefix}-{sanitized}-{}.rgb", &asset_id_hash[..16]))
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_history_recipient_id(swap_id: &str, asset_id: &str) -> String {
     let asset_id_hash = hash_bytes_hex(asset_id.as_bytes());
     format!("swap-history-{swap_id}-{}", &asset_id_hash[..16])
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-pub(crate) fn swap_proxy_transport_endpoint(proxy_url: &str) -> Result<String, Error> {
-    let endpoint = if let Some(rest) = proxy_url.strip_prefix("http://") {
-        format!("rpc://{rest}")
-    } else if let Some(rest) = proxy_url.strip_prefix("https://") {
-        format!("rpcs://{rest}")
-    } else {
-        proxy_url.to_string()
-    };
-    let transport = RgbTransport::from_str(&endpoint)?;
-    TransportEndpoint::try_from(transport)?;
-    Ok(endpoint)
-}
-
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-pub(crate) fn swap_validate_proxy_url(proxy_url: &Option<String>) -> Result<(), Error> {
-    let proxy_url = proxy_url
-        .as_deref()
-        .ok_or_else(|| Error::InvalidTransportEndpoints {
-            details: s!("on-chain RGB swaps require a proxy URL"),
-        })?;
-    swap_proxy_transport_endpoint(proxy_url)?;
-    Ok(())
-}
-
 /// Build the coloring for a swap RGB leg: `leg.amount` goes to `recipient_vout` and everything
 /// else the inputs carry (`available`, per contract) goes back to `change_vout`. Vouts are final
 /// PSBT indices; the returned flag tells whether the map was shifted for an OP_RETURN-first PSBT.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_rgb_leg_coloring_info(
     leg: &OnchainSwapLeg,
     psbt: &Psbt,
@@ -3352,7 +4062,7 @@ pub(crate) fn swap_rgb_leg_coloring_info(
     Ok((contract_id, coloring_info, shift))
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_side_btc_payment(leg: &OnchainSwapLeg) -> u64 {
     if matches!(leg.kind, OnchainSwapLegKind::Btc) {
         leg.amount
@@ -3361,7 +4071,7 @@ pub(crate) fn swap_side_btc_payment(leg: &OnchainSwapLeg) -> u64 {
     }
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_side_rgb_output_cost(receives: &OnchainSwapLeg, rgb_output_sat: u64) -> u64 {
     if matches!(receives.kind, OnchainSwapLegKind::Rgb) {
         rgb_output_sat
@@ -3370,7 +4080,7 @@ pub(crate) fn swap_side_rgb_output_cost(receives: &OnchainSwapLeg, rgb_output_sa
     }
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_append_side_change(
     outputs: &mut Vec<TxOut>,
     inputs: &[OnchainSwapInput],
@@ -3409,7 +4119,7 @@ pub(crate) fn swap_append_side_change(
     Ok(())
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_build_psbt(
     proposal: &OnchainSwapProposal,
 ) -> Result<(Psbt, Option<u32>, Option<u32>), Error> {
@@ -3543,7 +4253,7 @@ pub(crate) fn swap_build_psbt(
 
 /// The absolute fee the swap transaction pays: its inputs minus its outputs, which may exceed
 /// `network_fee_sat` when a side's change below the dust limit went to the fee.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_tx_fee(proposal: &OnchainSwapProposal) -> Result<u64, Error> {
     let (psbt, _, _) = swap_build_psbt(proposal)?;
     let inputs = swap_selected_inputs_total(&proposal.maker_inputs)
@@ -3562,7 +4272,7 @@ pub(crate) fn swap_tx_fee(proposal: &OnchainSwapProposal) -> Result<u64, Error> 
         .ok_or_else(|| swap_invalid("swap outputs exceed its inputs"))
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_restore_input_metadata(
     psbt: &mut Psbt,
     inputs: &[OnchainSwapInput],
@@ -3580,7 +4290,7 @@ pub(crate) fn swap_restore_input_metadata(
 /// After signing, make sure this wallet added signatures only to the inputs it declared. A
 /// counterparty that smuggles one of this wallet's coins into the PSBT as its own input would
 /// otherwise have it spent. Signatures the counterparty already put on its own inputs stay.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_ensure_only_own_inputs_signed(
     before: &Psbt,
     after: &Psbt,
@@ -3615,7 +4325,7 @@ pub(crate) fn swap_ensure_only_own_inputs_signed(
     Ok(())
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 pub(crate) fn swap_validate_proposal_psbt(
     proposal: &OnchainSwapProposal,
     psbt: &Psbt,
@@ -3753,25 +4463,24 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
         Ok(transactions)
     }
 
-    /// List the RGB [`Transfer`]s known to the wallet.
+    /// List the RGB [`Transfer`]s known to the wallet, filtered by `asset_filter` and `scope`.
     ///
-    /// `asset_filter` selects transfers by asset. When a `txid` is provided, restrict the result to the
-    /// transfers committed by the on-chain transaction with that ID; an unknown `txid` yields an
-    /// empty list.
+    /// An unknown TXID yields an empty list, while an unknown batch transfer index returns
+    /// [`Error::BatchTransferNotFound`].
     fn list_transfers(
         &self,
         asset_filter: AssetFilter,
-        txid: Option<String>,
+        scope: TransferScope,
     ) -> Result<Vec<Transfer>, Error> {
         info!(
             self.logger(),
-            "Listing transfers for filter '{:?}' and txid '{:?}'...", asset_filter, txid
+            "Listing transfers for filter '{:?}' and scope '{:?}'...", asset_filter, scope
         );
         let txn = self.database().begin_transaction()?;
         if let AssetFilter::Id(asset_id) = &asset_filter {
             txn.check_asset_exists(asset_id.clone())?;
         }
-        let transfers = self.list_transfers_impl(&txn, asset_filter, txid)?;
+        let transfers = self.list_transfers_impl(&txn, asset_filter, scope)?;
         txn.commit()?;
         info!(self.logger(), "List transfers completed");
         Ok(transfers)
@@ -3793,6 +4502,54 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
         self.persist_and_commit(txn)?;
         info!(self.logger(), "List unspents completed");
         Ok(unspents)
+    }
+
+    /// Export the contract consignment (no bundles) of the RGB contract with the provided
+    /// `asset_id` into the provided `destination_dir`, which must be an existing directory.
+    ///
+    /// The consignment is written to a `<contract ID without the "rgb:" prefix>.rgb` file,
+    /// which must not exist yet, and can be imported by a singlesig wallet with
+    /// [`import_contract`](Wallet::import_contract), together with its media files (see
+    /// [`get_asset_metadata`](RgbWalletOpsOffline::get_asset_metadata)), if any.
+    ///
+    /// Returns the path of the exported contract file.
+    fn export_contract(&self, asset_id: String, destination_dir: String) -> Result<String, Error> {
+        info!(
+            self.logger(),
+            "Exporting consignment for contract '{}'...", asset_id
+        );
+        let txn = self.database().begin_transaction()?;
+        txn.check_asset_exists(asset_id.clone())?;
+        let destination_dir_path = Path::new(&destination_dir);
+        if !destination_dir_path.is_dir() {
+            return Err(Error::InvalidFilePath {
+                file_path: destination_dir,
+            });
+        }
+        let contract_path = destination_dir_path.join(format!(
+            "{}.{RGB_BIN_EXTENSION}",
+            asset_id.replace(ASSET_ID_PREFIX, "")
+        ));
+        let contract_id = ContractId::from_str(&asset_id).expect("asset ID in DB should be valid");
+        let contract = self.rgb_stock(&txn)?.export_contract(contract_id)?;
+        txn.commit()?;
+
+        // written to a new temporary file, then moved into place only if there's no file there
+        // yet, as a rename would replace it (e.g. if written by a concurrent export)
+        let tmp_file = NamedTempFile::new_in(destination_dir_path)?;
+        contract.save(tmp_file.as_file())?;
+        tmp_file.as_file().sync_all()?;
+        tmp_file
+            .persist_noclobber(&contract_path)
+            .map_err(|e| match e.error.kind() {
+                io::ErrorKind::AlreadyExists => Error::FileAlreadyExists {
+                    path: contract_path.to_string_lossy().to_string(),
+                },
+                _ => e.error.into(),
+            })?;
+        sync_dir(destination_dir_path)?;
+        info!(self.logger(), "Export consignment completed");
+        Ok(contract_path.to_string_lossy().to_string())
     }
 
     /// Finalize a PSBT, optionally providing BDK sign options to tweak the behavior of the
@@ -3820,7 +4577,11 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
     /// If no `batch_transfer_idx` is provided, all failed transfers will be deleted, and if
     /// `no_asset_only` is true transfers with an associated asset ID will be skipped.
     ///
-    /// Eligible transfers are the ones in status [`TransferStatus::Failed`].
+    /// Eligible transfers are the ones in status [`TransferStatus::Failed`], except the transfers
+    /// to a reusable invoice that can still receive transfers (until its expiration plus the
+    /// retention grace of its recipient proxies): deleting them would stop the wallet from
+    /// receiving the invoice's next transfers. These are skipped when deleting all failed
+    /// transfers, while a `batch_transfer_idx` of one returns an error.
     fn delete_transfers(
         &self,
         batch_transfer_idx: Option<i32>,
@@ -3855,11 +4616,11 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
 
     /// Zip the wallet's data for a backup at `backup_path`, without encrypting it.
     ///
-    /// This is the part of [`backup`](WalletOffline::backup) that needs the wallet. Encrypting and
+    /// This is the part of [`backup`](RgbWalletOpsOffline::backup) that needs the wallet. Encrypting and
     /// writing the file is left to [`seal_backup`](crate::wallet::seal_backup), which doesn't, so
     /// the wallet keeps working meanwhile. Once the sealed file is safely stored, record it with
-    /// [`backup_mark_done`](WalletOffline::backup_mark_done); until then
-    /// [`backup_info`](WalletOffline::backup_info) keeps reporting a backup as due.
+    /// [`backup_mark_done`](RgbWalletOpsOffline::backup_mark_done); until then
+    /// [`backup_info`](RgbWalletOpsOffline::backup_info) keeps reporting a backup as due.
     ///
     /// A wallet restored from such a backup reports a backup as due until its next one.
     fn backup_snapshot(&self, backup_path: &str) -> Result<BackupSnapshot, Error> {
@@ -3873,7 +4634,7 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
     /// latest.
     ///
     /// The backup counts from the moment its snapshot was taken, so a change made after that keeps
-    /// [`backup_info`](WalletOffline::backup_info) reporting a backup as due.
+    /// [`backup_info`](RgbWalletOpsOffline::backup_info) reporting a backup as due.
     fn backup_mark_done(&self, sealed: &SealedBackup) -> Result<(), Error> {
         info!(self.logger(), "Marking backup done...");
         if &sealed.wallet_dir != self.wallet_dir() {
@@ -3898,6 +4659,61 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
         Ok(backup_required)
     }
 
+    /// Get the details of the mint received on the provided `recipient_id`, once the wallet has
+    /// checked it.
+    ///
+    /// The consignment of a mint is posted before its sender locks the corresponding tokens on the
+    /// external chain, so that its recipient can check it first: when refreshing, the wallet checks
+    /// it, assuming the lock will be made, and refuses it unless it's valid, pays the invoice (the
+    /// requested amount, if the invoice requests one), pays the recipient the whole amount minted
+    /// (which the lock has to match) and none of its history is rejected. A mint relying on other
+    /// mints whose locks aren't finalized yet (in its history or in the same bundle) is checked
+    /// only once they are, expiring with the invoice until then. The returned details are what the
+    /// lock has to match, for the mint to complete: its lock ID (committing to the mint operation
+    /// and its TX) and amount, the external chain block it has to be included before and the
+    /// bridge contract where to make it.
+    ///
+    /// The checks depending on when they run aren't repeated afterwards, as the lock relies on
+    /// them: e.g. a later update of the reject list doesn't refuse a checked mint. They aren't made
+    /// either for a mint whose lock is already recorded when the wallet first sees it (e.g. made
+    /// before the check, or for a wallet restored from a backup taken before it), as refusing it
+    /// wouldn't stop it from completing. The limit on the allocations of the asset a UTXO can hold
+    /// is an exception: a mint going over it is refused at any time, which loses only the mint,
+    /// while accepting it would freeze them all, the mint included. Checking a mint marks a backup
+    /// as required (see [`Self::backup_info`]), so that a backup restored once the lock is made has
+    /// it checked already.
+    ///
+    /// Once checked, the mint no longer expires with the invoice: the transfer is waited for until
+    /// its lock is finalized. A mint whose lock can no longer be included before the block, as of
+    /// the latest finalized block of the external chain, will never complete, so it's refused once
+    /// that's known (a bridge contract failing when asked about the lock is taken as recording
+    /// none). Once its lock is finalized, the mint is waited for until its TX is broadcast: the
+    /// transfer is failed if one of the TX inputs is spent by another confirmed TX, as the TX can
+    /// then never confirm, while a minter neither broadcasting the TX nor spending its inputs keeps
+    /// it pending. A mint committing to a block too far in the future is refused when checked,
+    /// bounding the wait for the lock (see
+    #[cfg_attr(
+        feature = "_online",
+        doc = "[`EvmChain::max_mint_lock_blocks`](crate::wallet::EvmChain::max_mint_lock_blocks))."
+    )]
+    #[cfg_attr(not(feature = "_online"), doc = "`EvmChain::max_mint_lock_blocks`).")]
+    ///
+    /// For now, a multisig wallet refuses the mints paying it (see [`MultisigWallet`]), so this
+    /// always returns `None` for one: no lock should be made for a mint paying a multisig wallet.
+    /// This is temporary, it will be addressed along with other open issues of multisig wallets.
+    ///
+    /// A reused invoice can receive several mints, one per transfer, each needing its own lock.
+    /// Returns an empty list if no mint checked by the wallet pays `recipient_id` (e.g. it hasn't
+    /// been received or checked yet, or it has been refused or failed).
+    fn get_received_mint(&self, recipient_id: String) -> Result<Vec<ReceivedMint>, Error> {
+        info!(self.logger(), "Getting received mint...");
+        let txn = self.database().begin_transaction()?;
+        let received_mint = self.get_received_mint_impl(&txn, &recipient_id)?;
+        txn.commit()?;
+        info!(self.logger(), "Get received mint completed");
+        Ok(received_mint)
+    }
+
     /// Inspect a PSBT to return its information.
     fn inspect_psbt(&self, psbt: String) -> Result<PsbtInspection, Error> {
         info!(self.logger(), "Inspecting PSBT...");
@@ -3906,25 +4722,45 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
         Ok(inspection)
     }
 
-    /// Inspect a PSBT and an RGB fascia to verify the commitment and show information about the
-    /// RGB transfer.
-    fn inspect_rgb_transfer(
+    /// Inspect the given PSBT and the RGB fascia at the given path, saved by this wallet when it
+    /// built the operation, to verify the PSBT commits to the bundles of the fascia and show
+    /// information about the RGB transitions they carry.
+    ///
+    /// This works like [`crate::no_wallet::inspect_fascia`], which doesn't need a wallet, adding
+    /// what only the wallet knows: the PSBT inputs are checked to all be the wallet's, the
+    /// allocations the transitions spend are resolved from the wallet (an input that isn't
+    /// allocated in it, or that the bundle doesn't spend, is an error) and the outputs report
+    /// whether they are the wallet's. The assignment types of the transitions are also checked
+    /// against the schemas of their assets, which the wallet has the genesis of. As there, a
+    /// fascia file larger than `max_fascia_size` bytes is refused with [`Error::FileTooLarge`]
+    /// before being decoded, and a fascia with more than `max_bundles` bundles before inspecting
+    /// them.
+    fn inspect_fascia(
         &self,
         psbt: String,
         fascia_path: String,
-        entropy: u64,
+        entropy: Option<u64>,
+        max_fascia_size: u64,
+        max_bundles: u32,
     ) -> Result<RgbInspection, Error> {
-        info!(self.logger(), "Inspecting RGB transfer...");
+        info!(self.logger(), "Inspecting fascia...");
         let txn = self.database().begin_transaction()?;
-        let inspection = self.inspect_rgb_transfer_impl(&txn, psbt, fascia_path, entropy)?;
+        let inspection = self.inspect_fascia_impl(
+            &txn,
+            psbt,
+            fascia_path,
+            entropy,
+            max_fascia_size,
+            max_bundles,
+        )?;
         txn.commit()?;
-        info!(self.logger(), "RGB transfer inspection completed");
+        info!(self.logger(), "Fascia inspection completed");
         Ok(inspection)
     }
 }
 
 #[cfg(test)]
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 mod swap_unit_tests {
     use super::*;
 
@@ -3971,7 +4807,6 @@ mod swap_unit_tests {
             maker_rgb_recipient_id: Some("maker-rgb-recipient".to_string()),
             maker_rgb_script_pubkey_hex: Some("51".to_string()),
             maker_rgb_blinding: Some(1),
-            proxy_url: Some("rpc://127.0.0.1:3000".to_string()),
             extra_outputs: vec![],
         };
         OnchainSwapProposal {
@@ -4228,21 +5063,6 @@ mod swap_unit_tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn validates_swap_proxy_transport() {
-        assert_eq!(
-            swap_proxy_transport_endpoint("http://127.0.0.1:3000").unwrap(),
-            "rpc://127.0.0.1:3000"
-        );
-        assert_eq!(
-            swap_proxy_transport_endpoint("https://example.com/json-rpc").unwrap(),
-            "rpcs://example.com/json-rpc"
-        );
-        assert!(swap_validate_proxy_url(&Some("rpc://127.0.0.1:3000".to_string())).is_ok());
-        assert!(swap_validate_proxy_url(&None).is_err());
-        assert!(swap_validate_proxy_url(&Some("ws://127.0.0.1:3000".to_string())).is_err());
     }
 
     #[test]

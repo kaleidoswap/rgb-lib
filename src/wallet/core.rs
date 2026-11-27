@@ -10,9 +10,14 @@ pub(crate) const BDK_DB_NAME: &str = "bdk_db";
 // BDK changes that have been applied in memory but whose transaction has not committed yet
 pub(crate) const BDK_PENDING_FILE: &str = "bdk_pending.json";
 
-pub(crate) const NUM_KNOWN_SCHEMAS: usize = 4;
+pub(crate) const NUM_KNOWN_SCHEMAS: usize = 5;
 
 pub(crate) const RGB_LIB_DB_NAME: &str = "rgb_lib_db";
+
+// extension received consignment files were saved with before RGB_BIN_EXTENSION
+const LEGACY_RGB_BIN_EXTENSION: &str = "rgbc";
+// name sent consignment files were saved with before CONSIGNMENT_FILE
+const LEGACY_CONSIGNMENT_FILE: &str = "consignment_out";
 
 pub(crate) const ASSETS_DIR: &str = "assets";
 pub(crate) const MEDIA_DIR: &str = "media_files";
@@ -38,9 +43,17 @@ pub(crate) struct WalletManifest {
     pub(crate) bitcoin_network: BitcoinNetwork,
     pub(crate) database_type: DatabaseType,
     pub(crate) max_allocations_per_utxo: u32,
-    #[serde(default)]
-    pub(crate) reuse_addresses: bool,
     pub(crate) supported_schemas: Vec<AssetSchema>,
+    // defaulted, so manifests written before this setting existed keep loading (as not reckless,
+    // which is what a wallet created without the setting was)
+    #[serde(default)]
+    pub(crate) allow_reckless_schemas: bool,
+    // defaulted, so manifests written before these settings existed keep loading (as not reusing
+    // addresses, which is what a wallet created without the settings did)
+    #[serde(default)]
+    pub(crate) address_reuse_vanilla: bool,
+    #[serde(default)]
+    pub(crate) address_reuse_colored_auto: bool,
     pub(crate) account_xpub_vanilla: String,
     pub(crate) account_xpub_colored: String,
     pub(crate) vanilla_keychain: u8,
@@ -55,8 +68,10 @@ impl WalletManifest {
             bitcoin_network: wallet_data.bitcoin_network,
             database_type: wallet_data.database_type.clone(),
             max_allocations_per_utxo: wallet_data.max_allocations_per_utxo,
-            reuse_addresses: wallet_data.reuse_addresses,
             supported_schemas: wallet_data.supported_schemas.clone(),
+            allow_reckless_schemas: wallet_data.allow_reckless_schemas,
+            address_reuse_vanilla: wallet_data.address_reuse_vanilla,
+            address_reuse_colored_auto: wallet_data.address_reuse_colored_auto,
             account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
             account_xpub_colored: keys.account_xpub_colored.clone(),
             vanilla_keychain: keys.vanilla_keychain.unwrap_or(KEYCHAIN_BTC),
@@ -67,6 +82,10 @@ impl WalletManifest {
 
     fn path(wallet_dir: &Path) -> PathBuf {
         wallet_dir.join(WALLET_MANIFEST_FILE)
+    }
+
+    pub(crate) fn exists(wallet_dir: &Path) -> bool {
+        Self::path(wallet_dir).exists()
     }
 
     pub(crate) fn write(&self, wallet_dir: &Path) -> Result<(), Error> {
@@ -104,7 +123,7 @@ impl WalletManifest {
         wallet_data: &WalletData,
         keys: &SinglesigKeys,
     ) -> Result<(), Error> {
-        if !Self::path(wallet_dir).exists() {
+        if !Self::exists(wallet_dir) {
             // skip when no manifest exists (legacy directory or first creation)
             return Ok(());
         }
@@ -135,6 +154,8 @@ impl WalletManifest {
             vanilla_keychain,
             account_xpub_colored,
             account_xpub_vanilla,
+            address_reuse_vanilla,
+            address_reuse_colored_auto,
         );
         Ok(())
     }
@@ -150,8 +171,10 @@ impl WalletManifest {
                 bitcoin_network: self.bitcoin_network,
                 database_type: self.database_type,
                 max_allocations_per_utxo: self.max_allocations_per_utxo,
-                reuse_addresses: self.reuse_addresses,
                 supported_schemas: self.supported_schemas,
+                allow_reckless_schemas: self.allow_reckless_schemas,
+                address_reuse_vanilla: self.address_reuse_vanilla,
+                address_reuse_colored_auto: self.address_reuse_colored_auto,
             },
             SinglesigKeys {
                 account_xpub_vanilla: self.account_xpub_vanilla,
@@ -166,7 +189,7 @@ impl WalletManifest {
 }
 
 /// Which keychain contributes SPKs to the sync request.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncKeychain {
     /// Sync the colored keychain
@@ -179,8 +202,9 @@ pub enum SyncKeychain {
     },
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 impl SyncKeychain {
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
     fn keychain(&self) -> KeychainKind {
         match self {
             SyncKeychain::Colored => KeychainKind::External,
@@ -190,7 +214,7 @@ impl SyncKeychain {
 }
 
 /// Strategy used to build the indexer sync request.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncStrategy {
     /// BIP44 stop-gap full scan
@@ -204,7 +228,7 @@ pub enum SyncStrategy {
 }
 
 /// Options driving a single sync invocation.
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncOptions {
     /// Which keychain to sync
@@ -221,36 +245,69 @@ pub struct WalletInternals {
     pub(crate) wallet_dir: PathBuf,
     pub(crate) bdk_wallet: BdkWallet,
     pub(crate) bdk_pending: Arc<Mutex<ChangeSet>>,
-    /// Pinned derivation index per keychain for address reuse.
-    pub(crate) reuse_address_index: HashMap<KeychainKind, u32>,
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     pub(crate) online_data: Option<OnlineData>,
     #[cfg(feature = "vss")]
     pub(crate) vss_client: Option<Arc<super::vss::VssBackupClient>>,
 }
 
-pub(crate) fn setup_rgb<P: AsRef<Path>>(
-    wallet_dir: P,
+impl WalletInternals {
+    /// Borrow the bitcoind client and the BDK wallet at the same time, when the wallet is online
+    /// via a bitcoind indexer. The wallet accessor methods borrow the whole struct, so callers
+    /// needing both use this field-level split borrow instead.
+    #[cfg(feature = "bitcoind")]
+    pub(crate) fn bitcoind_and_bdk_mut(&mut self) -> Option<(&BitcoindClient, &mut BdkWallet)> {
+        match &self.online_data.as_ref().expect("wallet is online").indexer {
+            Indexer::Bitcoind(client) => Some((client, &mut self.bdk_wallet)),
+            #[cfg(any(feature = "electrum", feature = "esplora"))]
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn setup_rgb(
+    database: &RgbLibDatabase,
     supported_schemas: Vec<AssetSchema>,
     bitcoin_network: BitcoinNetwork,
+    allow_reckless_schemas: bool,
+    logger: &Logger,
 ) -> Result<(), Error> {
     if supported_schemas.is_empty() {
         return Err(Error::NoSupportedSchemas);
     }
-    if bitcoin_network == BitcoinNetwork::Mainnet && supported_schemas.contains(&AssetSchema::Ifa) {
-        return Err(Error::CannotUseIfaOnMainnet);
+    if bitcoin_network == BitcoinNetwork::Mainnet
+        && let Some(asset_schema) = supported_schemas.iter().find(|s| !s.allowed_on_mainnet())
+    {
+        if !allow_reckless_schemas {
+            return Err(Error::CannotUseSchemaOnMainnet {
+                asset_schema: *asset_schema,
+            });
+        }
+        // the caller has opted out of the mainnet schema check: leave a trace of it in the
+        // wallet log, since from here on the wallet can operate such schemas on mainnet
+        warn!(
+            logger,
+            "Reckless schemas allowed: supporting the {asset_schema} schema on mainnet"
+        );
     }
-    let mut runtime = load_rgb_runtime(wallet_dir)?;
-    let known_schemas = runtime.schemata()?;
+    let txn = database.begin_transaction()?;
+    let mut stock = RgbStock::new(&txn);
+    let known_schemas = stock.schemata()?;
     if known_schemas.len() < NUM_KNOWN_SCHEMAS {
         let known: HashSet<_> = known_schemas.iter().map(|s| s.id).collect();
         for schema in supported_schemas {
             if !known.contains(&SchemaId::from(schema)) {
-                schema.import_kit(&mut runtime)?;
+                schema.import_schema_definition(&mut stock)?;
             }
         }
     }
+    txn.commit()?;
     Ok(())
+}
+
+/// Whether the wallet directory already holds the wallet DB, i.e. the wallet already exists.
+pub(crate) fn db_exists(wallet_dir: &Path) -> bool {
+    wallet_dir.join(RGB_LIB_DB_NAME).exists()
 }
 
 pub(crate) fn setup_db<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbLibDatabase, Error> {
@@ -265,8 +322,84 @@ pub(crate) fn setup_db<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbLibDatabase, 
         .max_lifetime(Duration::from_secs(8));
     let db_cnn = block_on(Database::connect(opt));
     let connection = db_cnn?;
+    let rename_legacy_consignments = block_on(Migrator::get_pending_migrations(&connection))?
+        .iter()
+        .any(|m| m.name() == ConsignmentExtensionMigration.name());
+    if rename_legacy_consignments {
+        rename_legacy_consignment_files(wallet_dir.as_ref())?;
+    }
     block_on(Migrator::up(&connection, None))?;
     RgbLibDatabase::new_for_wallet(connection, wallet_dir.as_ref())
+}
+
+/// Give the consignment files saved before [`RGB_BIN_EXTENSION`] that extension: the issued
+/// contracts, named after their asset ID, and the sent consignments, which had none, plus the
+/// received consignments and their validated copies, which had the legacy one.
+///
+/// This runs before [`ConsignmentExtensionMigration`] is applied, which then records it as done:
+/// each rename is atomic and synced to disk before the migration is committed, so a crash in
+/// between just has the next run rename what's left.
+fn rename_legacy_consignment_files(wallet_dir: &Path) -> Result<(), Error> {
+    // skipping the leftovers of an interrupted atomic write, which have an extension
+    rename_files(&wallet_dir.join(ASSETS_DIR), |path| {
+        path.extension()
+            .is_none()
+            .then(|| path.with_extension(RGB_BIN_EXTENSION))
+    })?;
+    for transfer_dir in subdirs(&wallet_dir.join(TRANSFERS_DIR))? {
+        rename_files(&transfer_dir, |path| {
+            (path.extension() == Some(LEGACY_RGB_BIN_EXTENSION.as_ref()))
+                .then(|| path.with_extension(RGB_BIN_EXTENSION))
+        })?;
+        // the sent consignments are in a dir per asset
+        for asset_transfer_dir in subdirs(&transfer_dir)? {
+            rename_files(&asset_transfer_dir, |path| {
+                path.ends_with(LEGACY_CONSIGNMENT_FILE)
+                    .then(|| path.with_file_name(CONSIGNMENT_FILE.as_str()))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// The dirs directly inside `dir`, none if it doesn't exist.
+///
+/// Symlinks are skipped, never followed, as in a tampered-with wallet dir they could lead anywhere.
+fn subdirs(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut dirs = vec![];
+    if !dir.is_dir() {
+        return Ok(dirs);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    Ok(dirs)
+}
+
+/// Rename the regular files directly inside `dir` that `new_path` gives a new path, syncing `dir`
+/// if any is.
+fn rename_files(dir: &Path, new_path: impl Fn(&Path) -> Option<PathBuf>) -> Result<(), Error> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let mut renamed = false;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file()
+            && let Some(new_path) = new_path(&path)
+        {
+            fs::rename(&path, new_path)?;
+            renamed = true;
+        }
+    }
+    if renamed {
+        sync_dir(dir)?;
+    }
+    Ok(())
 }
 
 /// Import the BDK data of a wallet created before the changeset moved into the rgb-lib DB.
@@ -277,16 +410,20 @@ pub(crate) fn setup_db<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbLibDatabase, 
 /// handed out again. The signing and watch-only wallets had a store each, so both are imported;
 /// `last_revealed` is persisted monotonically, so the higher of the two wins regardless of order.
 ///
-/// A store that was read in full is removed once the import is durably committed, so the stale
-/// copy cannot be picked up again by an older rgb-lib. A truncated one is left in place, since the
-/// entries past the truncation were never imported. Keeping it costs nothing at load time: this
-/// runs only while the stored changeset is empty, and by the end of the first setup it no longer
-/// is (either the import filled it or the freshly created wallet wrote its descriptors) so a
-/// left-behind store is never read a second time.
+/// A store that was read in full is added to `migrated`, for the caller to remove once the import
+/// has been durably committed, so the stale copy cannot be picked up again by an older rgb-lib. A
+/// truncated one is left in place, since the entries past the truncation were never imported.
+/// Keeping it costs nothing at load time: this runs only while the stored changeset is empty, and
+/// by the end of the first setup it no longer is (either the import filled it or the freshly
+/// created wallet wrote its descriptors) so a left-behind store is never read a second time.
 ///
 /// Returns whether anything was imported.
 #[cfg(feature = "bdk_file_store_migration")]
-fn import_legacy_bdk_store(txn: &DbTxn, wallet_dir: &Path) -> Result<bool, Error> {
+fn import_legacy_bdk_store(
+    txn: &DbTxn,
+    wallet_dir: &Path,
+    migrated: &mut Vec<PathBuf>,
+) -> Result<bool, Error> {
     let mut imported = false;
     for name in [BDK_DB_NAME.to_string(), format!("{BDK_DB_NAME}_watch_only")] {
         let path = wallet_dir.join(name);
@@ -310,11 +447,9 @@ fn import_legacy_bdk_store(txn: &DbTxn, wallet_dir: &Path) -> Result<bool, Error
             txn.update_bdk_changeset(&changeset)?;
             imported = true;
         }
-        // drop the file only once its contents are durably in the DB
+        // the file is the caller's to drop, once its contents are durably in the DB
         if complete {
-            txn.on_commit(move || {
-                let _ = fs::remove_file(path);
-            });
+            migrated.push(path);
         }
     }
     Ok(imported)
@@ -322,33 +457,42 @@ fn import_legacy_bdk_store(txn: &DbTxn, wallet_dir: &Path) -> Result<bool, Error
 
 /// Without the `bdk_file_store_migration` feature there is nothing to import from.
 #[cfg(not(feature = "bdk_file_store_migration"))]
-fn import_legacy_bdk_store(_txn: &DbTxn, _wallet_dir: &Path) -> Result<bool, Error> {
+fn import_legacy_bdk_store(
+    _txn: &DbTxn,
+    _wallet_dir: &Path,
+    _migrated: &mut Vec<PathBuf>,
+) -> Result<bool, Error> {
     Ok(false)
 }
 
+/// Load (or create) the BDK wallet whose data lives in the rgb-lib DB.
+///
+/// Owns the transaction that the load needs, so that the files whose contents it takes over - a
+/// legacy file store, the crash-recovery copy of the pending changes - are deleted only once that
+/// transaction has committed. Were one deleted first, a rollback would lose the data it held.
 pub(crate) fn setup_bdk<P: AsRef<Path>>(
-    txn: &DbTxn,
+    database: &RgbLibDatabase,
     wallet_dir: P,
     desc_colored: String,
     desc_vanilla: String,
-    watch_only: bool,
     bitcoin_network: BitcoinNetwork,
 ) -> Result<BdkWallet, Error> {
+    let txn = database.begin_transaction()?;
     let chain_net: ChainNet = bitcoin_network.into();
-    let mut wallet_params = BdkWallet::load()
+    let wallet_params = BdkWallet::load()
         .descriptor(KeychainKind::External, Some(desc_colored.clone()))
         .descriptor(KeychainKind::Internal, Some(desc_vanilla.clone()))
         .use_spk_cache(false)
         .check_genesis_hash(BlockHash::from_byte_array(
             chain_net.chain_hash().to_bytes(),
         ));
-    if !watch_only {
-        wallet_params = wallet_params.extract_keys();
-    }
     let mut changeset = txn.get_bdk_changeset()?;
+    // files this transaction takes the contents of, to be dropped once it has committed
+    let mut migrated = Vec::new();
     // an empty changeset means either a brand-new wallet or one whose data still lives in the
     // legacy file store
-    let mut reload = changeset.is_empty() && import_legacy_bdk_store(txn, wallet_dir.as_ref())?;
+    let mut reload =
+        changeset.is_empty() && import_legacy_bdk_store(&txn, wallet_dir.as_ref(), &mut migrated)?;
     // a crash between the temporary write and the rename leaves the newer changeset in the .tmp
     // file, so fold both in; the pending buffer only ever grows, so applying them in this order
     // ends on the newest state
@@ -364,10 +508,7 @@ pub(crate) fn setup_bdk<P: AsRef<Path>>(
             txn.update_bdk_changeset(&pending)?;
             reload = true;
         }
-        // drop the file only once its contents are durably in the DB
-        txn.on_commit(move || {
-            let _ = fs::remove_file(pending_file);
-        });
+        migrated.push(pending_file);
     }
     if reload {
         changeset = txn.get_bdk_changeset()?;
@@ -386,6 +527,11 @@ pub(crate) fn setup_bdk<P: AsRef<Path>>(
             wallet
         }
     };
+    txn.commit()?;
+    // only now that their contents are durably in the DB
+    for path in migrated {
+        let _ = fs::remove_file(path);
+    }
     Ok(bdk_wallet)
 }
 
@@ -429,6 +575,22 @@ pub trait WalletCore {
 
     fn bdk_wallet_mut(&mut self) -> &mut BdkWallet {
         &mut self.internals_mut().bdk_wallet
+    }
+
+    /// Add the full previous transaction to each PSBT input missing it.
+    ///
+    /// BDK never sets it for taproot inputs, but its signer refuses to sign without it unless it
+    /// already knows the previous transaction, which a separate signer (e.g. for a watch-only or
+    /// multisig wallet) doesn't.
+    fn add_non_witness_utxos(&self, psbt: &mut Psbt) {
+        let tx_graph = self.bdk_wallet().tx_graph();
+        for (input, txin) in psbt.inputs.iter_mut().zip(&psbt.unsigned_tx.input) {
+            if input.non_witness_utxo.is_none()
+                && let Some(prev_tx) = tx_graph.get_tx(txin.previous_output.txid)
+            {
+                input.non_witness_utxo = Some(prev_tx.as_ref().clone());
+            }
+        }
     }
 
     /// Persist the BDK wallet's staged changes through the given rgb-lib transaction.
@@ -532,31 +694,85 @@ pub trait WalletCore {
         &self.internals().wallet_data
     }
 
+    /// Whether the wallet reuses the first address of the keychain instead of deriving a new one:
+    /// for every vanilla address (see [`WalletData::address_reuse_vanilla`]) or for the colored
+    /// outputs whose address it picks automatically (see
+    /// [`WalletData::address_reuse_colored_auto`]).
+    fn reuses_address(&self, keychain: KeychainKind) -> bool {
+        match keychain {
+            KeychainKind::Internal => self.wallet_data().address_reuse_vanilla,
+            KeychainKind::External => self.wallet_data().address_reuse_colored_auto,
+        }
+    }
+
     fn wallet_dir(&self) -> &PathBuf {
         &self.internals().wallet_dir
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     fn online_data(&self) -> &Option<OnlineData> {
         &self.internals().online_data
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     fn online_data_mut(&mut self) -> &mut Option<OnlineData> {
         &mut self.internals_mut().online_data
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     fn indexer(&self) -> &Indexer {
         &self.online_data().as_ref().unwrap().indexer
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn spv_resolver(&self) -> Option<&dyn ResolveSpvProof> {
+        #[cfg(feature = "_online")]
+        {
+            self.online_data()
+                .as_ref()
+                .map(|d| &d.resolver as &dyn ResolveSpvProof)
+        }
+        #[cfg(not(feature = "_online"))]
+        {
+            None
+        }
+    }
+
+    #[cfg(feature = "_online")]
     fn vanilla_sync_lookback(&self) -> u32 {
         self.online_data().as_ref().unwrap().vanilla_sync_lookback
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
+    fn failed_witness_receive_grace_secs(&self) -> u32 {
+        self.online_data()
+            .as_ref()
+            .unwrap()
+            .failed_witness_receive_grace_secs
+    }
+
+    #[cfg(feature = "_online")]
+    /// The configured EVM RPC URLs, keyed by chain ID
+    fn evm_rpc_urls(&self) -> &HashMap<u64, String> {
+        &self.online_data().as_ref().unwrap().evm_rpc_urls
+    }
+
+    #[cfg(feature = "_online")]
+    /// The configured EVM RPC URL for the given chain ID, if any
+    fn evm_rpc_url(&self, chain_id: u64) -> Option<&str> {
+        self.evm_rpc_urls().get(&chain_id).map(String::as_str)
+    }
+
+    #[cfg(feature = "_online")]
+    /// The configured EVM chain with the given chain ID, if any
+    fn evm_chain(&self, chain_id: u64) -> Option<&EvmChain> {
+        self.online_data()
+            .as_ref()
+            .unwrap()
+            .evm_chains
+            .get(&chain_id)
+    }
+
+    #[cfg(feature = "_online")]
     fn check_online(&self, online: Online) -> Result<(), Error> {
         if let Some(online_data) = &self.online_data() {
             if online_data.id != online.id {
@@ -570,16 +786,141 @@ pub trait WalletCore {
         Ok(())
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
-    fn fast_sync_colored_spks(&self, txn: &DbTxn) -> Result<HashSet<ScriptBuf>, Error> {
-        let mut spks: HashSet<ScriptBuf> = HashSet::new();
-        for pws in txn.iter_pending_witness_scripts()? {
-            spks.insert(ScriptBuf::from_hex(&pws.script).expect("valid script"));
+    /// Reconcile the pending witness state with the status of the witness receives it belongs to.
+    ///
+    /// A witness receive registers its script as pending witness and, once its consignment is
+    /// accepted, a TXO flagged as pending witness. Both are meant to live only while the receive is
+    /// pending, but the receive may end in ways that leave them behind (e.g. it is failed, or the
+    /// counterparty broadcasts despite a refusal), so they are checked against the receive status
+    /// on every colored sync:
+    /// - the script of a pending receive is kept and a payment to it is a pending witness UTXO
+    /// - the script of a failed receive is kept for a grace time (see
+    ///   [`OnlineOptions::failed_witness_receive_grace_secs`]), so that a payment the counterparty
+    ///   broadcasts anyway is still detected by fast sync, but as an ordinary UTXO
+    /// - any other script (failed receive past its grace time, settled receive, or unknown one, e.g.
+    ///   deleted) is dropped
+    /// - a TXO flagged as pending witness whose receive is not pending anymore gets unflagged
+    ///
+    /// The script of a receive that gets paid is instead dropped once the TXO paying it is
+    /// registered, by [`Self::update_db_colored_txos_from_bdk`].
+    ///
+    /// Returns the kept scripts, mapped to whether their receive is still pending.
+    #[cfg(feature = "_online")]
+    fn reconcile_pending_witness(
+        &self,
+        txn: &DbTxn,
+    ) -> Result<HashMap<String, WatchedWitnessScript>, Error> {
+        let pending_witness_scripts = txn.iter_pending_witness_scripts()?;
+        let pending_witness_txos = txn.iter_pending_witness_txos()?;
+        if pending_witness_scripts.is_empty() && pending_witness_txos.is_empty() {
+            return Ok(HashMap::new());
         }
-        Ok(spks)
+
+        // incoming witness receives that are pending or failed within the grace time, by script
+        // and by asset transfer: any other receive is not pending (outgoing transfers can pay one
+        // of this wallet's scripts too, when sending to oneself)
+        let now = now().unix_timestamp();
+        let failed_since = now - self.failed_witness_receive_grace_secs() as i64;
+        // a script can be paid by several transfers (reusable invoice or reused address), so it is
+        // pending if any of them is
+        let mut receives: HashMap<String, WatchedWitnessScript> = HashMap::new();
+        // the script of a reusable invoice that can still receive transfers is pending whatever
+        // the state of the transfers known so far, as a later one can pay it before its
+        // consignment has been accepted
+        for invoice in txn.iter_invoices()?.into_iter().filter(|i| i.live(now)) {
+            let Some(recipient_id) = txn
+                .get_invoice_transfers(invoice.idx)?
+                .into_iter()
+                .filter(|t| matches!(t.recipient_type, Some(RecipientTypeFull::Witness { .. })))
+                .find_map(|t| t.recipient_id)
+            else {
+                continue;
+            };
+            let Some(script) = script_buf_from_recipient_id(recipient_id)? else {
+                continue;
+            };
+            receives.insert(
+                script.to_hex_string(),
+                WatchedWitnessScript {
+                    pending: true,
+                    shared: true,
+                },
+            );
+        }
+        let mut receives_by_asset_transfer: HashMap<i32, DbBatchTransfer> = HashMap::new();
+        for (transfer, batch_transfer) in
+            txn.get_pending_or_recently_failed_incoming_transfers(failed_since)?
+        {
+            if !matches!(
+                transfer.recipient_type,
+                Some(RecipientTypeFull::Witness { .. })
+            ) {
+                continue;
+            }
+            let Some(recipient_id) = transfer.recipient_id else {
+                continue;
+            };
+            let Some(script) = script_buf_from_recipient_id(recipient_id)? else {
+                continue;
+            };
+            let entry = receives.entry(script.to_hex_string()).or_default();
+            entry.pending |= batch_transfer.status.pending();
+            entry.shared |= transfer.receive_dir.is_some();
+            receives_by_asset_transfer.insert(transfer.asset_transfer_idx, batch_transfer);
+        }
+
+        let mut kept_scripts = HashMap::new();
+        for pws in pending_witness_scripts {
+            match receives.get(&pws.script) {
+                Some(r) => {
+                    kept_scripts.insert(pws.script, *r);
+                }
+                None => {
+                    debug!(
+                        self.logger(),
+                        "Dropping stale pending witness script {}", pws.script
+                    );
+                    txn.del_pending_witness_script(pws.script)?;
+                }
+            }
+        }
+
+        let receive_colorings = txn.get_receive_colorings_by_txo_idxs(
+            pending_witness_txos.iter().map(|t| t.idx).collect(),
+        )?;
+        for txo in pending_witness_txos {
+            // the receive the TXO belongs to: via its receive coloring once the consignment has
+            // been accepted, via the script it pays otherwise (detected by a sync before that)
+            let receive_pending = match receive_colorings
+                .iter()
+                .filter(|c| c.txo_idx == txo.idx)
+                .find_map(|c| receives_by_asset_transfer.get(&c.asset_transfer_idx))
+            {
+                Some(batch_transfer) => batch_transfer.status.pending(),
+                None => self
+                    .bdk_wallet()
+                    .tx_graph()
+                    .get_txout(txo.outpoint().into())
+                    .and_then(|txout| receives.get(&txout.script_pubkey.to_hex_string()))
+                    .is_some_and(|r| r.pending),
+            };
+            if receive_pending {
+                continue;
+            }
+            debug!(
+                self.logger(),
+                "Clearing pending witness flag of TXO {}, its receive is not pending",
+                txo.outpoint()
+            );
+            let mut txo: DbTxoActMod = txo.into();
+            txo.pending_witness = ActiveValue::Set(false);
+            txn.update_txo(txo)?;
+        }
+
+        Ok(kept_scripts)
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     fn fast_sync_vanilla_spks(&self, lookback: u32) -> HashSet<ScriptBuf> {
         let spk_index = self.bdk_wallet().spk_index();
         let Some(last_revealed) = spk_index.last_revealed_index(KeychainKind::Internal) else {
@@ -596,7 +937,7 @@ pub trait WalletCore {
             .collect()
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     fn unconfirmed_colored_spks(&self) -> HashSet<ScriptBuf> {
         let spk_index = self.bdk_wallet().spk_index();
         let mut spks: HashSet<ScriptBuf> = HashSet::new();
@@ -618,7 +959,7 @@ pub trait WalletCore {
         spks
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     fn sync_bdk_and_db_txos(
         &mut self,
         txn: &DbTxn,
@@ -627,6 +968,53 @@ pub trait WalletCore {
     ) -> Result<(), Error> {
         debug!(self.logger(), "Syncing {:?}...", options);
 
+        let pending_witness_scripts = match options.keychain {
+            SyncKeychain::Colored => self.reconcile_pending_witness(txn)?,
+            SyncKeychain::Vanilla { .. } => HashMap::new(),
+        };
+
+        #[cfg(feature = "bitcoind")]
+        if let Some((client, bdk_wallet)) = self.internals_mut().bitcoind_and_bdk_mut() {
+            // a node has no address index, so there is no per-SPK request to make: whatever the
+            // strategy, the wallet is brought up to date by applying every block since its last
+            // checkpoint (the first sync scans the whole chain) plus the mempool
+            client.sync_bdk_wallet(bdk_wallet)?;
+            return self.finish_sync(txn, options, include_spent, &pending_witness_scripts);
+        }
+
+        #[cfg(not(any(feature = "electrum", feature = "esplora")))]
+        unreachable!("without electrum/esplora the indexer can only be bitcoind");
+
+        #[cfg(any(feature = "electrum", feature = "esplora"))]
+        {
+            self.sync_bdk_via_requests(options, &pending_witness_scripts)?;
+            self.finish_sync(txn, options, include_spent, &pending_witness_scripts)
+        }
+    }
+
+    /// DB-side bookkeeping shared by both sync paths, run after the BDK wallet has been synced.
+    #[cfg(feature = "_online")]
+    fn finish_sync(
+        &mut self,
+        txn: &DbTxn,
+        options: SyncOptions,
+        include_spent: bool,
+        pending_witness_scripts: &HashMap<String, WatchedWitnessScript>,
+    ) -> Result<(), Error> {
+        if matches!(options.keychain, SyncKeychain::Colored) {
+            self.update_db_colored_txos_from_bdk(txn, include_spent, pending_witness_scripts)?;
+        }
+        debug!(self.logger(), "Synced");
+        Ok(())
+    }
+
+    /// Sync the BDK wallet via SPK-based requests to an electrum/esplora indexer.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn sync_bdk_via_requests(
+        &mut self,
+        options: SyncOptions,
+        pending_witness_scripts: &HashMap<String, WatchedWitnessScript>,
+    ) -> Result<(), Error> {
         let kc = options.keychain.keychain();
         let latest_checkpoint = self.bdk_wallet().latest_checkpoint();
         let update: Update = match options.strategy {
@@ -654,7 +1042,11 @@ pub trait WalletCore {
                 let mut spks: HashSet<ScriptBuf> = HashSet::new();
                 match options.keychain {
                     SyncKeychain::Colored => {
-                        spks.extend(self.fast_sync_colored_spks(txn)?);
+                        spks.extend(
+                            pending_witness_scripts
+                                .keys()
+                                .map(|s| ScriptBuf::from_hex(s).expect("valid script")),
+                        );
                         spks.extend(self.unconfirmed_colored_spks());
                     }
                     SyncKeychain::Vanilla { lookback } => {
@@ -672,12 +1064,6 @@ pub trait WalletCore {
             .map_err(|e| Error::FailedBdkSync {
                 details: e.to_string(),
             })?;
-
-        if matches!(options.keychain, SyncKeychain::Colored) {
-            self.update_db_colored_txos_from_bdk(txn, include_spent)?;
-        }
-
-        debug!(self.logger(), "Synced");
         Ok(())
     }
 
@@ -695,7 +1081,7 @@ pub trait WalletCore {
     /// visible so it can refuse to come online in the cross-device-wallet case
     /// (where healing would silently lose RGB allocations). The reconcile runs only
     /// on the user-facing `Wallet::sync` path, after the wallet is already online.
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     fn reconcile_orphaned_colored_txos(&self, txn: &DbTxn) -> Result<(), Error> {
         let bdk_unspent_outpoints: HashSet<String> = self
             .bdk_wallet()
@@ -719,24 +1105,42 @@ pub trait WalletCore {
         Ok(())
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    /// Register in the DB the colored TXOs known to BDK but not to the DB yet.
+    ///
+    /// `pending_witness_scripts` are the pending witness scripts returned by
+    /// [`Self::reconcile_pending_witness`]: a TXO paying one of them is flagged as pending witness
+    /// only if its receive is still pending, and the script is dropped as it has been paid, unless
+    /// it can be paid by more than one transfer (reusable invoice or reused address), in which
+    /// case every new TXO paying it is flagged. The outputs the wallet created for itself, which
+    /// it registered before broadcasting them, are neither flagged nor taken as paying the script,
+    /// as they can be on an address that also receives transfers (see
+    /// [`WalletData::address_reuse_colored_auto`]).
+    #[cfg(feature = "_online")]
     fn update_db_colored_txos_from_bdk(
         &mut self,
         txn: &DbTxn,
         include_spent: bool,
+        pending_witness_scripts: &HashMap<String, WatchedWitnessScript>,
     ) -> Result<(), Error> {
         let db_txos = txn.iter_txos()?;
 
         let db_outpoints: HashSet<String> = db_txos
-            .into_iter()
+            .iter()
             .filter(|t| t.exists && (include_spent || !t.spent))
             .map(|u| u.outpoint().to_string())
             .collect();
-
-        let pending_witness_scripts: Vec<String> = txn
-            .iter_pending_witness_scripts()?
+        // registered before being broadcast, not as the payment of a witness receive (which gets
+        // a receive coloring when its consignment is accepted, kept if the receive then fails)
+        let unbroadcast_txos: Vec<&DbTxo> = db_txos.iter().filter(|t| !t.exists).collect();
+        let received_txo_idxs: HashSet<i32> = txn
+            .get_receive_colorings_by_txo_idxs(unbroadcast_txos.iter().map(|t| t.idx).collect())?
             .into_iter()
-            .map(|s| s.script)
+            .map(|c| c.txo_idx)
+            .collect();
+        let own_outpoints: HashSet<String> = unbroadcast_txos
+            .into_iter()
+            .filter(|t| !received_txo_idxs.contains(&t.idx))
+            .map(|u| u.outpoint().to_string())
             .collect();
 
         let iter: Box<dyn Iterator<Item = LocalOutput>> = if include_spent {
@@ -750,15 +1154,15 @@ pub trait WalletCore {
             .filter(|u| !db_outpoints.contains(&u.outpoint.to_string()))
         {
             let mut new_db_utxo: DbTxoActMod = new_utxo.clone().into();
-            if !pending_witness_scripts.is_empty() {
-                let pending_witness_script = new_utxo.txout.script_pubkey.to_hex_string();
-                if pending_witness_scripts.contains(&pending_witness_script) {
-                    new_db_utxo.pending_witness = ActiveValue::Set(true);
-                    let in_flight =
-                        txn.count_in_flight_witness_transfers_for_script(&pending_witness_script)?;
-                    if in_flight <= 1 {
-                        txn.del_pending_witness_script(pending_witness_script)?;
-                    }
+            let script = new_utxo.txout.script_pubkey.to_hex_string();
+            if own_outpoints.contains(&new_utxo.outpoint.to_string()) {
+                txn.set_txo(new_db_utxo)?;
+                continue;
+            }
+            if let Some(pws) = pending_witness_scripts.get(&script) {
+                new_db_utxo.pending_witness = ActiveValue::Set(pws.pending);
+                if !pws.shared {
+                    txn.del_pending_witness_script(script)?;
                 }
             }
             txn.set_txo(new_db_utxo.clone())?;
@@ -767,7 +1171,7 @@ pub trait WalletCore {
         Ok(())
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(feature = "_online")]
     fn sync_wallet(
         &mut self,
         txn: &DbTxn,

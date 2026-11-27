@@ -292,12 +292,13 @@ struct LockedHtlc {
     recipient_id: String,
     outpoint: BtcOutPoint,
     txout: BtcTxOut,
+    consignment: String,
 }
 
 /// Lock `LOCK_AMOUNT` of a freshly issued NIA in the HTLC through the regular send path: the HTLC
-/// is a witness recipient (`recipient_id_from_script_buf` + `WitnessData`) and the send is a
-/// donation, so it is broadcast without waiting for an ACK and the consignment is on the proxy
-/// under the HTLC recipient ID.
+/// is an out-of-band witness recipient (`recipient_id_from_script_buf` + `WitnessData`) and the
+/// send is a donation, so it is broadcast without waiting for an ACK; the consignment is handed
+/// over out-of-band (base64).
 fn lock_in_htlc(sender: &mut SinglesigParty, timeout_height: Option<u32>) -> LockedHtlc {
     let asset = sender.issue_asset_nia(Some(&[AMOUNT]));
     let htlc =
@@ -313,7 +314,10 @@ fn lock_in_htlc(sender: &mut SinglesigParty, timeout_height: Option<u32>) -> Loc
                 blinding: Some(LOCK_BLINDING),
             }),
             assignment: Assignment::Fungible(LOCK_AMOUNT),
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            transport_endpoints: vec![],
+            public_key: None,
+            expiration_timestamp: None,
+            encryption: Encryption::Optional,
         }],
     )]);
     let online = sender.party_online();
@@ -327,10 +331,11 @@ fn lock_in_htlc(sender: &mut SinglesigParty, timeout_height: Option<u32>) -> Loc
             MIN_CONFIRMATIONS,
             default_send_expiration(),
             None,
+            None,
         )
         .unwrap()
         .txid;
-    mine_tx(false, &lock_txid);
+    mine_tx(&lock_txid);
 
     let lock_tx = sender
         .wallet
@@ -349,6 +354,10 @@ fn lock_in_htlc(sender: &mut SinglesigParty, timeout_height: Option<u32>) -> Loc
         txid: bitcoin::Txid::from_str(&lock_txid).unwrap(),
         vout,
     };
+    let consignment_path = sender
+        .wallet
+        .get_send_consignment_path(&asset.asset_id, &lock_txid);
+    let consignment = general_purpose::STANDARD.encode(std::fs::read(consignment_path).unwrap());
     LockedHtlc {
         htlc,
         contract_id: ContractId::from_str(&asset.asset_id).unwrap(),
@@ -359,20 +368,22 @@ fn lock_in_htlc(sender: &mut SinglesigParty, timeout_height: Option<u32>) -> Loc
             value: BtcAmount::from_sat(HTLC_SAT),
             script_pubkey: htlc_spk,
         },
+        consignment,
     }
 }
 
-/// Import the lock into a wallet that did not create it, pinning the proxy consignment to the HTLC
-/// output.
+/// Import the lock into a wallet that did not create it, pinning the out-of-band consignment to
+/// the HTLC output.
 fn accept_htlc_lock(party: &mut SinglesigParty, locked: &LockedHtlc) {
     let online = party.party_online();
     let (consignment, assignments) = party
         .wallet
-        .fetch_and_accept_transfer_by_recipient_id(
+        .accept_htlc_consignment(
             online,
+            locked.consignment.clone(),
+            locked.outpoint.txid.to_string(),
+            locked.outpoint.vout,
             locked.recipient_id.clone(),
-            locked.recipient_id.clone(),
-            &PROXY_ENDPOINT,
             LOCK_BLINDING,
             MIN_CONFIRMATIONS,
             expected_nia(&locked.asset_id, LOCK_AMOUNT),
@@ -426,6 +437,7 @@ fn build_htlc_spend(
         builder.nlocktime(BtcLockTime::from_height(locked.htlc.timeout_height).unwrap());
     }
     let mut psbt = builder.finish().unwrap();
+    party.wallet.add_non_witness_utxos(&mut psbt);
     if colored {
         insert_op_return_first(&mut psbt);
     }
@@ -456,7 +468,15 @@ fn sign_htlc_spend(
         .sign(&psbt.unsigned_tx, &psbt_prevouts(&psbt), path);
     psbt.inputs[htlc_index].final_script_witness = Some(witness.clone());
 
-    let signed = party.wallet.sign_psbt(psbt.to_string(), None).unwrap();
+    // the lock TX is not in this wallet's graph: trust the witness UTXO of the inputs (BDK 3.2)
+    let sign_options = bdk_wallet::SignOptions {
+        trust_witness_utxo: true,
+        ..Default::default()
+    };
+    let signed = party
+        .wallet
+        .sign_psbt(psbt.to_string(), Some(sign_options))
+        .unwrap();
     let finalized = party.wallet.finalize_psbt(signed, None).unwrap();
     let finalized = Psbt::from_str(&finalized).unwrap();
     assert_eq!(
@@ -476,21 +496,19 @@ fn sign_htlc_spend(
 struct PreparedSpend {
     psbt: Psbt,
     operation_id: String,
-    operation_dir: String,
     allocations: Vec<PsbtOpAllocation>,
     dest_vout: u32,
     receive_data: ReceiveData,
-    proxy_recipient_id: String,
 }
 
-/// Color an HTLC spend to a fresh `witness_receive` output of `party`.
+/// Color an HTLC spend to a fresh out-of-band `witness_receive` output of `party`.
 fn prepare_htlc_spend(
     party: &mut SinglesigParty,
     locked: &LockedHtlc,
     path: HtlcPath,
     blinding: u64,
 ) -> PreparedSpend {
-    let receive_data = party.witness_receive();
+    let receive_data = party.witness_receive_out_of_band();
     prepare_htlc_spend_to(party, locked, path, blinding, receive_data).unwrap()
 }
 
@@ -501,10 +519,6 @@ fn prepare_htlc_spend_to(
     blinding: u64,
     receive_data: ReceiveData,
 ) -> Result<PreparedSpend, Error> {
-    let proxy_recipient_id = Invoice::new(receive_data.invoice.clone())
-        .unwrap()
-        .invoice_data()
-        .recipient_id;
     let dest_script = script_buf_from_recipient_id(receive_data.recipient_id.clone())
         .unwrap()
         .expect("witness_receive yields a script");
@@ -512,7 +526,6 @@ fn prepare_htlc_spend_to(
     let dest_vout = dest_vout(&psbt, &dest_script);
     let PsbtOpPrepareResult {
         operation_id,
-        operation_dir,
         allocations,
         ..
     } = party.wallet.psbt_op_prepare(
@@ -529,11 +542,9 @@ fn prepare_htlc_spend_to(
     Ok(PreparedSpend {
         psbt,
         operation_id,
-        operation_dir,
         allocations,
         dest_vout,
         receive_data,
-        proxy_recipient_id,
     })
 }
 
@@ -558,23 +569,16 @@ fn broadcast_and_settle(
             .unwrap(),
         PsbtOperationStatus::Applied
     );
-    mine_tx(false, &txid);
+    mine_tx(&txid);
 
-    let consignment_path = crate::wallet::rust_only::psbt_op_consignment_path(
-        &party.wallet.get_wallet_dir().join(&prepared.operation_dir),
-        &locked.asset_id,
-    );
     party
         .wallet
-        .post_consignment_to_proxy(
-            &get_proxy_client(None),
-            prepared.proxy_recipient_id.clone(),
-            consignment_path,
-            txid,
-            Some(prepared.dest_vout),
+        .psbt_op_provide_receive_consignment(
+            party.party_online(),
+            &prepared.operation_id,
+            &locked.asset_id,
         )
         .unwrap();
-    party.wait_for_refresh_raw(None, Some(&[prepared.receive_data.batch_transfer_idx]));
     mine(false);
     party.wait_for_refresh(None);
 
@@ -601,12 +605,15 @@ fn send_onward(party: &mut SinglesigParty, asset_id: &str, amount: u64) {
             recipient_id: receive_data.recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let txid = party.send(recipient_map, FEE_RATE, None).txid;
     rcv_party.wait_for_refresh(None);
     party.wait_for_refresh(Some(asset_id));
-    mine_tx(false, &txid);
+    mine_tx(&txid);
     rcv_party.wait_for_refresh(None);
     party.wait_for_refresh(Some(asset_id));
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
@@ -736,7 +743,7 @@ fn claim_prepared_then_aborted_then_claimed() {
     let locked = lock_in_htlc(&mut sender, None);
     accept_htlc_lock(&mut claimer, &locked);
 
-    let receive_data = claimer.witness_receive();
+    let receive_data = claimer.witness_receive_out_of_band();
     let balance_before = claimer.get_asset_balance(&locked.asset_id);
     let txos_before = claimer.db_txos().len();
     let colorings_before = claimer.db_colorings();
@@ -787,7 +794,7 @@ fn claim_prepared_then_aborted_then_claimed() {
         "abort must not leave claim outputs as wallet TXOs"
     );
     let aborted_receive = claimer
-        .list_transfers_filtered(AssetFilter::AnyOrNone, None)
+        .list_transfers_filtered(AssetFilter::AnyOrNone, TransferScope::All)
         .into_iter()
         .find(|t| t.recipient_id.as_deref() == Some(aborted.receive_data.recipient_id.as_str()))
         .unwrap();
@@ -833,7 +840,7 @@ fn uncolored_htlc_spend_burns_asset() {
     let tx = sign_htlc_spend(&claimer, &locked, &psbt, HtlcPath::Claim);
     let burn_txid = tx.compute_txid();
     claimer.wallet.broadcast_tx(tx.clone()).unwrap();
-    mine_tx(false, &burn_txid.to_string());
+    mine_tx(&burn_txid.to_string());
 
     let burn_outpoints: Vec<Outpoint> = (0..tx.output.len() as u32)
         .map(|vout| {
@@ -858,7 +865,7 @@ fn uncolored_htlc_spend_burns_asset() {
     assert_eq!(claimer.get_asset_balance(&locked.asset_id).settled, 0);
 
     // a colored claim of the stale allocation, if it can be prepared at all, can never be mined
-    let receive_data = claimer.witness_receive();
+    let receive_data = claimer.witness_receive_out_of_band();
     if let Ok(prepared) =
         prepare_htlc_spend_to(&mut claimer, &locked, HtlcPath::Claim, 893, receive_data)
     {
@@ -1052,13 +1059,18 @@ fn swap_tree_witnesses_verify() {
     }
 }
 
-/// Import the lock with the wallet-free fetch and the pinned accept, then save the asset.
-fn accept_htlc_lock_pinned(party: &mut SinglesigParty, locked: &LockedHtlc) -> AcceptedTransfer {
-    let fetched = crate::wallet::rust_only::fetch_consignment_by_recipient_id_unchecked(
-        locked.recipient_id.clone(),
-        &PROXY_ENDPOINT,
+fn received_lock(locked: &LockedHtlc) -> ReceivedConsignment {
+    ReceivedConsignment::from_base64(
+        &locked.consignment,
+        locked.outpoint.txid.to_string(),
+        locked.outpoint.vout,
     )
-    .unwrap();
+    .unwrap()
+}
+
+/// Import the lock with the out-of-band consignment and the pinned accept, then save the asset.
+fn accept_htlc_lock_pinned(party: &mut SinglesigParty, locked: &LockedHtlc) -> AcceptedTransfer {
+    let fetched = received_lock(locked);
     let online = party.party_online();
     let accepted = party
         .wallet
@@ -1092,19 +1104,16 @@ fn pinned_accept_then_claim_settles_through_the_operation() {
     let mut claimer = funded_party_with_fee_utxos();
     let locked = lock_in_htlc(&mut sender, None);
 
-    // nothing posted under an unknown key
-    let missing = crate::wallet::rust_only::fetch_consignment_by_recipient_id_unchecked(
-        claimer.witness_receive().recipient_id,
-        &PROXY_ENDPOINT,
+    // not a consignment
+    let invalid = ReceivedConsignment::from_base64(
+        "not base64",
+        locked.outpoint.txid.to_string(),
+        locked.outpoint.vout,
     );
-    assert_matches!(missing, Err(Error::NoConsignment));
+    assert_matches!(invalid, Err(Error::InvalidConsignment));
 
     // the consignment is pinned to the HTLC output, not to another script
-    let fetched = crate::wallet::rust_only::fetch_consignment_by_recipient_id_unchecked(
-        locked.recipient_id.clone(),
-        &PROXY_ENDPOINT,
-    )
-    .unwrap();
+    let fetched = received_lock(&locked);
     let online = claimer.party_online();
     let other = claimer.witness_receive().recipient_id;
     let result = claimer.wallet.accept_transfer_pinned(
@@ -1131,11 +1140,15 @@ fn pinned_accept_then_claim_settles_through_the_operation() {
     let receive_data = claimer
         .wallet
         .witness_receive(
+            Some(claimer.online),
             None,
             Assignment::Any,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
+            None,
+            None,
         )
         .unwrap();
     let prepared =
@@ -1166,7 +1179,7 @@ fn pinned_accept_then_claim_settles_through_the_operation() {
         .wallet
         .psbt_op_apply(online, &prepared.operation_id)
         .unwrap();
-    mine_tx(false, &txid);
+    mine_tx(&txid);
 
     // a contract the operation doesn't move
     let other_asset = claimer.issue_asset_nia(Some(&[AMOUNT]));
@@ -1295,7 +1308,7 @@ mod sdk_golden_vectors {
     use secp256k1_musig::{PublicKey as MusigPublicKey, musig::KeyAggCache};
 
     use super::*;
-    use crate::utils::{
+    use crate::no_wallet::{
         BitcoinNetwork, recipient_id_from_script_buf, script_buf_from_recipient_id,
     };
 
@@ -1406,7 +1419,7 @@ mod sdk_golden_vectors {
     fn musig_agg(keys: [&BtcPublicKey; 2]) -> XOnlyPublicKey {
         let keys = keys.map(|k| MusigPublicKey::from_slice(&k.to_bytes()).unwrap());
         let agg = KeyAggCache::new(&[&keys[0], &keys[1]]).agg_pk();
-        XOnlyPublicKey::from_slice(&agg.serialize()).unwrap()
+        XOnlyPublicKey::from_slice(&agg.to_byte_array()).unwrap()
     }
 
     /// Boltz key order: the swap provider's key first. That is the claim key in a submarine swap

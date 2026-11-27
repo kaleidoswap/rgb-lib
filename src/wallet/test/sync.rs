@@ -105,14 +105,14 @@ fn sync_marks_orphan_txo_spent() {
     );
 }
 
-/// `pending_witness` rows must be skipped by the reconcile pass: they correspond
-/// to incoming witness invoices waiting for the sender's tx to land. BDK does
-/// not yet hold them as unspent (the tx isn't on-chain yet from the receiver's
-/// perspective), and marking them spent would corrupt the receive flow.
+/// A `pending_witness` row whose receive is no longer pending (here: none at
+/// all) loses the flag in the pending witness reconcile, after which the orphan
+/// reconcile marks it spent, as BDK doesn't hold it. Rows of pending receives
+/// keep the flag and are skipped (covered by the witness receive tests).
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn sync_skips_pending_witness_txos() {
+fn sync_clears_orphan_pending_witness_txos() {
     initialize();
 
     let mut wallet = get_test_wallet(false, None);
@@ -152,12 +152,12 @@ fn sync_skips_pending_witness_txos() {
         .expect("pending row");
     txn.commit().unwrap();
     assert!(
-        !after.spent,
-        "pending_witness rows must not be marked spent by the reconcile pass"
+        !after.pending_witness,
+        "the flag of a pending witness row without a pending receive must be cleared"
     );
     assert!(
-        after.pending_witness,
-        "pending_witness flag should be preserved"
+        after.spent,
+        "an orphan row BDK doesn't hold must be marked spent"
     );
 }
 
@@ -241,6 +241,9 @@ fn sync_reconciles_after_simulated_snapshot_restore() {
             recipient_id: receive_data.recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     party.send(recipient_map, FEE_RATE, None);

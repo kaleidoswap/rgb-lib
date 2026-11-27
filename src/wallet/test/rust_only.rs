@@ -77,7 +77,10 @@ fn success() {
             .iter()
             .any(|o| o.script_pubkey.is_op_return())
     );
-    assert!(!psbt.proprietary.is_empty());
+    // the RGB data are removed once committed
+    assert!(psbt.proprietary.is_empty());
+    assert!(psbt.inputs.iter().all(|i| i.proprietary.is_empty()));
+    assert!(psbt.outputs.iter().all(|o| o.proprietary.is_empty()));
     let vout = vout + 1;
 
     // check fascia
@@ -94,8 +97,7 @@ fn success() {
     let fungible = fungible.as_fungible();
     assert_eq!(fungible.len(), 1);
     let fungible = fungible.first().unwrap();
-    let seal = fungible.revealed_seal().unwrap();
-    let state = fungible.as_revealed_state();
+    let (seal, state) = fungible.as_revealed().unwrap();
     assert_eq!(seal.txid, TxPtr::WitnessTx);
     assert_eq!(seal.vout.into_u32(), vout);
     assert_eq!(seal.blinding, blinding);
@@ -124,7 +126,7 @@ fn success() {
     // save consignment to file
     let txid = psbt_copy.unsigned_tx.compute_txid().to_string();
     let transfers_dir = party_send.wallet.get_transfers_dir().join(&txid);
-    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE);
+    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE.as_str());
     std::fs::create_dir_all(&transfers_dir).unwrap();
     assert_eq!(transfers.len(), 1);
     transfers
@@ -133,8 +135,28 @@ fn success() {
         .save_file(&consignment_path)
         .unwrap();
 
+    // the invoice must be reserved on the proxy before a consignment can be posted
+    let recipient_pk = hex::encode(gen_ed25519().verifying_key().to_bytes());
+    let proxy_client = get_proxy_client(Some(PROXY_URL));
+    proxy_client
+        .prepare_invoice(
+            &invoice_id(&txid, &recipient_pk),
+            &(now().unix_timestamp() + 3600).to_string(),
+            &recipient_pk,
+            1,
+            None,
+        )
+        .unwrap();
+    post_test_consignment(
+        &proxy_client,
+        &txid,
+        &recipient_pk,
+        &consignment_path,
+        FAKE_HASH,
+    );
+
     // accept transfer
-    recv_party
+    let (consignment, assignments, _) = recv_party
         .wallet
         .accept_transfer_consignment(
             recv_party.online,
@@ -144,6 +166,8 @@ fn success() {
             blinding,
         )
         .unwrap();
+    assert_eq!(consignment.contract_id().to_string(), asset.asset_id);
+    assert_eq!(assignments, vec![Assignment::Fungible(AMOUNT)]);
 
     // consume fascia
     party_send.wallet.consume_fascia(fascia, None).unwrap();
@@ -370,7 +394,10 @@ fn color_psbt_uda() {
             .iter()
             .any(|o| o.script_pubkey.is_op_return())
     );
-    assert!(!psbt.proprietary.is_empty());
+    // the RGB data are removed once committed
+    assert!(psbt.proprietary.is_empty());
+    assert!(psbt.inputs.iter().all(|i| i.proprietary.is_empty()));
+    assert!(psbt.outputs.iter().all(|o| o.proprietary.is_empty()));
     assert!(
         psbt.unsigned_tx
             .output
@@ -589,52 +616,6 @@ fn color_psbt_overflow_fail() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn check_indexer_url_electrum_success() {
-    initialize();
-
-    let result = check_indexer_url(ELECTRUM_URL, BitcoinNetwork::Regtest);
-    assert_matches!(result, Ok(IndexerProtocol::Electrum));
-
-    let result = check_indexer_url(ELECTRUM_2_URL, BitcoinNetwork::Regtest);
-    assert_matches!(result, Ok(IndexerProtocol::Electrum));
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn check_indexer_url_electrum_fail() {
-    initialize();
-
-    let result = check_indexer_url(ELECTRUM_BLOCKSTREAM_URL, BitcoinNetwork::Regtest);
-    let verbose_unsupported =
-        "verbose transactions are unsupported by the provided electrum service";
-    assert_matches!(result, Err(Error::InvalidIndexer { details: m }) if m.contains(verbose_unsupported));
-}
-
-#[cfg(feature = "esplora")]
-#[test]
-#[parallel]
-fn check_indexer_url_esplora_success() {
-    initialize();
-
-    let result = check_indexer_url(ESPLORA_URL, BitcoinNetwork::Regtest);
-    assert_matches!(result, Ok(IndexerProtocol::Esplora));
-}
-
-#[cfg(feature = "esplora")]
-#[test]
-#[parallel]
-fn check_indexer_url_esplora_fail() {
-    initialize();
-
-    let result = check_indexer_url(PROXY_URL, BitcoinNetwork::Regtest);
-    let invalid_indexer = s!("not a valid electrum nor esplora server");
-    assert_matches!(result, Err(Error::InvalidIndexer { details: m }) if m == invalid_indexer);
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
 fn check_proxy_url_success() {
     initialize();
 
@@ -677,7 +658,10 @@ fn accept_transfer_consignment_fail() {
     let mut party = get_empty_party!();
 
     // invalid txid
-    let consignment_path = party.wallet.get_transfers_dir().join(CONSIGNMENT_FILE);
+    let consignment_path = party
+        .wallet
+        .get_transfers_dir()
+        .join(CONSIGNMENT_FILE.as_str());
     let result = party.wallet.accept_transfer_consignment(
         party.online,
         consignment_path,
@@ -696,6 +680,130 @@ fn accept_transfer_consignment_fail() {
         0,
     );
     assert_matches!(result, Err(Error::InvalidFilePath { file_path: m }) if m == "invalidConsignmentPath");
+}
+
+/// Send the whole `amount` of the asset with ID `asset_id` held by `party_send` (on its only UTXO)
+/// to an output of `recv_party`, paid with `color_psbt_and_consume` at a seal with the given
+/// `blinding`. Returns the path of the saved consignment, the TXID and the vout of the colored TX
+/// paying `recv_party`, as `accept_transfer_consignment` takes them.
+#[cfg(feature = "electrum")]
+fn color_psbt_and_save_consignment(
+    party_send: &mut SinglesigParty,
+    recv_party: &mut SinglesigParty,
+    asset_id: &str,
+    amount: u64,
+    blinding: u64,
+) -> (PathBuf, String, u32) {
+    let amt_sat = 500;
+    let address = BdkAddress::from_str(&recv_party.get_address()).unwrap();
+    let mut tx_builder = party_send.wallet.bdk_wallet_mut().build_tx();
+    tx_builder
+        .add_recipient(
+            address.assume_checked().script_pubkey(),
+            BdkAmount::from_sat(amt_sat),
+        )
+        .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
+    let mut psbt = tx_builder.finish().unwrap();
+    let vout = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .position(|o| o.value.to_sat() == amt_sat)
+        .unwrap() as u32;
+    let coloring_info = ColoringInfo {
+        asset_info_map: HashMap::from([(
+            ContractId::from_str(asset_id).unwrap(),
+            AssetColoringInfo {
+                output_map: HashMap::from([(vout, amount)]),
+                static_blinding: Some(blinding),
+            },
+        )]),
+        static_blinding: Some(blinding),
+        nonce: None,
+    };
+    let transfers = party_send
+        .wallet
+        .color_psbt_and_consume(&mut psbt, coloring_info)
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    // the OP_RETURN commitment is added as the first output
+    let vout = vout + 1;
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+    let transfers_dir = party_send.wallet.get_transfers_dir().join(&txid);
+    std::fs::create_dir_all(&transfers_dir).unwrap();
+    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE.as_str());
+    transfers[0].save_file(&consignment_path).unwrap();
+    (consignment_path, txid, vout)
+}
+
+/// Accepting a transfer consignment checks the assignments it receives against the reject list of
+/// the asset, as a refresh does: an allowed assignment shields its history, even when the inputs
+/// of the operation paying it are rejected (which the standalone validation refuses, see
+/// `validate_consignment::reject_list`).
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn accept_transfer_consignment_reject_list() {
+    initialize();
+
+    let blinding = 777;
+    let list_name = "accept_transfer_consignment.list";
+    write_opouts_to_reject_list(list_name, &[]);
+
+    // wallets
+    let mut party_send = get_funded_noutxo_party!();
+    let mut recv_party = get_empty_party!();
+
+    // a single UTXO, holding the issued asset (with no inflation right)
+    party_send.create_utxos(false, Some(1), None, FEE_RATE, None);
+    party_send.send_btc(&recv_party.get_address(), 99_998_200);
+    let asset = party_send.issue_asset_ifa(
+        Some(&[AMOUNT]),
+        Some(&[]),
+        Some(format!("http://localhost:8140/lists/{list_name}")),
+    );
+
+    let (consignment_path, txid, vout) = color_psbt_and_save_consignment(
+        &mut party_send,
+        &mut recv_party,
+        &asset.asset_id,
+        AMOUNT,
+        blinding,
+    );
+    let consignment = RgbTransfer::load_file(&consignment_path).unwrap();
+    let transfer = consignment
+        .bundles
+        .iter()
+        .flat_map(|wb| wb.bundle.known_transitions.iter())
+        .next()
+        .unwrap();
+    let issuance = transfer.transition.inputs().into_iter().next().unwrap();
+    let received = Opout::new(transfer.opid, OS_ASSET, 0);
+
+    let mut accept = || {
+        recv_party.wallet.accept_transfer_consignment(
+            recv_party.online,
+            consignment_path.clone(),
+            txid.clone(),
+            vout,
+            blinding,
+        )
+    };
+
+    // the received assignment rejected
+    write_opouts_to_reject_list(list_name, &[received.to_string()]);
+    let result = accept();
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![received.to_string()]);
+
+    // a rejected ancestor taints the received assignment
+    write_opouts_to_reject_list(list_name, &[issuance.to_string()]);
+    let result = accept();
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![received.to_string()]);
+
+    // an allowed received assignment shields its rejected ancestor
+    write_opouts_to_reject_list(list_name, &[issuance.to_string(), format!("!{received}")]);
+    let (_, assignments, _) = accept().unwrap();
+    assert_eq!(assignments, vec![Assignment::Fungible(AMOUNT)]);
 }
 
 #[cfg(feature = "electrum")]
@@ -796,6 +904,9 @@ fn save_new_asset_fail() {
         vec![Recipient {
             assignment: Assignment::Fungible(10),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -847,6 +958,9 @@ fn send_end_db_update_only_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(10),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -860,6 +974,7 @@ fn send_end_db_update_only_success() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             false,
             None,
         )
@@ -869,7 +984,7 @@ fn send_end_db_update_only_success() {
 
     let result = party
         .wallet
-        .send_end_db_update_only(party.online, signed_psbt)
+        .send_end_db_update_only(party.online, signed_psbt.clone())
         .unwrap();
 
     assert!(!result.txid.is_empty());
@@ -879,6 +994,63 @@ fn send_end_db_update_only_success() {
         party
             .check_test_transfer_status_sender(&result.txid, TransferStatus::WaitingConfirmations,)
     );
+
+    // a donation that has already been ended cannot be ended again
+    let result_again = party
+        .wallet
+        .send_end_db_update_only(party.online, signed_psbt);
+    assert_matches!(result_again, Err(Error::CannotEndTransfer { txid }) if txid == result.txid);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn send_end_db_update_only_wrong_operation() {
+    initialize();
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    // a non-donation send
+    let asset = party.issue_asset_ifa(None, None, None);
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(10),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let begin = party.send_begin_result(&recipient_map).unwrap();
+    let signed_psbt = party.wallet.sign_psbt(begin.psbt, None).unwrap();
+    let txid = Psbt::from_str(&signed_psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    let result = party
+        .wallet
+        .send_end_db_update_only(party.online, signed_psbt);
+    assert_matches!(result, Err(Error::WrongOperation { txid: t }) if t == txid);
+
+    // another operation
+    let asset = party.issue_asset_ifa(None, None, None);
+    let unsigned_psbt = party.burn_begin(&asset.asset_id, 1, None);
+    let signed_psbt = party.wallet.sign_psbt(unsigned_psbt, None).unwrap();
+    let txid = Psbt::from_str(&signed_psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    let result = party
+        .wallet
+        .send_end_db_update_only(party.online, signed_psbt);
+    assert_matches!(result, Err(Error::WrongOperation { txid: t }) if t == txid);
 }
 
 #[cfg(feature = "electrum")]
@@ -898,6 +1070,9 @@ fn send_end_db_update_only_unknown_transfer() {
         vec![Recipient {
             assignment: Assignment::Fungible(amount),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -947,6 +1122,9 @@ fn create_consignments_success() {
         vec![Recipient {
             assignment: Assignment::Fungible(10),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -959,7 +1137,7 @@ fn create_consignments_success() {
     let consignment_path = party
         .wallet
         .get_asset_transfer_dir(party.wallet.get_transfers_dir().join(txid), &asset.asset_id)
-        .join(CONSIGNMENT_FILE);
+        .join(CONSIGNMENT_FILE.as_str());
     assert!(consignment_path.is_file());
 }
 
@@ -1080,8 +1258,9 @@ fn output_index_with_value(psbt: &Psbt, amt_sat: u64) -> u32 {
 /// Whether the RGB stash of `wallet` holds assignments of `contract_id` on `outpoint`.
 #[cfg(feature = "electrum")]
 fn stash_has_assignments(wallet: &Wallet, contract_id: ContractId, outpoint: OutPoint) -> bool {
-    let runtime = wallet.rgb_runtime().unwrap();
-    runtime
+    let txn = wallet.database().begin_transaction().unwrap();
+    let stock = wallet.rgb_stock(&txn).unwrap();
+    stock
         .contract_assignments_for(contract_id, [outpoint])
         .unwrap()
         .values()
@@ -1150,7 +1329,7 @@ fn color_psbt_and_prepare_consume_round_trip() {
     // the receiver accepts the consignment built before the stash update
     let consignment_dir = recv_party.wallet.get_transfers_dir().join(&txid);
     std::fs::create_dir_all(&consignment_dir).unwrap();
-    let consignment_path = consignment_dir.join(CONSIGNMENT_FILE);
+    let consignment_path = consignment_dir.join(CONSIGNMENT_FILE.as_str());
     loaded.save_file(&consignment_path).unwrap();
     let (_, assignments, _) = recv_party
         .wallet
@@ -1555,6 +1734,8 @@ fn color_psbt_and_prepare_consume_rejects_second_live_batch_for_same_txid() {
 #[parallel]
 fn color_psbt_and_prepare_consume_bulk_fail_transfers_reclaims_expired_batch() {
     initialize();
+    // no sender proxy is involved: let the expiration take effect without the skew margin
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(0));
 
     let amt_sat = 500;
     let blinding = 777;
@@ -1592,6 +1773,8 @@ fn color_psbt_and_prepare_consume_bulk_fail_transfers_reclaims_expired_batch() {
 #[parallel]
 fn color_psbt_and_prepare_consume_bulk_fail_transfers_spares_broadcast_expired_batch() {
     initialize();
+    // no sender proxy is involved: let the expiration take effect without the skew margin
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(0));
 
     let amt_sat = 500;
     let blinding = 777;
@@ -1673,13 +1856,15 @@ fn consume_transfer_fascia_recovers_after_crash_between_stash_consume_and_db_com
         .get_transfers_dir()
         .join(&txid)
         .join("stash_consumed");
+    // the stash consume and the SQL side share one transaction: the failure rolls both back,
+    // and the marker (written only on commit) is never left behind
     assert!(
-        marker.exists(),
-        "durable marker must exist after stash consume"
+        !marker.exists(),
+        "no marker may survive a rolled back consume"
     );
     assert!(party_send.check_test_transfer_status_sender(&txid, TransferStatus::Initiated));
 
-    // Retry finishes the SQL side without a second consume_fascia.
+    // Retry consumes the fascia again and finishes the SQL side.
     party_send
         .wallet
         .consume_transfer_fascia(party_send.party_online(), batch_transfer_idx)
@@ -2170,6 +2355,9 @@ fn consume_transfer_fascia_rejects_send_begin_batch() {
             recipient_id: receive_data.recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let begin = party.send_begin_result(&recipient_map).unwrap();
@@ -3113,7 +3301,6 @@ fn psbt_op_prepare_writes_op_dir_for_wallet_owned_input() {
 }
 
 // A deterministic Electrum fixture: startup/network checks succeed, but history lookup fails.
-// Two clients are opened by get_resolver (protocol detection and consensus resolution).
 #[cfg(feature = "electrum")]
 fn failing_history_indexer() -> (String, std::thread::JoinHandle<usize>) {
     use std::io::{BufRead, BufReader, Write};
@@ -3127,10 +3314,23 @@ fn failing_history_indexer() -> (String, std::thread::JoinHandle<usize>) {
         )
         .header,
     ));
+    // indexer detection and resolution open several clients, some left idle: serve every client
+    // that connects until none has for a while, ending a client on read timeout or EOF
+    listener.set_nonblocking(true).unwrap();
     let server = std::thread::spawn(move || {
         let mut clients = vec![];
-        for _ in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
+        let mut last_accept = std::time::Instant::now();
+        while last_accept.elapsed() < std::time::Duration::from_secs(10) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(conn) => conn,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            };
+            last_accept = std::time::Instant::now();
+            stream.set_nonblocking(false).unwrap();
             let header = header.clone();
             clients.push(std::thread::spawn(move || {
                 stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
@@ -3138,7 +3338,10 @@ fn failing_history_indexer() -> (String, std::thread::JoinHandle<usize>) {
                 let mut failures = 0;
                 loop {
                     let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap() == 0 { break; }
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
                     let request: Value = serde_json::from_str(&line).unwrap();
                     let mut response = serde_json::json!({"jsonrpc":"2.0", "id":request["id"]});
                     match request["method"].as_str().unwrap() {
@@ -3154,9 +3357,15 @@ fn failing_history_indexer() -> (String, std::thread::JoinHandle<usize>) {
                                 "code": -1, "message": "temporary indexer outage",
                             });
                         }
-                        method => panic!("unexpected Electrum request: {method}"),
+                        method => {
+                            response["error"] = serde_json::json!({
+                                "code": -1, "message": format!("unsupported method {method}"),
+                            });
+                        }
                     }
-                    writeln!(stream, "{response}").unwrap();
+                    if writeln!(stream, "{response}").is_err() {
+                        break;
+                    }
                 }
                 failures
             }));
@@ -3249,7 +3458,7 @@ fn psbt_op_prepare_foreign_escrow_input_persists_claim_change() {
         .extract_tx()
         .expect("valid funding tx");
     party.wallet.broadcast_tx(fund_tx.clone()).unwrap();
-    mine_tx(false, &escrow_txid.to_string());
+    mine_tx(&escrow_txid.to_string());
     party
         .wallet
         .consume_transfer_fascia(party.party_online(), fund_batch_idx)
@@ -3302,6 +3511,8 @@ fn psbt_op_prepare_foreign_escrow_input_persists_claim_change() {
         )
         .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
     let mut claim_psbt = claim_builder.finish().unwrap();
+    // BDK 3.2 no longer fills in the previous TXs of the wallet inputs
+    party.wallet.add_non_witness_utxos(&mut claim_psbt);
     prepend_psbt_input(
         &mut claim_psbt,
         escrow_outpoint,
@@ -3610,7 +3821,7 @@ fn psbt_op_foreign_escrow_witness_receive_apply_refresh_balance() {
         .extract_tx()
         .expect("valid funding tx");
     party.wallet.broadcast_tx(fund_tx.clone()).unwrap();
-    mine_tx(false, &escrow_txid.to_string());
+    mine_tx(&escrow_txid.to_string());
     party
         .wallet
         .consume_transfer_fascia(party.party_online(), fund_batch_idx)
@@ -3639,9 +3850,7 @@ fn psbt_op_foreign_escrow_witness_receive_apply_refresh_balance() {
     assert_eq!(stash_on_escrow.len(), 1);
     assert!(!stash_on_escrow[0].1.is_empty());
 
-    let receive_data = party.witness_receive();
-    let invoice = Invoice::new(receive_data.invoice.clone()).unwrap();
-    let proxy_recipient_id = invoice.invoice_data().proxy_recipient_id;
+    let receive_data = party.witness_receive_out_of_band();
     let claim_script = script_buf_from_recipient_id(receive_data.recipient_id.clone())
         .unwrap()
         .expect("witness_receive yields a script");
@@ -3650,7 +3859,7 @@ fn psbt_op_foreign_escrow_witness_receive_apply_refresh_balance() {
         "witness_receive must leave a pending witness script"
     );
     let incoming_before = party
-        .list_transfers_filtered(AssetFilter::AnyOrNone, None)
+        .list_transfers_filtered(AssetFilter::AnyOrNone, TransferScope::All)
         .into_iter()
         .find(|t| {
             t.kind == TransferKind::ReceiveWitness
@@ -3678,6 +3887,8 @@ fn psbt_op_foreign_escrow_witness_receive_apply_refresh_balance() {
         .add_recipient(claim_script.clone(), BdkAmount::from_sat(amt_sat))
         .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
     let mut claim_psbt = claim_builder.finish().unwrap();
+    // BDK 3.2 no longer fills in the previous TXs of the wallet inputs
+    party.wallet.add_non_witness_utxos(&mut claim_psbt);
     prepend_psbt_input(
         &mut claim_psbt,
         escrow_outpoint,
@@ -3739,7 +3950,7 @@ fn psbt_op_foreign_escrow_witness_receive_apply_refresh_balance() {
     );
 
     let incoming_after_prepare = party
-        .list_transfers_filtered(AssetFilter::AnyOrNone, None)
+        .list_transfers_filtered(AssetFilter::AnyOrNone, TransferScope::All)
         .into_iter()
         .find(|t| t.idx == incoming_before.idx)
         .unwrap();
@@ -3793,19 +4004,12 @@ fn psbt_op_foreign_escrow_witness_receive_apply_refresh_balance() {
     );
     party
         .wallet
-        .post_consignment_to_proxy(
-            &get_proxy_client(None),
-            proxy_recipient_id.clone(),
-            consignment_path,
-            claim_txid.clone(),
-            Some(claim_vout),
+        .provide_out_of_band_consignment(
+            party.party_online(),
+            consignment_path.to_string_lossy().to_string(),
+            vec![],
         )
         .unwrap();
-
-    // Open `witness_receive` has no asset_id yet; `refresh(Some(asset_id))` would skip it.
-    // Drive the invoice like `send_to_oneself` (refresh, not `fetch_and_accept`: that API
-    // only writes the stash, which `psbt_op_apply` already did).
-    party.wait_for_refresh_raw(None, Some(&[receive_data.batch_transfer_idx]));
     mine(false);
     party.wait_for_refresh(None);
 
@@ -3877,9 +4081,7 @@ fn psbt_op_apply_consumes_fascia_after_incoming_accept_of_same_witness() {
         .collect();
     assert!(!colored_inputs.is_empty());
 
-    let receive_data = party.witness_receive();
-    let invoice = Invoice::new(receive_data.invoice.clone()).unwrap();
-    let proxy_recipient_id = invoice.invoice_data().proxy_recipient_id;
+    let receive_data = party.witness_receive_out_of_band();
     let claim_script = script_buf_from_recipient_id(receive_data.recipient_id.clone())
         .unwrap()
         .expect("witness_receive yields a script");
@@ -3951,7 +4153,7 @@ fn psbt_op_apply_consumes_fascia_after_incoming_accept_of_same_witness() {
     let bitcoin_txid = tx.compute_txid();
     let txid = bitcoin_txid.to_string();
     party.wallet.broadcast_tx(tx).unwrap();
-    mine_tx(false, &txid);
+    mine_tx(&txid);
 
     let consignment_path = crate::wallet::rust_only::psbt_op_consignment_path(
         &party.wallet.get_wallet_dir().join(&operation_dir),
@@ -3959,15 +4161,12 @@ fn psbt_op_apply_consumes_fascia_after_incoming_accept_of_same_witness() {
     );
     party
         .wallet
-        .post_consignment_to_proxy(
-            &get_proxy_client(None),
-            proxy_recipient_id,
-            consignment_path,
-            txid.clone(),
-            Some(claim_vout),
+        .provide_out_of_band_consignment(
+            party.party_online(),
+            consignment_path.to_string_lossy().to_string(),
+            vec![],
         )
         .unwrap();
-    party.wait_for_refresh_raw(None, Some(&[receive_data.batch_transfer_idx]));
     let change_outpoint = OutPoint {
         txid: bitcoin_txid,
         vout: change_vout,
@@ -4504,26 +4703,25 @@ fn accept_paths_fail_when_offline() {
         let wallet = get_test_wallet(true, None);
         party!(wallet, Online { id: 0 })
     };
-    let result = offline_party.wallet.accept_transfer(
+    let result = offline_party.wallet.accept_transfer_consignment(
         Online { id: 0 },
+        PathBuf::from("not-checked-before-the-online-guard"),
         FAKE_TXID.to_string(),
         0,
-        &PROXY_ENDPOINT,
         777,
     );
     assert_matches!(result, Err(Error::Offline));
 
-    let result = offline_party
-        .wallet
-        .fetch_and_accept_transfer_by_recipient_id(
-            Online { id: 0 },
-            FAKE_TXID.to_string(),
-            s!("bcrt:wvout:not-checked-before-the-online-guard"),
-            &PROXY_ENDPOINT,
-            777,
-            MIN_CONFIRMATIONS,
-            expected_nia(FAKE_TXID, AMOUNT),
-        );
+    let result = offline_party.wallet.accept_htlc_consignment(
+        Online { id: 0 },
+        s!("not-checked-before-the-online-guard"),
+        FAKE_TXID.to_string(),
+        0,
+        s!("bcrt:wvout:not-checked-before-the-online-guard"),
+        777,
+        MIN_CONFIRMATIONS,
+        expected_nia(FAKE_TXID, AMOUNT),
+    );
     assert_matches!(result, Err(Error::Offline));
 
     let result = offline_party
@@ -4695,6 +4893,8 @@ fn psbt_op_abort_recovers_after_crash_between_sql_fail_and_journal() {
 #[parallel]
 fn psbt_op_fail_transfers_expiration_heals_meta() {
     initialize();
+    // no sender proxy is involved: let the expiration take effect without the skew margin
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(0));
 
     let amt_sat = 500;
     let blinding = 777;
@@ -4858,6 +5058,8 @@ fn psbt_op_abort_refused_after_broadcast_attempt() {
 #[parallel]
 fn psbt_op_fail_transfers_bulk_releases_expired_attempted_batch() {
     initialize();
+    // no sender proxy is involved: let the expiration take effect without the skew margin
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(0));
 
     let amt_sat = 500;
     let blinding = 777;
@@ -5005,7 +5207,7 @@ fn psbt_op_abort_allowed_after_expiration_when_tx_unknown() {
     );
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[test]
 fn psbt_op_consignment_path_is_windows_safe_and_creatable() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5308,16 +5510,7 @@ fn psbt_op_prepare_apply_round_trip() {
     let consignment_path =
         crate::wallet::rust_only::psbt_op_consignment_path(&op_dir, &asset.asset_id);
     let txid = psbt.unsigned_tx.compute_txid().to_string();
-    party_send
-        .wallet
-        .post_consignment_to_proxy(
-            &get_proxy_client(None),
-            txid.clone(),
-            consignment_path,
-            txid.clone(),
-            Some(vout),
-        )
-        .unwrap();
+    let consignment = general_purpose::STANDARD.encode(std::fs::read(consignment_path).unwrap());
 
     let signed_psbt = party_send.wallet.sign_psbt(psbt.to_string(), None).unwrap();
     let finalized_psbt = party_send.wallet.finalize_psbt(signed_psbt, None).unwrap();
@@ -5343,11 +5536,12 @@ fn psbt_op_prepare_apply_round_trip() {
     );
     recv_party
         .wallet
-        .fetch_and_accept_transfer_by_recipient_id(
+        .accept_htlc_consignment(
             recv_online,
+            consignment,
             txid,
+            vout,
             witness_recipient_id,
-            &PROXY_ENDPOINT,
             blinding,
             0,
             expected_nia(&asset.asset_id, AMOUNT),
@@ -6121,7 +6315,7 @@ fn contract_assignments_for_outpoints_preserves_order_and_duplicates() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn fetch_consignment_by_recipient_id_unchecked_success() {
+fn received_consignment_from_base64_success() {
     initialize();
 
     let amt_sat = 500;
@@ -6165,30 +6359,22 @@ fn fetch_consignment_by_recipient_id_unchecked_success() {
 
     let txid = psbt.unsigned_tx.compute_txid().to_string();
     let transfers_dir = party_send.wallet.get_transfers_dir().join(&txid);
-    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE);
+    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE.as_str());
     std::fs::create_dir_all(&transfers_dir).unwrap();
     transfers
         .first()
         .unwrap()
         .save_file(&consignment_path)
         .unwrap();
-    party_send
-        .wallet
-        .post_consignment_to_proxy(
-            &get_proxy_client(None),
-            txid.clone(),
-            consignment_path,
-            txid.clone(),
-            Some(vout),
-        )
-        .unwrap();
+    let consignment = general_purpose::STANDARD.encode(std::fs::read(&consignment_path).unwrap());
 
-    let (transfer, fetched_txid, fetched_vout) = party_send
-        .wallet
-        .fetch_consignment_by_recipient_id_unchecked(txid.clone(), &PROXY_ENDPOINT)
-        .unwrap();
-    assert_eq!(fetched_txid, txid);
-    assert_eq!(fetched_vout, vout);
+    let ReceivedConsignment {
+        consignment: transfer,
+        txid: received_txid,
+        vout: received_vout,
+    } = ReceivedConsignment::from_base64(&consignment, txid.clone(), vout).unwrap();
+    assert_eq!(received_txid, txid);
+    assert_eq!(received_vout, vout);
     let mut expected_bytes = vec![];
     transfers
         .first()
@@ -6213,11 +6399,12 @@ fn fetch_consignment_by_recipient_id_unchecked_success() {
     let recv_online = recv_party.party_online();
     let (_accepted, assignments) = recv_party
         .wallet
-        .fetch_and_accept_transfer_by_recipient_id(
+        .accept_htlc_consignment(
             recv_online,
+            consignment,
             txid.clone(),
+            vout,
             witness_recipient_id,
-            &PROXY_ENDPOINT,
             blinding,
             MIN_CONFIRMATIONS,
             expected_nia(&asset.asset_id, AMOUNT),
@@ -6229,85 +6416,7 @@ fn fetch_consignment_by_recipient_id_unchecked_success() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn fetch_consignment_by_recipient_id_unchecked_missing_vout() {
-    initialize();
-
-    let amt_sat = 500;
-    let blinding = 777;
-
-    let mut party_send = get_funded_noutxo_party!();
-    let mut recv_party = get_empty_party!();
-    party_send.create_utxos(false, Some(1), None, FEE_RATE, None);
-    party_send.send_btc(&recv_party.get_address(), 99_998_200);
-    let asset = party_send.issue_asset_nia(Some(&[AMOUNT]));
-
-    let address = BdkAddress::from_str(&recv_party.get_address()).unwrap();
-    let mut tx_builder = party_send.wallet.bdk_wallet_mut().build_tx();
-    tx_builder
-        .add_recipient(
-            address.assume_checked().script_pubkey(),
-            BdkAmount::from_sat(amt_sat),
-        )
-        .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
-    let mut psbt = tx_builder.finish().unwrap();
-    insert_op_return(&mut psbt, true);
-    let input = psbt.unsigned_tx.input[0].previous_output;
-    let vout = psbt
-        .unsigned_tx
-        .output
-        .iter()
-        .enumerate()
-        .find(|(_, o)| o.value.to_sat() == amt_sat)
-        .unwrap()
-        .0 as u32;
-    let coloring_info =
-        coloring_info_for(&asset.asset_id, HashMap::from([(vout, AMOUNT)]), blinding);
-    let ColorPrepareResult { transfers, .. } = party_send
-        .wallet
-        .color_psbt_for_outpoints_and_prepare_consume(
-            &mut psbt,
-            coloring_info,
-            vec![input],
-            MIN_CONFIRMATIONS,
-            None,
-        )
-        .unwrap();
-
-    let recipient_id = format!("{}-no-vout", psbt.unsigned_tx.compute_txid());
-    let txid = psbt.unsigned_tx.compute_txid().to_string();
-    let transfers_dir = party_send.wallet.get_transfers_dir().join(&recipient_id);
-    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE);
-    std::fs::create_dir_all(&transfers_dir).unwrap();
-    transfers
-        .first()
-        .unwrap()
-        .save_file(&consignment_path)
-        .unwrap();
-    party_send
-        .wallet
-        .post_consignment_to_proxy(
-            &get_proxy_client(None),
-            recipient_id.clone(),
-            consignment_path,
-            txid,
-            None,
-        )
-        .unwrap();
-
-    let result = party_send
-        .wallet
-        .fetch_consignment_by_recipient_id_unchecked(recipient_id, &PROXY_ENDPOINT);
-    assert_matches!(
-        result,
-        Err(Error::Internal { details: m })
-            if m == "missing vout in consignment response"
-    );
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
-fn fetch_and_accept_pin_rejects_mismatch_blinded_and_oor_vout() {
+fn accept_htlc_consignment_pin_rejects_mismatch_blinded_and_oor_vout() {
     initialize();
 
     let (
@@ -6316,10 +6425,10 @@ fn fetch_and_accept_pin_rejects_mismatch_blinded_and_oor_vout() {
         asset_id,
         txid,
         recipient_script,
-        consignment_endpoint,
+        consignment,
+        vout,
         blinding,
-        consignment_path,
-    ) = setup_fetch_accept_pin_fixture(true);
+    ) = setup_accept_pin_fixture(true);
 
     let expected = expected_nia(&asset_id, AMOUNT);
     let recv_online = recv_party.party_online();
@@ -6329,11 +6438,12 @@ fn fetch_and_accept_pin_rejects_mismatch_blinded_and_oor_vout() {
     // Wrong chain-net prefix (mainnet ID, regtest wallet) even if script bytes would match
     let mainnet_witness_recipient_id =
         recipient_id_from_script_buf(recipient_script.clone(), BitcoinNetwork::Mainnet);
-    let result = recv_party.wallet.fetch_and_accept_transfer_by_recipient_id(
+    let result = recv_party.wallet.accept_htlc_consignment(
         recv_online,
+        consignment.clone(),
         txid.clone(),
+        vout,
         mainnet_witness_recipient_id,
-        consignment_endpoint,
         blinding,
         MIN_CONFIRMATIONS,
         expected.clone(),
@@ -6347,11 +6457,12 @@ fn fetch_and_accept_pin_rejects_mismatch_blinded_and_oor_vout() {
         .script_pubkey();
     let wrong_witness_recipient_id =
         recipient_id_from_script_buf(wrong_script, BitcoinNetwork::Regtest);
-    let result = recv_party.wallet.fetch_and_accept_transfer_by_recipient_id(
+    let result = recv_party.wallet.accept_htlc_consignment(
         recv_online,
+        consignment.clone(),
         txid.clone(),
+        vout,
         wrong_witness_recipient_id,
-        consignment_endpoint,
         blinding,
         MIN_CONFIRMATIONS,
         expected.clone(),
@@ -6370,34 +6481,25 @@ fn fetch_and_accept_pin_rejects_mismatch_blinded_and_oor_vout() {
             .unwrap()
             .is_none()
     );
-    let result = recv_party.wallet.fetch_and_accept_transfer_by_recipient_id(
+    let result = recv_party.wallet.accept_htlc_consignment(
         recv_online,
+        consignment.clone(),
         txid.clone(),
+        vout,
         blinded_recipient_id,
-        consignment_endpoint,
         blinding,
         MIN_CONFIRMATIONS,
         expected.clone(),
     );
     assert_matches!(result, Err(Error::InvalidRecipientID));
 
-    // (d) proxy returns a vout past the end of the witness TX
-    let bad_proxy_id = format!("{txid}-oor-vout");
-    party_send
-        .wallet
-        .post_consignment_to_proxy(
-            &get_proxy_client(None),
-            bad_proxy_id.clone(),
-            consignment_path,
-            txid,
-            Some(999),
-        )
-        .unwrap();
-    let result = recv_party.wallet.fetch_and_accept_transfer_by_recipient_id(
+    // (d) the counterparty declares a vout past the end of the witness TX
+    let result = recv_party.wallet.accept_htlc_consignment(
         recv_online,
-        bad_proxy_id,
+        consignment,
+        txid,
+        999,
         correct_witness_recipient_id,
-        consignment_endpoint,
         blinding,
         MIN_CONFIRMATIONS,
         expected,
@@ -6412,7 +6514,7 @@ fn fetch_and_accept_pin_rejects_mismatch_blinded_and_oor_vout() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn fetch_and_accept_rejects_unconfirmed_then_accepts_after_mine() {
+fn accept_htlc_consignment_rejects_unconfirmed_then_accepts_after_mine() {
     initialize();
 
     let (
@@ -6421,20 +6523,21 @@ fn fetch_and_accept_rejects_unconfirmed_then_accepts_after_mine() {
         asset_id,
         txid,
         recipient_script,
-        consignment_endpoint,
+        consignment,
+        vout,
         blinding,
-        _,
-    ) = setup_fetch_accept_pin_fixture(false);
+    ) = setup_accept_pin_fixture(false);
     let witness_recipient_id =
         recipient_id_from_script_buf(recipient_script, BitcoinNetwork::Regtest);
     let expected = expected_nia(&asset_id, AMOUNT);
     let recv_online = recv_party.party_online();
 
-    let result = recv_party.wallet.fetch_and_accept_transfer_by_recipient_id(
+    let result = recv_party.wallet.accept_htlc_consignment(
         recv_online,
+        consignment.clone(),
         txid.clone(),
+        vout,
         witness_recipient_id.clone(),
-        consignment_endpoint,
         blinding,
         1,
         expected.clone(),
@@ -6448,11 +6551,12 @@ fn fetch_and_accept_rejects_unconfirmed_then_accepts_after_mine() {
 
     let (_accepted, assignments) = recv_party
         .wallet
-        .fetch_and_accept_transfer_by_recipient_id(
+        .accept_htlc_consignment(
             recv_online,
+            consignment.clone(),
             txid,
+            vout,
             witness_recipient_id,
-            consignment_endpoint,
             blinding,
             1,
             expected,
@@ -6464,7 +6568,7 @@ fn fetch_and_accept_rejects_unconfirmed_then_accepts_after_mine() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn fetch_and_accept_allows_mempool_when_min_confirmations_zero() {
+fn accept_htlc_consignment_allows_mempool_when_min_confirmations_zero() {
     initialize();
 
     let (
@@ -6473,21 +6577,22 @@ fn fetch_and_accept_allows_mempool_when_min_confirmations_zero() {
         asset_id,
         txid,
         recipient_script,
-        consignment_endpoint,
+        consignment,
+        vout,
         blinding,
-        _,
-    ) = setup_fetch_accept_pin_fixture(false);
+    ) = setup_accept_pin_fixture(false);
     let witness_recipient_id =
         recipient_id_from_script_buf(recipient_script, BitcoinNetwork::Regtest);
     let recv_online = recv_party.party_online();
 
     let (_accepted, assignments) = recv_party
         .wallet
-        .fetch_and_accept_transfer_by_recipient_id(
+        .accept_htlc_consignment(
             recv_online,
+            consignment.clone(),
             txid,
+            vout,
             witness_recipient_id,
-            consignment_endpoint,
             blinding,
             0,
             expected_nia(&asset_id, AMOUNT),
@@ -6714,7 +6819,7 @@ fn expected_nia(asset_id: &str, amount: u64) -> ExpectedTransfer {
 
 /// Broadcast (and optionally mine) a colored witness transfer posted to the proxy under `txid`.
 #[cfg(feature = "electrum")]
-fn setup_fetch_accept_pin_fixture(
+fn setup_accept_pin_fixture(
     mine_after: bool,
 ) -> (
     SinglesigParty,
@@ -6722,9 +6827,9 @@ fn setup_fetch_accept_pin_fixture(
     String,
     String,
     ScriptBuf,
-    &'static str,
+    String,
+    u32,
     u64,
-    PathBuf,
 ) {
     let amt_sat = 500;
     let blinding = 777;
@@ -6767,23 +6872,14 @@ fn setup_fetch_accept_pin_fixture(
 
     let txid = psbt.unsigned_tx.compute_txid().to_string();
     let transfers_dir = party_send.wallet.get_transfers_dir().join(&txid);
-    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE);
+    let consignment_path = transfers_dir.join(CONSIGNMENT_FILE.as_str());
     std::fs::create_dir_all(&transfers_dir).unwrap();
     transfers
         .first()
         .unwrap()
         .save_file(&consignment_path)
         .unwrap();
-    party_send
-        .wallet
-        .post_consignment_to_proxy(
-            &get_proxy_client(None),
-            txid.clone(),
-            consignment_path.clone(),
-            txid.clone(),
-            Some(vout),
-        )
-        .unwrap();
+    let consignment = general_purpose::STANDARD.encode(std::fs::read(&consignment_path).unwrap());
 
     let signed_psbt = party_send.wallet.sign_psbt(psbt.to_string(), None).unwrap();
     let finalized_psbt = party_send.wallet.finalize_psbt(signed_psbt, None).unwrap();
@@ -6802,9 +6898,9 @@ fn setup_fetch_accept_pin_fixture(
         asset.asset_id,
         txid,
         recipient_script,
-        PROXY_ENDPOINT.as_str(),
+        consignment,
+        vout,
         blinding,
-        consignment_path,
     )
 }
 
@@ -6892,20 +6988,30 @@ fn import_asset_contract_repairs_partial_persistence() {
         .unwrap();
     let validation_config = ValidationConfig {
         chain_net: stock_only_recipient.wallet.chain_net(),
-        trusted_typesystem: AssetSchema::Nia.types(),
         ..Default::default()
     };
     let valid_contract = contract
         .clone()
-        .validate(&DumbResolver, &validation_config)
+        .validate(
+            &AssetSchema::Nia.schema_rules(),
+            &DumbResolver,
+            &validation_config,
+        )
         .unwrap();
     let contract_id = valid_contract.contract_id();
 
     {
-        let mut runtime = stock_only_recipient.wallet.rgb_runtime().unwrap();
-        runtime
+        let txn = stock_only_recipient
+            .wallet
+            .database()
+            .begin_transaction()
+            .unwrap();
+        let mut stock = stock_only_recipient.wallet.rgb_stock(&txn).unwrap();
+        stock
             .import_contract(valid_contract.clone(), &DumbResolver)
             .unwrap();
+        drop(stock);
+        txn.commit().unwrap();
     }
     assert_matches!(
         stock_only_recipient
@@ -6922,7 +7028,8 @@ fn import_asset_contract_repairs_partial_persistence() {
     {
         // Read metadata from the issuer's stock so the recipient's stock remains untouched. This
         // deterministically models a database commit that completed before the stock write.
-        let runtime = issuer.wallet.rgb_runtime().unwrap();
+        let issuer_txn = issuer.wallet.database().begin_transaction().unwrap();
+        let mut issuer_stock = issuer.wallet.rgb_stock(&issuer_txn).unwrap();
         let txn = database_only_recipient
             .wallet
             .database()
@@ -6932,8 +7039,7 @@ fn import_asset_contract_repairs_partial_persistence() {
             .wallet
             .save_new_asset_internal(
                 &txn,
-                &runtime,
-                contract_id,
+                &mut issuer_stock,
                 AssetSchema::Nia,
                 valid_contract,
                 None,
@@ -6941,14 +7047,15 @@ fn import_asset_contract_repairs_partial_persistence() {
             .unwrap();
         txn.commit().unwrap();
     }
-    assert!(
-        database_only_recipient
+    {
+        let txn = database_only_recipient
             .wallet
-            .rgb_runtime()
-            .unwrap()
-            .export_contract(contract_id)
-            .is_err()
-    );
+            .database()
+            .begin_transaction()
+            .unwrap();
+        let stock = database_only_recipient.wallet.rgb_stock(&txn).unwrap();
+        assert!(stock.export_contract(contract_id).is_err());
+    }
     let repaired = database_only_recipient
         .wallet
         .import_asset_contract(contract)
@@ -7015,6 +7122,9 @@ fn send_consignment_stable_across_signing() {
             recipient_id: receive_data.recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
 
@@ -7063,6 +7173,9 @@ fn create_consignments_return_path_success() {
             recipient_id: receive_data.recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let psbt = party.send_begin_result(&recipient_map).unwrap().psbt;
@@ -7079,7 +7192,7 @@ fn create_consignments_return_path_success() {
             party.wallet.get_transfers_dir().join(&txid),
             &asset.asset_id,
         )
-        .join(CONSIGNMENT_FILE);
+        .join(CONSIGNMENT_FILE.as_str());
     let public_path = party
         .wallet
         .get_send_consignment_path(&asset.asset_id, &txid);
@@ -7118,6 +7231,9 @@ fn create_consignments_return_path_multi_asset_fails() {
                 recipient_id: receive_data_nia.recipient_id.clone(),
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+                public_key: Some(receive_data_nia.public_key.clone()),
+                expiration_timestamp: Some(receive_data_nia.expiration_timestamp),
+                encryption: Encryption::Optional,
             }],
         ),
         (
@@ -7127,6 +7243,9 @@ fn create_consignments_return_path_multi_asset_fails() {
                 recipient_id: receive_data_cfa.recipient_id.clone(),
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+                public_key: Some(receive_data_cfa.public_key.clone()),
+                expiration_timestamp: Some(receive_data_cfa.expiration_timestamp),
+                encryption: Encryption::Optional,
             }],
         ),
     ]);
@@ -7138,7 +7257,7 @@ fn create_consignments_return_path_multi_asset_fails() {
     assert_matches!(result, Err(Error::Internal { details: _ }));
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[test]
 #[parallel]
 fn validate_consignment_offchain_success() {
@@ -7157,6 +7276,9 @@ fn validate_consignment_offchain_success() {
             recipient_id: receive_data.recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
 
@@ -7185,7 +7307,7 @@ fn validate_consignment_offchain_success() {
     assert!(result.details.is_none());
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[test]
 #[parallel]
 fn validate_consignment_offchain_invalid_txid() {
@@ -7204,6 +7326,9 @@ fn validate_consignment_offchain_invalid_txid() {
             recipient_id: receive_data.recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
 
@@ -7224,7 +7349,7 @@ fn validate_consignment_offchain_invalid_txid() {
     assert_matches!(result, Err(Error::InvalidTxid));
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(feature = "_online")]
 #[test]
 #[parallel]
 fn validate_consignment_offchain_file_not_found() {

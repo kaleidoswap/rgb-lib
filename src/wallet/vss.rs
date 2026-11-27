@@ -31,11 +31,11 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
 use crate::error::{Error, InternalError};
-use crate::utils::LOG_FILE;
-use crate::utils::setup_logger;
 use crate::wallet::backup::stream_be32_nonce;
 #[cfg(test)]
 use crate::wallet::core::WALLET_MANIFEST_FILE;
+use crate::wallet::utils::LOG_FILE;
+use crate::wallet::utils::setup_logger;
 
 /// Whether auto-backup uploads block the calling operation or run asynchronously.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -949,7 +949,13 @@ fn get_fingerprint_from_zip_bytes(data: &[u8]) -> Result<String, Error> {
         details: format!("Failed to read zip archive: {e}"),
     })?;
 
-    let first_entry = archive.name_for_index(0).unwrap_or_default();
+    let first_entry = archive
+        .name_for_index(0)
+        .transpose()
+        .map_err(|e| Error::Internal {
+            details: format!("Failed to read zip archive: {e}"),
+        })?
+        .unwrap_or_default();
     let fingerprint = first_entry.trim_end_matches('/').to_string();
 
     // Validate: wallet fingerprints are 8 hex characters (4 bytes)
@@ -1013,7 +1019,12 @@ pub(crate) fn sanitize_zip_for_plaintext(data: &[u8]) -> Result<(Vec<u8>, String
             // ZIP APPNOTE mandates '/' separators; a Windows-produced archive may carry
             // backslashes ("fp\bdk_db"), which the separator-naive predicates below would miss
             // and leak unredacted. Normalize once so every predicate sees canonical names.
-            let original_name = file.name().replace('\\', "/");
+            let original_name = file
+                .name()
+                .map_err(|e| Error::Internal {
+                    details: format!("Failed to read zip entry name: {e}"),
+                })?
+                .replace('\\', "/");
 
             // Skip files carrying xpubs or the fingerprint in their contents
             if is_bdk_db_file(&original_name) || is_wallet_manifest_file(&original_name) {
@@ -1064,7 +1075,7 @@ fn unzip_wallet_from_bytes(data: &[u8], target_dir: &Path, logger: &Logger) -> R
             None => continue,
         };
 
-        if file.name().ends_with('/') {
+        if file.is_dir() {
             debug!(logger, "VSS restore: creating directory {:?}", outpath);
             fs::create_dir_all(&outpath)?;
         } else {
@@ -1148,7 +1159,7 @@ pub async fn restore_from_vss(config: VssBackupConfig, target_dir: &str) -> Resu
 
     // Old backups could contain a transient lock from the source process.
     // The target directory is newly extracted and has no live runtime owner.
-    match fs::remove_file(wallet_dir.join(crate::utils::RGB_RUNTIME_LOCK_FILE)) {
+    match fs::remove_file(wallet_dir.join(crate::wallet::utils::RGB_RUNTIME_LOCK_FILE)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -1486,7 +1497,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(reader).unwrap();
 
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
 
         // Fingerprint should be replaced with "wallet"
@@ -1519,7 +1530,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(reader).unwrap();
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).unwrap();
-            let filename = file.name().rsplit('/').next().unwrap().to_string();
+            let filename = file.name().unwrap().rsplit('/').next().unwrap().to_string();
             assert_ne!(filename, WALLET_MANIFEST_FILE);
             assert_ne!(filename, format!("{WALLET_MANIFEST_FILE}.tmp"));
             let mut content = Vec::new();
