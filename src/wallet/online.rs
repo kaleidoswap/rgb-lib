@@ -9567,6 +9567,32 @@ pub(crate) fn swap_validate_received_transfer_from_file(
     )
 }
 
+/// Validate the swap's incoming assignments by the same claim and reject-list rules as a
+/// regular receive. The caller's resolver allows only the paying witness to be unbroadcast.
+fn swap_check_received_consignment(
+    wallet: &Wallet,
+    consignment: &RgbTransfer,
+    asset_schema: AssetSchema,
+    witness_id: RgbTxid,
+    vout: u32,
+    resolver: &impl ResolveWitness,
+) -> Result<(ValidTransfer, HashMap<Opout, Assignment>), Error> {
+    let pending = validate_with_claims(
+        consignment,
+        ClaimResolution::Evm(wallet.evm_rpc_urls()),
+        &wallet.received_validation_config(asset_schema, None),
+    )
+    .map_err(|e| wallet.received_validation_error(e))?;
+    let assignments = wallet.extract_received_assignments(
+        consignment,
+        witness_id,
+        PaymentSeal::WitnessVout(vout),
+    );
+    let validated =
+        wallet.check_received_consignment(pending, resolver, asset_schema, &assignments, true)?;
+    Ok((validated, assignments))
+}
+
 /// Validate the transfer consignment of a received swap leg, whose witness transaction may not be
 /// broadcast yet, and return the assignments it gives to `vout`.
 pub(crate) fn swap_validate_received_transfer(
@@ -9604,40 +9630,17 @@ pub(crate) fn swap_validate_received_transfer(
         consignment: &consignment,
         fallback: &blockchain_resolver,
     };
-    let validation_config = ValidationConfig {
-        chain_net: wallet.chain_net(),
-        ..Default::default()
-    };
-    match consignment
-        .clone()
-        .validate(&asset_schema.schema_rules(), &resolver, &validation_config)
-    {
-        Ok(_) => {}
-        Err(ValidationError::InvalidConsignment(e)) => {
-            error!(wallet.logger(), "Consignment is invalid: {}", e);
-            return Err(Error::InvalidConsignment);
-        }
-        Err(ValidationError::ResolverError(e)) => {
-            warn!(
-                wallet.logger(),
-                "Network error during consignment validation"
-            );
-            return Err(Error::Network {
-                details: e.to_string(),
-            });
-        }
-        Err(e) => {
-            return Err(Error::Internal {
-                details: format!("unexpected consignment validation error: {e}"),
-            });
-        }
-    };
+    let (_, assignments) = swap_check_received_consignment(
+        wallet,
+        &consignment,
+        asset_schema,
+        witness_id,
+        vout,
+        &resolver,
+    )?;
     swap_validate_witness_output(&consignment, witness_id, recipient_id, vout)?;
 
-    let assignments = wallet
-        .extract_received_assignments(&consignment, witness_id, PaymentSeal::WitnessVout(vout))
-        .into_values()
-        .collect::<Vec<_>>();
+    let assignments = assignments.into_values().collect::<Vec<_>>();
     drop(runtime);
     if assignments.is_empty() {
         return Err(swap_invalid(
@@ -9841,31 +9844,14 @@ pub(crate) fn swap_import_asset_history(
         chain_net: wallet.chain_net(),
         ..Default::default()
     };
-    let valid_consignment = match consignment.validate(
-        &asset_schema.schema_rules(),
+    let valid_consignment = validate_consignment_internal(
+        &consignment,
+        None,
         &wallet.blockchain_resolver(),
+        ClaimResolution::Evm(wallet.evm_rpc_urls()),
         &validation_config,
-    ) {
-        Ok(consignment) => consignment,
-        Err(ValidationError::InvalidConsignment(e)) => {
-            error!(wallet.logger(), "Swap asset history is invalid: {}", e);
-            return Err(Error::InvalidConsignment);
-        }
-        Err(ValidationError::ResolverError(e)) => {
-            warn!(
-                wallet.logger(),
-                "Network error during swap asset history validation"
-            );
-            return Err(Error::Network {
-                details: e.to_string(),
-            });
-        }
-        Err(e) => {
-            return Err(Error::Internal {
-                details: format!("unexpected consignment validation error: {e}"),
-            });
-        }
-    };
+    )
+    .map_err(|e| wallet.received_validation_error(e))?;
     let valid_contract = valid_consignment.clone().into_valid_contract();
     let mut runtime = wallet.rgb_stock(txn)?;
     runtime.accept_transfer(valid_consignment.clone(), &wallet.blockchain_resolver())?;
@@ -9985,35 +9971,14 @@ pub(crate) fn swap_accept_transfer_from_file(
         consignment: &consignment,
         fallback: &blockchain_resolver,
     };
-    let validation_config = ValidationConfig {
-        chain_net: wallet.chain_net(),
-        ..Default::default()
-    };
-    let valid_consignment = match consignment.clone().validate(
-        &asset_schema.schema_rules(),
+    let (valid_consignment, received_rgb_assignments) = swap_check_received_consignment(
+        wallet,
+        &consignment,
+        asset_schema,
+        witness_id,
+        vout,
         &resolver,
-        &validation_config,
-    ) {
-        Ok(consignment) => consignment,
-        Err(ValidationError::InvalidConsignment(e)) => {
-            error!(wallet.logger(), "Consignment is invalid: {}", e);
-            return Err(Error::InvalidConsignment);
-        }
-        Err(ValidationError::ResolverError(e)) => {
-            warn!(
-                wallet.logger(),
-                "Network error during consignment validation"
-            );
-            return Err(Error::Network {
-                details: e.to_string(),
-            });
-        }
-        Err(e) => {
-            return Err(Error::Internal {
-                details: format!("unexpected consignment validation error: {e}"),
-            });
-        }
-    };
+    )?;
     swap_validate_witness_output(&consignment, witness_id, recipient_id, vout)?;
 
     let valid_contract = valid_consignment.clone().into_valid_contract();
@@ -10029,11 +9994,6 @@ pub(crate) fn swap_accept_transfer_from_file(
             Some(valid_consignment.clone()),
         )?;
     }
-    let received_rgb_assignments = wallet.extract_received_assignments(
-        &consignment,
-        witness_id,
-        PaymentSeal::WitnessVout(vout),
-    );
     runtime.accept_transfer(valid_consignment, &resolver)?;
     let assignments = received_rgb_assignments.into_values().collect::<Vec<_>>();
     drop(runtime);

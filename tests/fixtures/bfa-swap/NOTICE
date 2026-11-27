@@ -1,0 +1,4 @@
+This scenario E test vector is the strict-encoded consignment_E.rgb from
+rgb-protocol/rgb-tests, revision 6d35ea056809d3dc16fd4163f678d94e205cb467,
+licensed under Apache-2.0. The RGB transfer file header has been prepended.
+https://github.com/rgb-protocol/rgb-tests/blob/6d35ea056809d3dc16fd4163f678d94e205cb467/tests/fixtures/consignment_E.rgb

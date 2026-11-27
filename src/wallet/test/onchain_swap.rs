@@ -44,6 +44,111 @@ fn rgb(asset_id: &str, amount: u64) -> OnchainSwapLeg {
     }
 }
 
+// The public BFA scenario E has one mint secured by an Ethereum lock. A wallet receiving
+// that history in a swap must verify the lock before adding the contract to its stock.
+#[cfg(feature = "esplora")]
+#[test]
+fn swap_history_checks_finalized_mint_lock() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let bytes = include_bytes!("../../../tests/fixtures/bfa-swap/consignment.rgb");
+    let consignment = RgbTransfer::load(&bytes[..]).unwrap();
+    let asset_id = consignment.contract_id().to_string();
+    let history = OnchainSwapAssetHistory {
+        asset_id: asset_id.clone(),
+        consignment: general_purpose::STANDARD.encode(bytes),
+        recipient_id: "swap-history-test".to_string(),
+    };
+    MOCK_CHAIN_TXS.with_borrow_mut(|txs| {
+        for bundle in consignment.bundled_witnesses() {
+            txs.insert(bundle.witness_id().to_string(), (bundle.tx.clone(), 1));
+        }
+    });
+    let mut server = mockito::Server::new();
+    let genesis_hash = bdk_wallet::bitcoin::blockdata::constants::genesis_block(
+        bdk_wallet::bitcoin::Network::Regtest,
+    )
+    .block_hash();
+    let _genesis = server
+        .mock("GET", "/block-height/0")
+        .with_body(genesis_hash.to_string())
+        .create();
+    let locked = Arc::new(AtomicBool::new(false));
+    let rpc_locked = Arc::clone(&locked);
+    let _rpc = server
+        .mock("POST", "/")
+        .with_body_from_request(move |req| {
+            let request: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "eth_chainId" => serde_json::json!("0x1"),
+                "eth_getBlockByNumber" => {
+                    assert_eq!(request["params"][0], "finalized");
+                    serde_json::json!({"number": "0x10"})
+                }
+                "eth_call" => {
+                    assert_eq!(request["params"][1], "0x10");
+                    let block_plus_one = u8::from(rpc_locked.load(Ordering::SeqCst)) * 2;
+                    serde_json::json!(format!("0x{block_plus_one:064x}"))
+                }
+                method => panic!("unexpected RPC method {method}"),
+            };
+            serde_json::to_vec(
+                &serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result}),
+            )
+            .unwrap()
+        })
+        .create();
+
+    let dir = tempfile::tempdir().unwrap();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let mut wallet = Wallet::new(
+        get_test_wallet_data(dir.path().to_str().unwrap()),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+    let mut options = test_go_online_options(None);
+    options.indexer_config = IndexerConfig::Esplora { url: server.url() };
+    options.evm_chains.clear();
+    wallet.go_online(options.clone()).unwrap();
+    let import = |wallet: &Wallet| -> Result<(), Error> {
+        let txn = wallet.database().begin_transaction()?;
+        super::super::online::swap_import_asset_history(
+            wallet,
+            &txn,
+            &history,
+            &rgb(&asset_id, 1),
+        )?;
+        txn.commit()?;
+        Ok(())
+    };
+    assert_matches!(import(&wallet), Err(Error::NoEvmRpcUrl { chain_id: 1 }));
+    options.evm_chains = test_evm_chains(HashMap::from([(1, server.url())]));
+    wallet.go_online(options).unwrap();
+    assert_matches!(import(&wallet), Err(Error::MintLockNotFound { .. }));
+    assert!(
+        wallet
+            .list_assets(vec![AssetSchema::Bfa])
+            .unwrap()
+            .bfa
+            .unwrap()
+            .is_empty()
+    );
+
+    locked.store(true, Ordering::SeqCst);
+    import(&wallet).unwrap();
+    assert_eq!(
+        wallet
+            .list_assets(vec![AssetSchema::Bfa])
+            .unwrap()
+            .bfa
+            .unwrap()[0]
+            .asset_id,
+        asset_id
+    );
+    MOCK_CHAIN_TXS.with_borrow_mut(|txs| txs.clear());
+}
+
 #[test]
 #[parallel]
 fn maker_taker_rgb_for_btc_balances() {
