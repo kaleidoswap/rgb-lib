@@ -1916,6 +1916,7 @@ impl Wallet {
         min_confirmations: u8,
         encryption: Option<Encryption>,
         quota: Option<u32>,
+        address: Option<String>,
     ) -> Result<ReceiveData, RgbLibError> {
         self._get_wallet().witness_receive(
             online,
@@ -1926,6 +1927,7 @@ impl Wallet {
             min_confirmations,
             encryption,
             quota,
+            address,
         )
     }
 
@@ -3370,7 +3372,7 @@ mod tests {
             bitcoin::{Network as BdkNetwork, bip32::Xpriv},
             keys::bip39::{Language, Mnemonic},
         },
-        utils::{BitcoinNetwork, recipient_id_from_script_buf},
+        no_wallet::{BitcoinNetwork, recipient_id_from_script_buf},
     };
 
     #[test]

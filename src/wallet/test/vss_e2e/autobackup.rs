@@ -100,6 +100,7 @@ fn scenario_3_1_enable_auto_backup_bumps_version_after_each_operation() {
             MIN_CONFIRMATIONS,
             None,
             None,
+            None,
         )
         .expect("witness_receive");
     let v3 = rt
@@ -122,6 +123,7 @@ fn scenario_3_1_enable_auto_backup_bumps_version_after_each_operation() {
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
             None,
         )
@@ -236,6 +238,7 @@ fn scenario_3_2_disable_auto_backup_prevents_version_bumps() {
             MIN_CONFIRMATIONS,
             None,
             None,
+            None,
         )
         .expect("witness_receive");
     assert_version_unchanged_for(
@@ -255,6 +258,7 @@ fn scenario_3_2_disable_auto_backup_prevents_version_bumps() {
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
             None,
             None,
         )

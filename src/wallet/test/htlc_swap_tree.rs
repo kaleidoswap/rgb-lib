@@ -1148,6 +1148,7 @@ fn pinned_accept_then_claim_settles_through_the_operation() {
             MIN_CONFIRMATIONS,
             None,
             None,
+            None,
         )
         .unwrap();
     let prepared =

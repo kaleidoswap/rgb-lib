@@ -485,6 +485,8 @@ async fn auto_backup() {
                     AssetSchema::Ifa,
                 ],
                 allow_reckless_schemas: false,
+                address_reuse_vanilla: false,
+                address_reuse_colored_auto: false,
             },
             wallet_keys,
         )
@@ -573,6 +575,8 @@ async fn unencrypted_auto_backup() {
                     AssetSchema::Ifa,
                 ],
                 allow_reckless_schemas: false,
+                address_reuse_vanilla: false,
+                address_reuse_colored_auto: false,
             },
             wallet_keys,
         )
@@ -630,6 +634,8 @@ async fn blocking_auto_backup() {
                     AssetSchema::Ifa,
                 ],
                 allow_reckless_schemas: false,
+                address_reuse_vanilla: false,
+                address_reuse_colored_auto: false,
             },
             wallet_keys,
         )
@@ -709,6 +715,8 @@ async fn auto_backup_disabled_by_default() {
                     AssetSchema::Ifa,
                 ],
                 allow_reckless_schemas: false,
+                address_reuse_vanilla: false,
+                address_reuse_colored_auto: false,
             },
             wallet_keys,
         )

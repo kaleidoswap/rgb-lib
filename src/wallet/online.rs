@@ -373,38 +373,6 @@ fn check_get_ack_error(err: JsonRpcError) -> Result<(), Error> {
     }
 }
 
-/// The wallet's reject list resolver: the one of the standalone validation, logging what the
-/// user may need to act on.
-#[doc(hidden)]
-pub struct WalletRejectListResolver<'a> {
-    inner: RemoteRejectListResolver<'a>,
-    logger: &'a Logger,
-}
-
-impl ResolveRejectList for WalletRejectListResolver<'_> {
-    fn get_reject_list(&self, source: &RejectListSource) -> Result<RejectList, Error> {
-        let (reject_list, invalid) =
-            self.inner
-                .get_reject_list_counting(source)
-                .inspect_err(|e| {
-                    if let Error::NoEvmRpcUrl { chain_id } = e {
-                        error!(
-                            self.logger,
-                            "No EVM RPC URL configured for chain ID {chain_id}"
-                        );
-                    }
-                })?;
-        // invalid lines are counted and reported once, as a list can contain many
-        if invalid > 0 {
-            warn!(
-                self.logger,
-                "Ignoring {invalid} invalid opout(s) in reject list"
-            );
-        }
-        Ok(reject_list)
-    }
-}
-
 pub trait WalletOnline: WalletOffline {
     fn blockchain_resolver(&self) -> ChainResolver<'_> {
         ChainResolver {
@@ -652,6 +620,10 @@ pub trait WalletOnline: WalletOffline {
         size: u32,
         fee_rate: FeeRate,
     ) -> Result<Psbt, bdk_wallet::error::CreateTxError> {
+        let change = self.reuses_address(KeychainKind::Internal).then(|| {
+            self.get_first_address(KeychainKind::Internal)
+                .script_pubkey()
+        });
         let mut tx_builder = self.bdk_wallet_mut().build_tx();
         tx_builder
             .add_utxos(inputs)
@@ -660,6 +632,9 @@ pub trait WalletOnline: WalletOffline {
             .fee_rate(fee_rate);
         for address in addresses {
             tx_builder.add_recipient(address.clone(), BdkAmount::from_sat(size as u64));
+        }
+        if let Some(change) = change {
+            tx_builder.drain_to(change);
         }
         let mut psbt = tx_builder.finish()?;
         self.add_non_witness_utxos(&mut psbt);
@@ -750,7 +725,10 @@ pub trait WalletOnline: WalletOffline {
         let num_try_creating = min(utxos_to_create, max_possible_utxos);
         let mut addresses = vec![];
         for _i in 0..num_try_creating {
-            addresses.push(self.get_new_address()?.script_pubkey());
+            addresses.push(
+                self.get_output_address(KeychainKind::External)?
+                    .script_pubkey(),
+            );
         }
         while !addresses.is_empty() {
             match self.create_split_tx(&inputs, &addresses, utxo_size, fee_rate_checked) {
@@ -792,6 +770,30 @@ pub trait WalletOnline: WalletOffline {
             signed_psbt,
             WalletTransactionType::CreateUtxos,
         )?;
+
+        // the created UTXOs are registered before broadcasting, so that one on an address that also
+        // receives transfers (see WalletData::address_reuse_colored_auto) isn't taken for a payment
+        // that is still waiting for its transfer to be accepted
+        let unsigned_tx = &signed_psbt.unsigned_tx;
+        let txid = unsigned_tx.compute_txid().to_string();
+        for (vout, output) in unsigned_tx.output.iter().enumerate() {
+            if matches!(
+                self.bdk_wallet()
+                    .spk_index()
+                    .index_of_spk(output.script_pubkey.clone()),
+                Some((KeychainKind::External, _))
+            ) {
+                txn.set_txo(DbTxoActMod {
+                    txid: ActiveValue::Set(txid.clone()),
+                    vout: ActiveValue::Set(vout as u32),
+                    btc_amount: ActiveValue::Set(output.value.to_sat().to_string()),
+                    spent: ActiveValue::Set(false),
+                    exists: ActiveValue::Set(false),
+                    pending_witness: ActiveValue::Set(false),
+                    ..Default::default()
+                })?;
+            }
+        }
 
         let tx = self.broadcast_psbt(txn, signed_psbt)?;
 
@@ -964,8 +966,9 @@ pub trait WalletOnline: WalletOffline {
                     vout,
                 });
             }
-            // a script shared with other transfers (reusable invoice) is left to the pending witness
-            // reconciliation, as its other TXOs may belong to transfers that are still pending
+            // a script shared with other transfers (reusable invoice or reused address) is left to
+            // the pending witness reconciliation, as its other TXOs may belong to transfers that are
+            // still pending
             if transfer.receive_dir.is_none()
                 && let Some(recipient_id) = transfer.recipient_id
                 && let Some(script) = script_buf_from_recipient_id(recipient_id)?
@@ -1905,8 +1908,8 @@ pub trait WalletOnline: WalletOffline {
 
         // a refused receive has no TXO registered, but a sync may have detected one paying its
         // script if the counterparty has already broadcast. A script shared with other transfers
-        // (reusable invoice) is instead left to the pending witness reconciliation, as its other
-        // TXOs may belong to transfers that are still pending
+        // (reusable invoice or reused address) is instead left to the pending witness
+        // reconciliation, as its other TXOs may belong to transfers that are still pending
         if transfer.receive_dir.is_none() {
             let scripts = script_buf_from_recipient_id(recipient_id.to_string())?
                 .into_iter()
@@ -2210,15 +2213,30 @@ pub trait WalletOnline: WalletOffline {
         received
     }
 
-    fn reject_list_resolver(&self) -> WalletRejectListResolver<'_> {
-        WalletRejectListResolver {
+    /// The reject list published at the given source, read with the resolver of the standalone
+    /// validation, logging what the user may need to act on.
+    fn reject_list(&self, source: &RejectListSource) -> Result<RejectList, Error> {
+        let resolver = RemoteRejectListResolver {
+            evm_rpc_urls: self.evm_rpc_urls(),
             // going online checks the chain of every configured EVM RPC endpoint
-            inner: RemoteRejectListResolver {
-                evm_rpc_urls: self.evm_rpc_urls(),
-                evm_chains_checked: true,
-            },
-            logger: self.logger(),
+            evm_chains_checked: true,
+        };
+        let (reject_list, invalid) = RejectList::resolve(&resolver, source).inspect_err(|e| {
+            if let Error::NoEvmRpcUrl { chain_id } = e {
+                error!(
+                    self.logger(),
+                    "No EVM RPC URL configured for chain ID {chain_id}"
+                );
+            }
+        })?;
+        // invalid lines are counted and reported once, as a list can contain many
+        if invalid > 0 {
+            warn!(
+                self.logger(),
+                "Ignoring {invalid} invalid opout(s) in reject list"
+            );
         }
+        Ok(reject_list)
     }
 
     fn safe_height(&self, min_confirmations: u8) -> Result<u32, Error> {
@@ -3552,7 +3570,7 @@ pub trait WalletOnline: WalletOffline {
                 asset_schema,
                 valid_consignment.genesis(),
                 validation_status.ops_dag.as_ref(),
-                Some(&self.reject_list_resolver()),
+                |source| self.reject_list(source),
                 &receiving.keys().copied().collect(),
             )
             .inspect_err(|e| {
@@ -5743,7 +5761,9 @@ pub trait WalletOnline: WalletOffline {
         fee_rate: FeeRate,
         lock_time: Option<u32>,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
-        let change_addr = self.get_new_address()?.script_pubkey();
+        let change_addr = self
+            .get_output_address(KeychainKind::External)?
+            .script_pubkey();
         let mut builder = self.bdk_wallet_mut().build_tx();
         builder
             .add_data(&[0; 32])
@@ -5766,7 +5786,7 @@ pub trait WalletOnline: WalletOffline {
         for (script_buf, amount_sat) in witness_recipients {
             builder.add_recipient(script_buf.clone(), BdkAmount::from_sat(*amount_sat));
         }
-        builder.drain_to(change_addr.clone());
+        builder.drain_to(change_addr);
 
         let mut psbt = builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
@@ -5785,16 +5805,15 @@ pub trait WalletOnline: WalletOffline {
         })?;
         self.add_non_witness_utxos(&mut psbt);
 
-        let btc_change = psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .enumerate()
-            .find(|(_, o)| o.script_pubkey == change_addr)
-            .map(|(i, o)| BtcChange {
-                vout: i as u32,
-                amount: o.value.to_sat(),
-            });
+        // with the outputs left in the order they were added, the change (if not dropped as dust)
+        // is the last one, after the OP_RETURN one and the witness recipients: it's found by
+        // position, as a recipient can pay the same script (e.g. sending to oneself on a reused
+        // address)
+        let change_vout = witness_recipients.len() + 1;
+        let btc_change = psbt.unsigned_tx.output.get(change_vout).map(|o| BtcChange {
+            vout: change_vout as u32,
+            amount: o.value.to_sat(),
+        });
 
         Ok((psbt, btc_change))
     }
@@ -6488,7 +6507,7 @@ pub trait WalletOnline: WalletOffline {
                 // again and all decide on the same version of it
                 let source = reject_list_source.unwrap();
                 if !reject_lists.contains_key(&source) {
-                    let reject_list = self.reject_list_resolver().get_reject_list(&source)?;
+                    let reject_list = self.reject_list(&source)?;
                     reject_lists.insert(source.clone(), reject_list);
                 }
                 let reject_list = &reject_lists[&source];
@@ -6907,6 +6926,19 @@ pub trait WalletOnline: WalletOffline {
         }
 
         let mut change_utxo_idxs: HashMap<ChangeDestination, i32> = HashMap::new();
+
+        // the BTC change output is registered even if no RGB change goes to it, so that one on an
+        // address that also receives transfers (see WalletData::address_reuse_colored_auto) isn't
+        // taken for a payment that is still waiting for its transfer to be accepted
+        if info_contents.btc_change.is_some() {
+            self.get_change_utxo_idx(
+                txn,
+                &txid,
+                info_contents,
+                &ChangeDestination::BtcChange,
+                &mut change_utxo_idxs,
+            )?;
+        }
 
         for (asset_id, transfer_info) in info_contents.transfers.iter() {
             // hash of the plaintext consignment for this asset, if already generated: a non-dry-run
@@ -7663,10 +7695,11 @@ pub trait WalletOnline: WalletOffline {
         fascia: Fascia,
         sync_tte_used: bool,
     ) -> Result<i32, Error> {
-        let mut stock = self.rgb_stock(txn)?;
-        let signed_tx = psbt.clone().extract_tx().map_err(InternalError::from)?;
-        self.broadcast_and_update_rgb(txn, &mut stock, signed_tx, fascia)?;
-        self.update_or_save_transfers(
+        // save the transfers before broadcasting, so that after a dry-run begin the outputs the
+        // wallet creates for itself are registered before the broadcast syncs them (see
+        // update_db_colored_txos_from_bdk): one on an address that also receives transfers would
+        // otherwise be taken for the payment of a witness receive
+        let batch_transfer_idx = self.update_or_save_transfers(
             txn,
             txid,
             info_contents,
@@ -7674,7 +7707,11 @@ pub trait WalletOnline: WalletOffline {
             consignment_hashes,
             sync_tte_used,
             psbt,
-        )
+        )?;
+        let mut stock = self.rgb_stock(txn)?;
+        let signed_tx = psbt.clone().extract_tx().map_err(InternalError::from)?;
+        self.broadcast_and_update_rgb(txn, &mut stock, signed_tx, fascia)?;
+        Ok(batch_transfer_idx)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8231,6 +8268,10 @@ pub trait WalletOnline: WalletOffline {
 
         let mut unspendable = self.get_unspendable_bdk_outpoints(txn)?;
         unspendable.extend(exclude_outpoints.iter().copied());
+        let change = self.reuses_address(KeychainKind::Internal).then(|| {
+            self.get_first_address(KeychainKind::Internal)
+                .script_pubkey()
+        });
 
         let mut tx_builder = self.bdk_wallet_mut().build_tx();
         tx_builder
@@ -8249,6 +8290,9 @@ pub trait WalletOnline: WalletOffline {
                     },
                 )?,
             );
+        }
+        if let Some(change) = change {
+            tx_builder.drain_to(change);
         }
         let mut psbt = tx_builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {

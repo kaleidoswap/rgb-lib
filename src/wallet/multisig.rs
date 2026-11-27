@@ -1061,6 +1061,12 @@ impl MultisigWallet {
     /// Create a new RGB multisig wallet based on the provided [`WalletData`] and
     /// [`MultisigKeys`].
     pub fn new(wallet_data: WalletData, keys: MultisigKeys) -> Result<Self, Error> {
+        // cosigners derive addresses through the hub, which can't reuse them
+        if wallet_data.address_reuse_vanilla || wallet_data.address_reuse_colored_auto {
+            return Err(Error::UnsupportedAddressReuse {
+                details: s!("multisig wallets don't support it"),
+            });
+        }
         let wdata = wallet_data.clone();
 
         // wallet keys
@@ -1553,8 +1559,9 @@ impl MultisigWallet {
             transport_endpoints,
             recipient_type,
             encryption,
-            // invoices cannot be reused by multisig wallets
+            // invoices and addresses cannot be reused by multisig wallets
             1,
+            None,
         )?;
 
         // post operation and metadata to hub
@@ -1592,6 +1599,7 @@ impl MultisigWallet {
             expiration_timestamp: expiration_timestamp as u64,
             batch_transfer_idx,
             public_key: hex::encode(&receive_data_internal.recipient_pubkey),
+            address: receive_data_internal.address,
         })
     }
 
@@ -1878,6 +1886,10 @@ impl MultisigWallet {
             _ => unreachable!("only receive operations"),
         };
 
+        let address = script_pubkey
+            .as_ref()
+            .and_then(|script| self.script_address(script));
+
         // store transfer
         let receive_data_internal = ReceiveDataInternal {
             asset_id: invoice_data.asset_id.clone(),
@@ -1905,6 +1917,8 @@ impl MultisigWallet {
             quota: 1,
             invoice_deadline: None,
             receive_dir: None,
+            address,
+            earlier_receives_to_share: vec![],
         };
         let batch_transfer_idx =
             self.store_receive_transfer(txn, &receive_data_internal, min_confirmations)?;
@@ -1915,6 +1929,7 @@ impl MultisigWallet {
             expiration_timestamp: receive_data_internal.expiration_timestamp as u64,
             batch_transfer_idx,
             public_key: hex::encode(&receive_data_internal.recipient_pubkey),
+            address: receive_data_internal.address,
         })
     }
 

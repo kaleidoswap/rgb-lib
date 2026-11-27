@@ -108,6 +108,13 @@ pub enum Error {
         details: String,
     },
 
+    /// The address passed to a witness receive cannot be reused
+    #[error("Cannot reuse address: {details}")]
+    CannotReuseAddress {
+        /// Error details
+        details: String,
+    },
+
     /// The schema cannot be used on mainnet, unless the wallet opts into it by setting
     /// `allow_reckless_schemas` (see `WalletData`)
     #[error("Cannot use {asset_schema} schema on mainnet")]
@@ -602,6 +609,14 @@ pub enum Error {
     #[error("The provided recipient ID is for a different network than the wallet's one")]
     InvalidRecipientNetwork,
 
+    /// The reject list resolver returned an invalid reject list (see
+    /// [`ResolveRejectList`](crate::no_wallet::ResolveRejectList))
+    #[error("Invalid reject list: {details}")]
+    InvalidRejectList {
+        /// Error details
+        details: String,
+    },
+
     /// The provided reject list URL is invalid
     #[error("Invalid reject list URL: {details}")]
     InvalidRejectListUrl {
@@ -995,6 +1010,13 @@ pub enum Error {
     UnknownTransfer {
         /// Transfer TXID
         txid: String,
+    },
+
+    /// Address reuse is not supported in the requested context
+    #[error("Address reuse is not supported: {details}")]
+    UnsupportedAddressReuse {
+        /// Error details
+        details: String,
     },
 
     /// The backup version is not supported

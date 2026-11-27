@@ -905,6 +905,7 @@ fn witness_receive_cleanup() {
             MIN_CONFIRMATIONS,
             None,
             None,
+            None,
         )
         .unwrap();
     let recipient_map = HashMap::from([(

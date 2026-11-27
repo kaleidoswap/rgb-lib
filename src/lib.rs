@@ -87,6 +87,8 @@
 //!         max_allocations_per_utxo: 5,
 //!         supported_schemas: vec![AssetSchema::Nia],
 //!         allow_reckless_schemas: false,
+//!         address_reuse_vanilla: false,
+//!         address_reuse_colored_auto: false,
 //!     };
 //!     let wallet = Wallet::new(wallet_data, single_sig_keys)?;
 //!
@@ -122,6 +124,8 @@
 //!         max_allocations_per_utxo: 5,
 //!         supported_schemas: vec![AssetSchema::Nia],
 //!         allow_reckless_schemas: false,
+//!         address_reuse_vanilla: false,
+//!         address_reuse_colored_auto: false,
 //!     };
 //!     let wallet = Wallet::new(wallet_data, SinglesigKeys::from_keys(&keys, None))?;
 //!     drop(wallet);
@@ -541,13 +545,14 @@ use crate::no_wallet::validation::esplora_config;
 #[cfg(feature = "_online")]
 use crate::no_wallet::validation::{
     ChainResolver, OffchainResolver, PendingClaims, RejectList, RejectListSource,
-    RemoteRejectListResolver, ResolveRejectList, check_reject_list,
-    genesis_reject_list_source_validated, get_resolver, pending_claims, rejected_opouts,
-    resolve_claims, resolve_witnesses, unreachable_indexer_details, validate_deterministic,
-    validate_with_claims,
+    RemoteRejectListResolver, check_reject_list, genesis_reject_list_source_validated,
+    get_resolver, pending_claims, rejected_opouts, resolve_claims, resolve_witnesses,
+    unreachable_indexer_details, validate_deterministic, validate_with_claims,
 };
 #[cfg(feature = "wallet")]
 use crate::no_wallet::validation::{ClaimResolution, validate_consignment_internal};
+#[cfg(feature = "_validation")]
+use crate::no_wallet::{EvmRejectList, EvmRejectListEntry};
 #[cfg(feature = "wallet")]
 use crate::no_wallet::{
     Outpoint, RgbBridgeLocationInfo, RgbRejectListInfo, beneficiary_from_script_buf, bundle_info,
