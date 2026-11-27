@@ -69,7 +69,7 @@ impl BackupPubData {
 
 /// A wallet's data zipped for a backup, before encryption.
 ///
-/// Taken with [`backup_snapshot`](crate::wallet::WalletOffline::backup_snapshot) on the thread that
+/// Taken with [`backup_snapshot`](crate::wallet::RgbWalletOpsOffline::backup_snapshot) on the thread that
 /// owns the wallet; [`seal_backup`] encrypts and writes it without the wallet.
 pub struct BackupSnapshot {
     paths: BackupPaths,
@@ -90,7 +90,7 @@ impl fmt::Debug for BackupSnapshot {
 }
 
 /// A backup file written by [`seal_backup`], to record with
-/// [`backup_mark_done`](crate::wallet::WalletOffline::backup_mark_done) once it is safely stored.
+/// [`backup_mark_done`](crate::wallet::RgbWalletOpsOffline::backup_mark_done) once it is safely stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedBackup {
     pub(crate) wallet_dir: PathBuf,
@@ -98,12 +98,12 @@ pub struct SealedBackup {
 }
 
 /// Encrypt the [`BackupSnapshot`] with `password` and write it to the backup path it was taken
-/// for, in the format [`backup`](crate::wallet::WalletOffline::backup) writes and
+/// for, in the format [`backup`](crate::wallet::RgbWalletOpsOffline::backup) writes and
 /// [`restore_backup`] reads.
 ///
 /// This doesn't touch the wallet, so it can run on another thread while the wallet keeps
 /// working. Nothing is recorded as backed up: pass the result to
-/// [`backup_mark_done`](crate::wallet::WalletOffline::backup_mark_done) once the file is safely
+/// [`backup_mark_done`](crate::wallet::RgbWalletOpsOffline::backup_mark_done) once the file is safely
 /// stored.
 pub fn seal_backup(snapshot: BackupSnapshot, password: &str) -> Result<SealedBackup, Error> {
     seal_snapshot(snapshot, password, None)

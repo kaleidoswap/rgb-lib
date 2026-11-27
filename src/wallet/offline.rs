@@ -4616,11 +4616,11 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
 
     /// Zip the wallet's data for a backup at `backup_path`, without encrypting it.
     ///
-    /// This is the part of [`backup`](WalletOffline::backup) that needs the wallet. Encrypting and
+    /// This is the part of [`backup`](RgbWalletOpsOffline::backup) that needs the wallet. Encrypting and
     /// writing the file is left to [`seal_backup`](crate::wallet::seal_backup), which doesn't, so
     /// the wallet keeps working meanwhile. Once the sealed file is safely stored, record it with
-    /// [`backup_mark_done`](WalletOffline::backup_mark_done); until then
-    /// [`backup_info`](WalletOffline::backup_info) keeps reporting a backup as due.
+    /// [`backup_mark_done`](RgbWalletOpsOffline::backup_mark_done); until then
+    /// [`backup_info`](RgbWalletOpsOffline::backup_info) keeps reporting a backup as due.
     ///
     /// A wallet restored from such a backup reports a backup as due until its next one.
     fn backup_snapshot(&self, backup_path: &str) -> Result<BackupSnapshot, Error> {
@@ -4634,7 +4634,7 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
     /// latest.
     ///
     /// The backup counts from the moment its snapshot was taken, so a change made after that keeps
-    /// [`backup_info`](WalletOffline::backup_info) reporting a backup as due.
+    /// [`backup_info`](RgbWalletOpsOffline::backup_info) reporting a backup as due.
     fn backup_mark_done(&self, sealed: &SealedBackup) -> Result<(), Error> {
         info!(self.logger(), "Marking backup done...");
         if &sealed.wallet_dir != self.wallet_dir() {

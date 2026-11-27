@@ -6,7 +6,7 @@
 //! `psbt_op_prepare` / `psbt_op_apply` / `psbt_op_abort` / `psbt_op_reconcile`,
 //! `accept_htlc_consignment`, `contract_assignments_for_outpoints`) that
 //! operate on escrow outpoints without treating them as wallet UTXOs. Of these, UniFFI exports
-//! the `psbt_op_*` methods, [`Wallet::accept_htlc_consignment`] and
+//! the `psbt_op_*` methods, `Wallet::accept_htlc_consignment` and
 //! [`Wallet::contract_assignments_for_outpoints`]; the low-level `color_psbt_*` /
 //! `consume_transfer_fascia` and the unchecked fetch/accept halves stay Rust-only.
 
@@ -1255,7 +1255,7 @@ impl Wallet {
     /// Create consignments for a PSBT created with the
     #[cfg_attr(
         feature = "_online",
-        doc = "[`send_begin`](Wallet::send_begin) method."
+        doc = "`send_begin` method."
     )]
     #[cfg_attr(not(feature = "_online"), doc = "`send_begin` method.")]
     ///
@@ -1288,7 +1288,7 @@ impl Wallet {
         Ok(consignment_paths)
     }
 
-    /// Create consignments for a PSBT created with the [`send_begin`](Wallet::send_begin) method,
+    /// Create consignments for a PSBT created with the `send_begin` method,
     /// returning the filesystem path of the consignment for the transferred asset.
     ///
     /// This requires the PSBT to send exactly one asset to a recipient; it returns an error
@@ -1316,7 +1316,7 @@ impl Wallet {
     ///
     /// The returned consignment contains the public contract definition and genesis metadata, but
     /// no transfer or allocation state. It can be distributed as public contract metadata and
-    /// imported with [`import_asset_contract`](Wallet::import_asset_contract).
+    /// imported with `import_asset_contract`.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed,
     /// use it only if you know what you're doing</div>
