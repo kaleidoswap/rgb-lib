@@ -1255,7 +1255,7 @@ impl Wallet {
     /// Create consignments for a PSBT created with the
     #[cfg_attr(
         feature = "_online",
-        doc = "`send_begin` method."
+        doc = "[`send_begin`](Wallet::send_begin) method."
     )]
     #[cfg_attr(not(feature = "_online"), doc = "`send_begin` method.")]
     ///
